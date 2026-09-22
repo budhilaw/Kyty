@@ -751,6 +751,21 @@ void CommandProcessor::ProcessPm4(Pm4Execution& execution) {
 
 		EXIT_NOT_IMPLEMENTED(remaining_dw < 2);
 
+		// A submitted size may end mid-packet. Handlers read their body unconditionally, so the
+		// declared length has to be checked before dispatch or they read past the buffer.
+		if (KYTY_PM4_LEN(packet_header) > remaining_dw) {
+			static std::atomic<uint32_t> truncated_log_count {0};
+			if (truncated_log_count.fetch_add(1) < 16) {
+				LOGF("\t truncated packet at 0x%05" PRIx32 ": cmd_id = 0x%08" PRIx32
+				     ", header_dw = %" PRIu32 ", remaining_dw = %" PRIu32 "\n",
+				     total_dw - remaining_dw, packet_header, KYTY_PM4_LEN(packet_header),
+				     remaining_dw);
+			}
+			cursor.offset_dw          = cursor.commands.size();
+			execution.m_made_progress = true;
+			continue;
+		}
+
 		if (GraphicsRunDebugDumpEnabled()) {
 			LOGF("CP packet: offset=0x%05" PRIx32 " cmd_id=0x%08" PRIx32 " op=0x%02" PRIx32
 			     " len=%" PRIu32 "\n",
