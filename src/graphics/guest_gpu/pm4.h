@@ -264,6 +264,9 @@ constexpr uint32_t PA_SC_GENERIC_SCISSOR_BR_BR_X_MASK  = 0x7FFF;
 constexpr uint32_t PA_SC_GENERIC_SCISSOR_BR_BR_Y_SHIFT = 16;
 constexpr uint32_t PA_SC_GENERIC_SCISSOR_BR_BR_Y_MASK  = 0x7FFF;
 
+constexpr uint32_t COHER_DEST_BASE_0 = 0x92;
+constexpr uint32_t COHER_DEST_BASE_1 = 0x93;
+
 constexpr uint32_t PA_SC_VPORT_SCISSOR_0_TL                             = 0x94;
 constexpr uint32_t PA_SC_VPORT_SCISSOR_0_TL_TL_X_SHIFT                  = 0;
 constexpr uint32_t PA_SC_VPORT_SCISSOR_0_TL_TL_X_MASK                   = 0x7FFF;

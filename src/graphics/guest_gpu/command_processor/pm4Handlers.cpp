@@ -297,6 +297,10 @@ static void HwCtxIgnoreDisabledUserClipPlane(CommandProcessor& cp, uint32_t valu
 	EXIT_NOT_IMPLEMENTED(value != 0 || cp.GetCtx().GetClipControl().user_clip_planes != 0);
 }
 
+// Base address for the hardware's cache coherency ops; the host tracks those with Vulkan
+// barriers instead, so the address itself is unused.
+static void HwCtxIgnoreCoherDestBase([[maybe_unused]] uint32_t value) {}
+
 static void HwCtxIgnoreDrawPayloadControl([[maybe_unused]] uint32_t value) {}
 
 static void HwCtxIgnoreObjprimIdControl([[maybe_unused]] uint32_t value) {}
@@ -2026,6 +2030,16 @@ KYTY_CP_OP_PARSER(CpOpIndirectCxRegs) {
 				}
 				continue;
 			}
+			// RDNA 2 leaves 0x3c-0x42 undefined; the PS5 programs 0x3f, so its effect cannot be
+			// derived from the PC register map.
+			if (raw_cmd_offset == 0x3fu) {
+				static std::atomic_flag logged = ATOMIC_FLAG_INIT;
+				if (!logged.test_and_set(std::memory_order_relaxed)) {
+					Log::WriteToConsoleAndLog(
+					    "\t diagnostic: ignoring indirect CX 0x3f; no RDNA 2 equivalent\n");
+				}
+				continue;
+			}
 			EXIT("unknown cx reg at %05" PRIx32 ": 0x%" PRIx32 " (raw 0x%" PRIx32
 			     "), value = 0x%08" PRIx32 "\n",
 			     num_dw - dw, cmd_offset, raw_cmd_offset, value);
@@ -3124,6 +3138,12 @@ void GraphicsInitJmpTablesCxIndirect() {
 	};
 	g_hw_ctx_indirect_func[Pm4::VGT_TF_PARAM] = [](KYTY_HW_CTX_INDIRECT_ARGS) {
 		cp.GetCtx().SetTfParam(value);
+	};
+	g_hw_ctx_indirect_func[Pm4::COHER_DEST_BASE_0] = [](KYTY_HW_CTX_INDIRECT_ARGS) {
+		HwCtxIgnoreCoherDestBase(value);
+	};
+	g_hw_ctx_indirect_func[Pm4::COHER_DEST_BASE_1] = [](KYTY_HW_CTX_INDIRECT_ARGS) {
+		HwCtxIgnoreCoherDestBase(value);
 	};
 	g_hw_ctx_indirect_func[Pm4::VGT_DRAW_PAYLOAD_CNTL] = [](KYTY_HW_CTX_INDIRECT_ARGS) {
 		HwCtxIgnoreDrawPayloadControl(value);
