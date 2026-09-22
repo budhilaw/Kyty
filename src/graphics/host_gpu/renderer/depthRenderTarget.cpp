@@ -30,13 +30,15 @@
 namespace Libs::Graphics {
 
 [[noreturn]] static void DepthFatal(const char* format, ...) {
-	std::fputs("Depth target fatal: ", stderr);
-	va_list args;
+	std::array<char, 512> reason {};
+	va_list               args;
 	va_start(args, format);
-	std::vfprintf(stderr, format, args);
+	std::vsnprintf(reason.data(), reason.size(), format, args);
 	va_end(args);
-	std::fputc('\n', stderr);
+	// stderr alone is lost whenever the run is captured through the log file instead.
+	std::fprintf(stderr, "Depth target fatal: %s\n", reason.data());
 	std::fflush(stderr);
+	LOGF("Depth target fatal: %s\n", reason.data());
 	EXIT("unsupported render state; details were printed above\n");
 }
 
