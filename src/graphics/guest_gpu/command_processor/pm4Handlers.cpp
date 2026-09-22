@@ -2026,7 +2026,9 @@ KYTY_CP_OP_PARSER(CpOpIndirectCxRegs) {
 				}
 				continue;
 			}
-			EXIT("unknown cx reg at %05" PRIx32 ": 0x%" PRIx32 "\n", num_dw - dw, cmd_offset);
+			EXIT("unknown cx reg at %05" PRIx32 ": 0x%" PRIx32 " (raw 0x%" PRIx32
+			     "), value = 0x%08" PRIx32 "\n",
+			     num_dw - dw, cmd_offset, raw_cmd_offset, value);
 		}
 
 		pfunc(cp, cmd_offset, value);
