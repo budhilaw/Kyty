@@ -1,3 +1,6 @@
+// SDL_main.h redefines main() to SDL_main on Windows; this test provides its own
+// entry point and does not link SDL2main.
+#define SDL_MAIN_HANDLED
 #include "SDL.h"
 #include "common/emulatorConfig.h"
 #include "common/file.h"
