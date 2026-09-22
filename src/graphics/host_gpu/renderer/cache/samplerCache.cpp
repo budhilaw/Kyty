@@ -5,6 +5,8 @@
 #include "graphics/guest_gpu/gpu_defs.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
 
+#include <algorithm>
+
 namespace Libs::Graphics {
 
 SamplerCache::~SamplerCache() {
@@ -69,6 +71,9 @@ vk::Sampler SamplerCache::GetSampler(const ShaderSamplerResource& r) {
 	if (static_cast<Prospero::SamplerMipFilter>(mip_filter) != Prospero::SamplerMipFilter::kNone) {
 		min_lod = static_cast<float>(r.MinLod()) / 256.0f;
 		max_lod = static_cast<float>(r.MaxLod()) / 256.0f;
+		// Guests may program MIN_LOD above MAX_LOD, which clamp() resolves to MAX_LOD but
+		// Vulkan rejects outright.
+		min_lod = std::min(min_lod, max_lod);
 	}
 
 	vk::SamplerCreateInfo sampler_info {};
