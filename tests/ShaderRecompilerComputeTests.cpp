@@ -222,6 +222,11 @@ struct TextureCacheTestAccess {
     cache.ClearImage(command, id, cache.GetImage(id).backing.format, range, clear);
   }
 
+  static void CopyImage(TextureCache &cache, ImageId destination, ImageId source) {
+    auto lock = Lock(cache);
+    cache.CopyImage(destination, source);
+  }
+
   static void ConfigureGarbageCollection(TextureCache &cache,
                                          std::span<const ImageId> oldest,
                                          uint64_t tick, uint64_t pressure) {
@@ -4557,6 +4562,137 @@ public:
                 texture_cache.IsMetaCleared(write_only_meta, 0),
             "a metadata write-only fill was not consumed as a clear");
     scheduler.Finish();
+    std::printf("[host]    %-32s ok\n", name);
+  }
+
+  // Depth and color formats never match here, so the copy goes through a staging buffer.
+  // Verify the depth bits survive that round trip.
+  void CheckDepthToColorCopy() {
+    constexpr const char *name = "DepthToColorCopy";
+    constexpr uintptr_t base = 0x0000000200E00000ull;
+    constexpr uint64_t allocation_size = 0x200000;
+    constexpr uint64_t allocation_alignment = 0x200000;
+    constexpr uint32_t width = 4;
+    constexpr uint32_t height = 4;
+    constexpr uint64_t surface_size = width * height * sizeof(float);
+    // Representable exactly in binary32, so the readback can compare bit patterns.
+    constexpr float depth_value = 0.625f;
+
+    EnsureRuntimeContext();
+    RenderContext context(m_runtime_context);
+    auto &scheduler = context.GetCommandScheduler();
+    HW::Context registers{};
+    HW::UserConfig user_config{};
+    HW::Shader shaders{};
+    scheduler.Begin(registers, user_config, shaders);
+    context.InitializeGpu(nullptr);
+
+    int64_t direct_offset = -1;
+    Require(name, "direct allocation",
+            Libs::LibKernel::Memory::KernelAllocateDirectMemory(
+                0, Libs::LibKernel::Memory::KernelGetDirectMemorySize(),
+                allocation_size, allocation_alignment, 0, &direct_offset) == 0,
+            "depth-to-color direct-memory allocation failed");
+    void *mapped = reinterpret_cast<void *>(base);
+    Require(name, "direct mapping",
+            Libs::LibKernel::Memory::KernelMapDirectMemory(
+                &mapped, allocation_size, 0x3, 0x10, direct_offset,
+                allocation_alignment) == 0 &&
+                mapped == reinterpret_cast<void *>(base),
+            "fixed depth-to-color direct-memory mapping failed");
+
+    auto &resources = context;
+    LibKernel::Memory::InstallGpuResources(&resources);
+    auto &texture_cache = resources.GetTextureCache();
+    resources.MapMemory(base, allocation_size);
+
+    ImageDesc color{};
+    color.type = BindingType::RenderTarget;
+    color.info.data = {base, surface_size};
+    color.info.pixel_format = vk::Format::eR32Sfloat;
+    color.info.guest_format = Prospero::BufferFormat::k32Float;
+    color.info.type = Prospero::ImageType::kColor2D;
+    color.info.extent = {width, height, 1};
+    color.info.resources = {1, 1};
+    color.info.pitch = width;
+    color.info.bytes_per_block = 4;
+    color.info.samples = 1;
+    color.info.tile_mode = Prospero::TileMode::kLinear;
+    color.info.mip_layout[0] = {0, surface_size, width, height};
+    color.view_info.format = vk::Format::eR32Sfloat;
+    color.view_info.aspect = vk::ImageAspectFlagBits::eColor;
+    color.view_info.layer_count = 1;
+    color.view_info.usage = vk::ImageUsageFlagBits::eColorAttachment;
+
+    auto depth = color;
+    depth.type = BindingType::DepthTarget;
+    depth.info.data = {base + 0x10000, surface_size};
+    depth.info.pixel_format = vk::Format::eD32Sfloat;
+    depth.view_info.format = vk::Format::eD32Sfloat;
+    depth.view_info.aspect = vk::ImageAspectFlagBits::eDepth;
+    depth.view_info.usage = vk::ImageUsageFlagBits::eDepthStencilAttachment;
+
+    const auto depth_id = texture_cache.FindImage(depth);
+    const auto color_id = texture_cache.FindImage(color);
+    Require(name, "distinct surfaces",
+            depth_id && color_id && depth_id != color_id,
+            "the depth and color targets resolved to one cache image");
+
+    auto &depth_native = texture_cache.GetImage(depth_id);
+    depth_native.Transit(vk::ImageLayout::eTransferDstOptimal,
+                         vk::AccessFlagBits2::eTransferWrite, {},
+                         scheduler.Current().Handle());
+    vk::ClearDepthStencilValue clear_value{};
+    clear_value.depth = depth_value;
+    const vk::ImageSubresourceRange clear_range{vk::ImageAspectFlagBits::eDepth,
+                                                0, 1, 0, 1};
+    scheduler.Current().Handle().clearDepthStencilImage(
+        depth_native.backing.image, vk::ImageLayout::eTransferDstOptimal,
+        &clear_value, 1, &clear_range);
+    texture_cache.MarkGpuWritten(depth_id);
+
+    // The transfer RenderExecutor::DepthToColorCopy issues once it consumes the draw.
+    TextureCacheTestAccess::CopyImage(texture_cache, color_id, depth_id);
+    texture_cache.MarkGpuWritten(color_id);
+
+    auto readback =
+        CreateHostBuffer(name, surface_size, vk::BufferUsageFlagBits::eTransferDst,
+                         std::vector<u32>(width * height, 0));
+    auto &color_native = texture_cache.GetImage(color_id);
+    color_native.Transit(vk::ImageLayout::eTransferSrcOptimal,
+                         vk::AccessFlagBits2::eTransferRead, {},
+                         scheduler.Current().Handle());
+    vk::BufferImageCopy region{};
+    region.bufferRowLength = width;
+    region.imageSubresource = {vk::ImageAspectFlagBits::eColor, 0, 0, 1};
+    region.imageExtent = {width, height, 1};
+    scheduler.Current().Handle().copyImageToBuffer(
+        color_native.backing.image, vk::ImageLayout::eTransferSrcOptimal,
+        readback.buffer, 1, &region);
+
+    vk::BufferMemoryBarrier host_barrier{};
+    host_barrier.sType = vk::StructureType::eBufferMemoryBarrier;
+    host_barrier.srcAccessMask = vk::AccessFlagBits::eTransferWrite;
+    host_barrier.dstAccessMask = vk::AccessFlagBits::eHostRead;
+    host_barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    host_barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    host_barrier.buffer = readback.buffer;
+    host_barrier.offset = 0;
+    host_barrier.size = readback.size;
+    scheduler.Current().Handle().pipelineBarrier(
+        vk::PipelineStageFlagBits::eTransfer, vk::PipelineStageFlagBits::eHost,
+        {}, 0, nullptr, 1, &host_barrier, 0, nullptr);
+    scheduler.Finish();
+
+    const auto words = ReadBuffer(name, readback, width * height);
+    u32 expected_bits = 0;
+    std::memcpy(&expected_bits, &depth_value, sizeof(expected_bits));
+    Require(name, "depth values reach the color target",
+            words.size() == static_cast<size_t>(width * height) &&
+                std::all_of(words.begin(), words.end(),
+                            [&](u32 value) { return value == expected_bits; }),
+            "the depth aspect did not transfer into the color target intact");
+    DestroyBuffer(&readback);
     std::printf("[host]    %-32s ok\n", name);
   }
 
@@ -32547,6 +32683,11 @@ int main(int argc, char **argv) {
   if (argc == 2 && std::strcmp(argv[1], "--storage-sampled-only") == 0) {
     VulkanHarness vulkan;
     vulkan.CheckUnifiedImageViewCache();
+    return 0;
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--depth-to-color-only") == 0) {
+    VulkanHarness vulkan;
+    vulkan.CheckDepthToColorCopy();
     return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--depth-readback-only") == 0) {

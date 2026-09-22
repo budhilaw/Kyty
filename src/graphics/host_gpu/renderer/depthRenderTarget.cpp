@@ -10,6 +10,7 @@
 #include "graphics/guest_gpu/hardwareContext.h"
 #include "graphics/guest_gpu/tile.h"
 #include "graphics/host_gpu/graphicContext.h"
+#include "graphics/host_gpu/renderer/colorRenderTarget.h"
 #include "graphics/host_gpu/renderer/commandScheduler.h"
 #include "graphics/host_gpu/renderer/debug.h"
 #include "graphics/host_gpu/renderer/image/imageView.h"
@@ -410,6 +411,55 @@ bool RenderExecutor::DepthStencilCopy(CommandBuffer& buffer) {
 	command.copyImage(source.backing.image, vk::ImageLayout::eTransferSrcOptimal,
 	                  destination.backing.image, vk::ImageLayout::eTransferDstOptimal,
 	                  count, regions.data());
+	return true;
+}
+
+// COPY_DEPTH_TO_COLOR routes depth output into the bound color target instead of testing, so
+// the draw carries no geometry and is consumed here as a transfer.
+bool RenderExecutor::DepthToColorCopy(CommandBuffer& buffer,
+                                      uint32_t       render_target_slice_offset) {
+	const auto& hw = buffer.GetRegisters();
+	const auto& rc = hw.GetRenderControl();
+	if (!rc.copy_depth_to_color && !rc.copy_stencil_to_color) {
+		return false;
+	}
+	// Per-sample and centroid copies select one MSAA sample; a whole-image transfer cannot.
+	if (rc.copy_centroid || rc.copy_sample != 0) {
+		return false;
+	}
+	// Stencil occupies a separate aspect that the staging-buffer copy path drops.
+	if (rc.copy_stencil_to_color) {
+		return false;
+	}
+
+	const auto& z = hw.GetDepthRenderTarget();
+	if (z.z_info.format == Prospero::DepthFormat::kInvalid || z.z_read_base_addr == 0) {
+		return false;
+	}
+	if (hw.GetRenderTarget(0).base.addr == 0) {
+		return false;
+	}
+
+	RenderColorInfo destination_info {};
+	ResolveRenderColorTarget(buffer, destination_info, render_target_slice_offset, 0, true, true);
+	if (!destination_info.image_id) {
+		return false;
+	}
+
+	auto&      cache       = m_context.GetTextureCache();
+	auto       source_desc = MakeDepthTargetDesc(buffer, z);
+	const auto source_id   = cache.FindImage(source_desc);
+	if (!source_id || source_id == destination_info.image_id) {
+		return false;
+	}
+	BindRenderTarget(source_id);
+	BindRenderTarget(destination_info.image_id);
+	cache.UpdateImage(source_id);
+	cache.MarkGpuWritten(destination_info.image_id);
+
+	m_context.GetCommandScheduler().EndRendering();
+	// Mismatched formats send this through Image::CopyImageWithBuffer.
+	cache.CopyImage(destination_info.image_id, source_id);
 	return true;
 }
 
