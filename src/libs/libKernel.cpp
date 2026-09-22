@@ -509,7 +509,6 @@ bool KernelIsDispatchingSignalOnCurrentThread() {
 	return g_dispatching_signal_handler;
 }
 
-#if KYTY_PLATFORM != KYTY_PLATFORM_WINDOWS
 static void WaitForSignalDispatch(Pthread thread, int signum) {
 	constexpr auto DISPATCH_WAIT_STEP = std::chrono::microseconds(1000);
 	constexpr auto DISPATCH_WAIT_MAX  = std::chrono::milliseconds(2);
@@ -520,7 +519,6 @@ static void WaitForSignalDispatch(Pthread thread, int signum) {
 		waited += DISPATCH_WAIT_STEP;
 	}
 }
-#endif
 
 struct SignalMcontext {
 	uint64_t mc_onstack;
@@ -1035,6 +1033,15 @@ static NtQueueApcThreadExFunc GetNtQueueApcThreadEx() {
 static void SignalApcHandler(void* arg1, void* arg2, void* /*arg3*/, PCONTEXT context) {
 	auto*      thread = static_cast<Pthread>(arg1);
 	const auto signum = static_cast<int>(reinterpret_cast<intptr_t>(arg2));
+	// The APC can land anywhere, including inside host code holding host locks. Running the
+	// guest handler there is unsafe, and running it on a helper thread leaves this thread
+	// running - which breaks handlers that suspend their own thread, such as the IL2CPP
+	// garbage collector's. Leave the signal pending instead: the thread dispatches it itself
+	// at its next wait point, where it is safe and where the handler can block this thread.
+	if (!IsGuestCodeAddress(context->Rip)) {
+		PthreadWakeForSignal(thread);
+		return;
+	}
 	if (!PthreadTakePendingSignal(thread, signum)) {
 		return;
 	}
@@ -1042,22 +1049,9 @@ static void SignalApcHandler(void* arg1, void* arg2, void* /*arg3*/, PCONTEXT co
 	auto* handler = reinterpret_cast<exception_handler_func_t>(g_exception_handlers[signum]);
 	if (handler != nullptr) {
 		SignalDispatchScope scope;
-		auto                ctx           = CreateSignalUcontext(context);
-		auto                guest_context = IsGuestCodeAddress(ctx.uc_mcontext.mc_rip);
-		if (!guest_context) {
-			SanitizeNonGuestSignalUcontext(&ctx, thread);
-			std::thread([thread, signum, handler, ctx]() mutable {
-				SignalDispatchScope helper_scope;
-				auto*               previous_self = PthreadSwapSelfForSignal(thread);
-				handler(signum, &ctx);
-				PthreadSwapSelfForSignal(previous_self);
-			}).detach();
-			return;
-		}
+		auto                ctx = CreateSignalUcontext(context);
 		handler(signum, &ctx);
-		if (guest_context) {
-			ApplySignalUcontext(context, ctx);
-		}
+		ApplySignalUcontext(context, ctx);
 	}
 }
 
@@ -1167,6 +1161,9 @@ static int KYTY_SYSV_ABI KernelRaiseException(Pthread thread, int signum) {
 
 		PthreadWakeForSignal(thread);
 		CloseHandle(target_thread);
+		// The caller may rely on the handler having run, as a garbage collector suspending
+		// the world does, so give the target a bounded chance to take the signal.
+		WaitForSignalDispatch(thread, signum);
 		return OK;
 #elif defined(__x86_64__)
 		// Deliver on the target thread.
