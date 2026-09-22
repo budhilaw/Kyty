@@ -23,6 +23,7 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <cstdarg>
 #include <cstdio>
 #include <deque>
 #include <memory>
@@ -79,6 +80,21 @@ static bool GraphicsRunDebugDumpEnabled() {
 	return Config::GraphicsDebugDumpEnabled() &&
 	       Config::GetPrintfDirection() != Config::LogDirection::Silent;
 }
+
+// LOGF is silent by default, which discards the packet dump a hard EXIT depends on.
+static void Pm4FatalPrintf(const char* format, ...) {
+	va_list args;
+	va_start(args, format);
+	std::vfprintf(stderr, format, args);
+	va_end(args);
+	std::fflush(stderr);
+}
+
+#define KYTY_PM4_FATAL_LOG(...)                                                                    \
+	do {                                                                                           \
+		LOGF(__VA_ARGS__);                                                                         \
+		Pm4FatalPrintf(__VA_ARGS__);                                                               \
+	} while (false)
 
 GuestGpu::GuestGpu(RenderContext& renderer): m_renderer(renderer) {
 	EXIT_NOT_IMPLEMENTED(!Common::Thread::IsMainThread());
@@ -757,15 +773,16 @@ void CommandProcessor::ProcessPm4(Pm4Execution& execution) {
 
 		if (handler == nullptr) {
 			const auto offset = total_dw - remaining_dw;
-			LOGF("unknown PM4 packet: data=0x%016" PRIx64 ", num_dw=%" PRIu32
-			     ", offset=0x%05" PRIx32 ", current=0x%016" PRIx64 "\n",
-			     reinterpret_cast<uint64_t>(packet - offset), total_dw, offset,
-			     reinterpret_cast<uint64_t>(packet));
+			KYTY_PM4_FATAL_LOG("unknown PM4 packet: data=0x%016" PRIx64 ", num_dw=%" PRIu32
+			                   ", offset=0x%05" PRIx32 ", current=0x%016" PRIx64 "\n",
+			                   reinterpret_cast<uint64_t>(packet - offset), total_dw, offset,
+			                   reinterpret_cast<uint64_t>(packet));
 			const auto  dump_begin = (offset > 8 ? offset - 8 : 0);
 			const auto  dump_end   = std::min<uint32_t>(total_dw, offset + 16);
 			auto* const base       = packet - offset;
 			for (uint32_t i = dump_begin; i < dump_end; i++) {
-				LOGF("\t%05" PRIx32 "%s %08" PRIx32 "\n", i, (i == offset ? ":" : " "), base[i]);
+				KYTY_PM4_FATAL_LOG("\t%05" PRIx32 "%s %08" PRIx32 "\n", i,
+				                   (i == offset ? ":" : " "), base[i]);
 			}
 			EXIT("unknown op\n\t%05" PRIx32 ":\n\tcmd_id = %08" PRIx32 "\n",
 			     total_dw - remaining_dw, packet_header);
@@ -773,7 +790,28 @@ void CommandProcessor::ProcessPm4(Pm4Execution& execution) {
 
 		const auto packet_dw =
 		    handler(*this, packet_header & ~1u, packet + 1, remaining_dw, total_dw) + 1;
-		EXIT_IF(packet_dw > remaining_dw);
+		if (packet_dw > remaining_dw) {
+			// The handler already read past the end; name the packet before dying.
+			const auto offset = total_dw - remaining_dw;
+			KYTY_PM4_FATAL_LOG("PM4 packet overran the command buffer: op=0x%02" PRIx32
+			                   ", cmd_id=0x%08" PRIx32 ", header_dw=%" PRIu32
+			                   ", consumed_dw=%" PRIu32 ", remaining_dw=%" PRIu32
+			                   ", num_dw=%" PRIu32 ", offset=0x%05" PRIx32
+			                   ", data=0x%016" PRIx64 "\n",
+			                   opcode, packet_header, KYTY_PM4_LEN(packet_header), packet_dw,
+			                   remaining_dw, total_dw, offset,
+			                   reinterpret_cast<uint64_t>(packet - offset));
+			const auto  dump_begin = (offset > 8 ? offset - 8 : 0);
+			const auto  dump_end   = std::min<uint32_t>(total_dw, offset + 16);
+			auto* const base       = packet - offset;
+			for (uint32_t i = dump_begin; i < dump_end; i++) {
+				KYTY_PM4_FATAL_LOG("\t%05" PRIx32 "%s %08" PRIx32 "\n", i,
+				                   (i == offset ? ":" : " "), base[i]);
+			}
+			EXIT("PM4 packet overran the command buffer\n\t%05" PRIx32 ":\n\tcmd_id = %08" PRIx32
+			     "\n",
+			     offset, packet_header);
+		}
 		if (execution.m_suspended) {
 			return;
 		}
