@@ -316,10 +316,53 @@ void EmitDispatcherInstruction(ValueEmitContext& ctx, const DispatcherFunctionSt
 	}
 }
 
+// Restores the wave's LDS ordering: emits a subgroup barrier before an access that could
+// otherwise observe another lane's access out of order. Block boundaries reset to the
+// conservative state, since a predecessor or a back edge may have run any access at all.
+bool NeedsWaveLdsOrdering(EmitterState& state, const IR::Inst& inst) {
+	if (!state.requirements.wave_lds_ordering) {
+		return false;
+	}
+	if (inst.GetOpcode() == IR::ValueOpcode::Barrier) {
+		state.lds_pending_read  = false;
+		state.lds_pending_write = false;
+		return false;
+	}
+	const auto access = IR::SharedAccessOf(inst.GetOpcode());
+	if (access == IR::SharedAccess::None) {
+		return false;
+	}
+	const auto index = inst.Flags<IR::MemoryFlags>().index;
+	if (index >= state.program.memory_info.size() ||
+	    state.program.memory_info[index].kind != IR::ResourceKind::Lds) {
+		return false;
+	}
+	const bool reads  = access != IR::SharedAccess::Write;
+	const bool writes = access != IR::SharedAccess::Read;
+	const bool hazard = (reads && state.lds_pending_write) ||
+	                    (writes && (state.lds_pending_read || state.lds_pending_write));
+	if (hazard) {
+		state.lds_pending_read  = false;
+		state.lds_pending_write = false;
+	}
+	state.lds_pending_read  = state.lds_pending_read || reads;
+	state.lds_pending_write = state.lds_pending_write || writes;
+	return hazard;
+}
+
+void EmitWaveLdsBarrier(EmitterState& state) {
+	state.builder.AddFunction(spv::OpControlBarrier, ConstantU32(state, spv::ScopeSubgroup),
+	                          ConstantU32(state, spv::ScopeWorkgroup),
+	                          ConstantU32(state, spv::MemorySemanticsAcquireReleaseMask |
+	                                                 spv::MemorySemanticsWorkgroupMemoryMask));
+}
+
 template <typename EmitInstruction>
 void EmitBlock(ValueEmitContext& ctx, const IR::Block* block, EmitInstruction&& emit_instruction) {
 	ctx.state.current_block = block;
 	EmitLabel(ctx.state, ctx.Label(block));
+	ctx.state.lds_pending_read  = ctx.state.requirements.wave_lds_ordering;
+	ctx.state.lds_pending_write = ctx.state.requirements.wave_lds_ordering;
 	bool emitted_non_phi = false;
 	for (const auto& inst: *block) {
 		if (inst.GetOpcode() == IR::ValueOpcode::Phi) {
@@ -328,6 +371,9 @@ void EmitBlock(ValueEmitContext& ctx, const IR::Block* block, EmitInstruction&& 
 			}
 		} else {
 			emitted_non_phi = true;
+		}
+		if (NeedsWaveLdsOrdering(ctx.state, inst)) {
+			EmitWaveLdsBarrier(ctx.state);
 		}
 		for (uint32_t half = 0; half < ctx.state.lane_count; half++) {
 			auto& lane          = half == 0 ? ctx : *ctx.other_half;

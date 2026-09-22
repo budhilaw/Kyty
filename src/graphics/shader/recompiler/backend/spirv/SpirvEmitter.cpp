@@ -234,9 +234,16 @@ Emitter::SpirvRequirements Emitter::AnalyzeProgramRequirements(const IR::Program
 				if (kind != IR::ResourceKind::Lds && kind != IR::ResourceKind::Gds) {
 					Fail(program, "shared operation has invalid resource kind");
 				}
-				if (program.stage != ShaderType::Compute && program.stage != ShaderType::Mesh &&
-				    kind == IR::ResourceKind::Lds) {
+				const bool workgroup_lds = kind == IR::ResourceKind::Lds &&
+				                           (program.stage == ShaderType::Compute ||
+				                            program.stage == ShaderType::Mesh);
+				if (kind == IR::ResourceKind::Lds && !workgroup_lds) {
 					requirements.function_lds = true;
+				}
+				// A guest wave issues its LDS operations in order, so its lanes never observe
+				// each other's accesses out of order. A host subgroup promises no such thing.
+				if (workgroup_lds && shared_access != IR::SharedAccess::Read) {
+					requirements.wave_lds_ordering = true;
 				}
 				if (shared_access == IR::SharedAccess::Append ||
 				    shared_access == IR::SharedAccess::Consume) {
