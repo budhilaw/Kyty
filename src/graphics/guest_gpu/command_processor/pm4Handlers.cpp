@@ -293,8 +293,15 @@ static void HwCtxIgnoreAaMaskRegister([[maybe_unused]] uint32_t cmd_offset,
 
 static void HwCtxIgnoreAlphaToMaskRegister([[maybe_unused]] uint32_t value) {}
 
+// Guests program the plane equations up front and enable them later through PA_CL_CLIP_CNTL, so
+// a write while UCP_ENA is clear has no effect. ClipCheck gates the enabled case at draw time.
 static void HwCtxIgnoreDisabledUserClipPlane(CommandProcessor& cp, uint32_t value) {
-	EXIT_NOT_IMPLEMENTED(value != 0 || cp.GetCtx().GetClipControl().user_clip_planes != 0);
+	const auto enabled = cp.GetCtx().GetClipControl().user_clip_planes;
+	if (enabled == 0) {
+		return;
+	}
+	EXIT("user clip planes enabled: UCP_ENA = 0x%02" PRIx8 ", plane value = 0x%08" PRIx32 "\n",
+	     enabled, value);
 }
 
 // Offsets RDNA 2 leaves undefined, checked against Mesa's gfx103 register table. The PS5
