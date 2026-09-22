@@ -297,9 +297,32 @@ static void HwCtxIgnoreDisabledUserClipPlane(CommandProcessor& cp, uint32_t valu
 	EXIT_NOT_IMPLEMENTED(value != 0 || cp.GetCtx().GetClipControl().user_clip_planes != 0);
 }
 
+// Offsets RDNA 2 leaves undefined, checked against Mesa's gfx103 register table. The PS5
+// programs them, so there is no documented effect to reproduce and no way to implement them.
+static bool IsPs5OnlyContextRegister(uint32_t offset) {
+	return offset >= 0x22u && offset <= 0x79u;
+}
+
+static bool IsPs5OnlyShaderRegister(uint32_t offset) {
+	return offset >= 0x193u && offset <= 0x1a2u;
+}
+
+static void LogPs5OnlyRegister(const char* space, uint32_t offset, uint32_t value) {
+	static std::atomic<uint32_t> log_count {0};
+	if (log_count.fetch_add(1, std::memory_order_relaxed) < 32) {
+		LOGF("\t diagnostic: ignoring PS5-only %s register 0x%" PRIx32 ", value = 0x%08" PRIx32
+		     "; no RDNA 2 equivalent\n",
+		     space, offset, value);
+	}
+}
+
 // Base address for the hardware's cache coherency ops; the host tracks those with Vulkan
 // barriers instead, so the address itself is unused.
 static void HwCtxIgnoreCoherDestBase([[maybe_unused]] uint32_t value) {}
+
+// Overrides the depth block's variable-rate shading. Without VRS the host already shades every
+// sample, which is the finest rate this can select.
+static void HwCtxIgnoreVrsOverrideControl([[maybe_unused]] uint32_t value) {}
 
 static void HwCtxIgnoreDrawPayloadControl([[maybe_unused]] uint32_t value) {}
 
@@ -2030,14 +2053,8 @@ KYTY_CP_OP_PARSER(CpOpIndirectCxRegs) {
 				}
 				continue;
 			}
-			// RDNA 2 leaves 0x3c-0x42 undefined; the PS5 programs 0x3f, so its effect cannot be
-			// derived from the PC register map.
-			if (raw_cmd_offset == 0x3fu) {
-				static std::atomic_flag logged = ATOMIC_FLAG_INIT;
-				if (!logged.test_and_set(std::memory_order_relaxed)) {
-					Log::WriteToConsoleAndLog(
-					    "\t diagnostic: ignoring indirect CX 0x3f; no RDNA 2 equivalent\n");
-				}
+			if (IsPs5OnlyContextRegister(raw_cmd_offset)) {
+				LogPs5OnlyRegister("CX", raw_cmd_offset, value);
 				continue;
 			}
 			EXIT("unknown cx reg at %05" PRIx32 ": 0x%" PRIx32 " (raw 0x%" PRIx32
@@ -2097,6 +2114,10 @@ KYTY_CP_OP_PARSER(CpOpIndirectShRegs) {
 		auto pfunc = g_hw_sh_indirect_func[cmd_offset];
 
 		if (pfunc == nullptr) {
+			if (IsPs5OnlyShaderRegister(cmd_offset)) {
+				LogPs5OnlyRegister("SH", cmd_offset, value);
+				continue;
+			}
 			LOGF("unknown indirect SH register: index=%" PRIu32 "/%" PRIu32 ", regs=0x%016" PRIx64
 			     ", offset=0x%08" PRIx32 ", value=0x%08" PRIx32 "\n",
 			     i, indirect_num_dw, indirect_address, cmd_offset, value);
@@ -3139,6 +3160,15 @@ void GraphicsInitJmpTablesCxIndirect() {
 	g_hw_ctx_indirect_func[Pm4::VGT_TF_PARAM] = [](KYTY_HW_CTX_INDIRECT_ARGS) {
 		cp.GetCtx().SetTfParam(value);
 	};
+	g_hw_ctx_indirect_func[Pm4::DB_VRS_OVERRIDE_CNTL] = [](KYTY_HW_CTX_INDIRECT_ARGS) {
+		HwCtxIgnoreVrsOverrideControl(value);
+	};
+	for (auto cmd_offset = Pm4::COHER_DEST_BASE_HI_0; cmd_offset <= Pm4::COHER_DEST_BASE_3;
+	     cmd_offset++) {
+		g_hw_ctx_indirect_func[cmd_offset] = [](KYTY_HW_CTX_INDIRECT_ARGS) {
+			HwCtxIgnoreCoherDestBase(value);
+		};
+	}
 	g_hw_ctx_indirect_func[Pm4::COHER_DEST_BASE_0] = [](KYTY_HW_CTX_INDIRECT_ARGS) {
 		HwCtxIgnoreCoherDestBase(value);
 	};

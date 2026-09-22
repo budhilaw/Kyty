@@ -210,6 +210,8 @@ constexpr uint32_t DB_STENCIL_READ_BASE  = 0x13;
 constexpr uint32_t DB_Z_WRITE_BASE       = 0x14;
 constexpr uint32_t DB_STENCIL_WRITE_BASE = 0x15;
 
+constexpr uint32_t DB_VRS_OVERRIDE_CNTL = 0x19;
+
 constexpr uint32_t DB_Z_READ_BASE_HI                  = 0x1A;
 constexpr uint32_t DB_STENCIL_READ_BASE_HI            = 0x1B;
 constexpr uint32_t DB_Z_WRITE_BASE_HI                 = 0x1C;
@@ -266,6 +268,11 @@ constexpr uint32_t PA_SC_GENERIC_SCISSOR_BR_BR_Y_MASK  = 0x7FFF;
 
 constexpr uint32_t COHER_DEST_BASE_0 = 0x92;
 constexpr uint32_t COHER_DEST_BASE_1 = 0x93;
+
+constexpr uint32_t COHER_DEST_BASE_HI_0 = 0x7A;
+constexpr uint32_t COHER_DEST_BASE_HI_3 = 0x7D;
+constexpr uint32_t COHER_DEST_BASE_2    = 0x7E;
+constexpr uint32_t COHER_DEST_BASE_3    = 0x7F;
 
 constexpr uint32_t PA_SC_VPORT_SCISSOR_0_TL                             = 0x94;
 constexpr uint32_t PA_SC_VPORT_SCISSOR_0_TL_TL_X_SHIFT                  = 0;
