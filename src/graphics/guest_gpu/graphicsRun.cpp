@@ -96,6 +96,11 @@ static void Pm4FatalPrintf(const char* format, ...) {
 		Pm4FatalPrintf(__VA_ARGS__);                                                               \
 	} while (false)
 
+// A lost packet boundary shows up well before the dword that fails to decode, so the trailing
+// window has to be wide enough to walk back to the last valid header.
+constexpr uint32_t kPm4DumpBefore = 64;
+constexpr uint32_t kPm4DumpAfter  = 16;
+
 GuestGpu::GuestGpu(RenderContext& renderer): m_renderer(renderer) {
 	EXIT_NOT_IMPLEMENTED(!Common::Thread::IsMainThread());
 	GraphicsInitJmpTables();
@@ -777,8 +782,8 @@ void CommandProcessor::ProcessPm4(Pm4Execution& execution) {
 			                   ", offset=0x%05" PRIx32 ", current=0x%016" PRIx64 "\n",
 			                   reinterpret_cast<uint64_t>(packet - offset), total_dw, offset,
 			                   reinterpret_cast<uint64_t>(packet));
-			const auto  dump_begin = (offset > 8 ? offset - 8 : 0);
-			const auto  dump_end   = std::min<uint32_t>(total_dw, offset + 16);
+			const auto  dump_begin = (offset > kPm4DumpBefore ? offset - kPm4DumpBefore : 0);
+			const auto  dump_end   = std::min<uint32_t>(total_dw, offset + kPm4DumpAfter);
 			auto* const base       = packet - offset;
 			for (uint32_t i = dump_begin; i < dump_end; i++) {
 				KYTY_PM4_FATAL_LOG("\t%05" PRIx32 "%s %08" PRIx32 "\n", i,
@@ -801,8 +806,8 @@ void CommandProcessor::ProcessPm4(Pm4Execution& execution) {
 			                   opcode, packet_header, KYTY_PM4_LEN(packet_header), packet_dw,
 			                   remaining_dw, total_dw, offset,
 			                   reinterpret_cast<uint64_t>(packet - offset));
-			const auto  dump_begin = (offset > 8 ? offset - 8 : 0);
-			const auto  dump_end   = std::min<uint32_t>(total_dw, offset + 16);
+			const auto  dump_begin = (offset > kPm4DumpBefore ? offset - kPm4DumpBefore : 0);
+			const auto  dump_end   = std::min<uint32_t>(total_dw, offset + kPm4DumpAfter);
 			auto* const base       = packet - offset;
 			for (uint32_t i = dump_begin; i < dump_end; i++) {
 				KYTY_PM4_FATAL_LOG("\t%05" PRIx32 "%s %08" PRIx32 "\n", i,
