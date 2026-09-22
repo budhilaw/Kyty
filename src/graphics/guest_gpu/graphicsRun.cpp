@@ -733,7 +733,17 @@ void CommandProcessor::ProcessPm4(Pm4Execution& execution) {
 		const auto        opcode        = (packet_header >> 8u) & 0xffu;
 		EXIT_NOT_IMPLEMENTED(remaining_dw > total_dw);
 
-		if (packet_header == 0x80000000u) {
+		// Only type 3 carries a body. Type 0/1/2 are header-only padding, skipped one dword at a
+		// time exactly as the disassembler in pm4.cpp does.
+		if ((packet_header >> 30u) != 3u) {
+			if (packet_header != 0x80000000u) {
+				static std::atomic<uint32_t> skip_log_count {0};
+				if (skip_log_count.fetch_add(1) < 64) {
+					LOGF("\t skipping type %" PRIu32 " packet at 0x%05" PRIx32
+					     ": cmd_id = 0x%08" PRIx32 "\n",
+					     packet_header >> 30u, total_dw - remaining_dw, packet_header);
+				}
+			}
 			cursor.offset_dw++;
 			execution.m_made_progress = true;
 			continue;
