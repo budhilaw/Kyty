@@ -83,6 +83,19 @@ static void RecordEndOfPipeWrite(uint64_t submit_id, CommandBuffer& buffer, uint
 	const auto value_low  = static_cast<uint32_t>(value);
 	const auto value_high = static_cast<uint32_t>(value >> 32u);
 	const auto operation  = static_cast<uint32_t>(DebugOperation(action));
+
+	// The guest polls this address with WAIT_REG_MEM, so the value has to reach memory once the
+	// work retires. Queued before any interrupt so the handler observes it.
+	auto& scheduler = buffer.GetContext().GetCommandScheduler();
+	EXIT_IF(!scheduler.Active() || &buffer != &scheduler.Current());
+	scheduler.DeferPriorityOperation([destination, value, size] {
+		if (size == EndOfPipeWriteSize::Qword) {
+			*reinterpret_cast<uint64_t*>(destination) = value;
+		} else {
+			*reinterpret_cast<uint32_t*>(destination) = static_cast<uint32_t>(value);
+		}
+	});
+
 	if (TriggersInterrupt(action)) {
 		buffer.SetDebugInfo(operation, submit_id, width, context_id, value_low, value_high,
 		                    destination);
