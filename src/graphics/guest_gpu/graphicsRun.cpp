@@ -749,10 +749,9 @@ void CommandProcessor::ProcessPm4(Pm4Execution& execution) {
 			continue;
 		}
 
-		EXIT_NOT_IMPLEMENTED(remaining_dw < 2);
-
 		// A submitted size may end mid-packet. Handlers read their body unconditionally, so the
-		// declared length has to be checked before dispatch or they read past the buffer.
+		// declared length has to be checked before dispatch or they read past the buffer. Type 3
+		// always spans at least two dwords, so a lone trailing header is truncated by definition.
 		if (KYTY_PM4_LEN(packet_header) > remaining_dw) {
 			static std::atomic<uint32_t> truncated_log_count {0};
 			if (truncated_log_count.fetch_add(1) < 16) {
