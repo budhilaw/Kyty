@@ -1758,8 +1758,6 @@ int KYTY_SYSV_ABI PthreadMutexLock(PthreadMutex* mutex) {
 
 	int result = NativeMutexLock(*mutex, nullptr);
 
-	// LOGF("\tmutex lock: %s, %d\n", (*mutex)->name.c_str(), result);
-
 	switch (result) {
 		case 0: return OK;
 		case EAGAIN: return KERNEL_ERROR_EAGAIN;
@@ -2847,6 +2845,9 @@ int KYTY_SYSV_ABI PthreadCondTimedwait(PthreadCond* cond, PthreadMutex* mutex,
                                        KernelUseconds usec) {
 	// PRINT_NAME();
 
+	LOGF("\t GWAIT: condtimedwait cond=0x%016" PRIx64 " usec=%" PRIu64 " thread=%d\n",
+	     reinterpret_cast<uint64_t>(cond), static_cast<uint64_t>(usec),
+	     Common::Thread::GetThreadIdUnique());
 	auto* pthread_static_objects = g_pthread_context->GetPthreadStaticObjects();
 
 	cond = static_cast<PthreadCond*>(
@@ -3011,6 +3012,11 @@ int KYTY_SYSV_ABI PthreadCondTimedwaitAbs(PthreadCond* cond, PthreadMutex* mutex
 
 int KYTY_SYSV_ABI PthreadCondWait(PthreadCond* cond, PthreadMutex* mutex) {
 	PRINT_NAME();
+
+	LOGF("\t GWAIT: condwait cond=0x%016" PRIx64 " thread=%d\n",
+	     reinterpret_cast<uint64_t>(cond), Common::Thread::GetThreadIdUnique());
+
+	Common::WaitTrace::Scope wait_scope(Common::WaitTrace::Kind::CondVar);
 
 	auto* pthread_static_objects = g_pthread_context->GetPthreadStaticObjects();
 
@@ -3611,6 +3617,10 @@ int KYTY_SYSV_ABI PthreadRename(Pthread thread, const char* name) {
 }
 
 void KYTY_SYSV_ABI PthreadYield() {
+	static std::atomic<uint32_t> yield_log_count {0};
+	if (yield_log_count.fetch_add(1) < 4096) {
+		LOGF("\t GWAIT: yield thread=%d\n", Common::Thread::GetThreadIdUnique());
+	}
 	SchedulerBackoffOnce();
 }
 
@@ -3842,6 +3852,8 @@ void KYTY_SYSV_ABI KernelSetThreadDtors(thread_dtors_func_t dtors) {
 }
 
 int KYTY_SYSV_ABI KernelUsleep(KernelUseconds microseconds) {
+	Common::WaitTrace::Scope wait_scope(Common::WaitTrace::Kind::Sleep);
+	LOGF("\t GWAIT: usleep usec=%u thread=%d\n", microseconds, Common::Thread::GetThreadIdUnique());
 	Common::Timer t;
 	t.Start();
 	SleepMicroWithSignalPoll(microseconds);
@@ -3867,6 +3879,9 @@ int KYTY_SYSV_ABI KernelNanosleep(const KernelTimespec* rqtp, KernelTimespec* rm
 	if (rqtp == nullptr) {
 		return KERNEL_ERROR_EFAULT;
 	}
+	LOGF("\t GWAIT: nanosleep sec=%" PRId64 " nsec=%" PRId64 " thread=%d\n",
+	     static_cast<int64_t>(rqtp->tv_sec), static_cast<int64_t>(rqtp->tv_nsec),
+	     Common::Thread::GetThreadIdUnique());
 
 	if (rqtp->tv_sec < 0 || rqtp->tv_nsec < 0 || rqtp->tv_nsec >= 1000000000) {
 		return KERNEL_ERROR_EINVAL;

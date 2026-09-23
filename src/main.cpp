@@ -2,11 +2,26 @@
 #include "common/dateTime.h"
 #include "common/debug.h"
 #include "common/file.h"
+#include "common/logging/log.h"
 #include "common/stringUtils.h"
 #include "common/threads.h"
 #include "common/virtualMemory.h"
 #include "emulator.h"
 #include "kytyGitVersion.h"
+
+#include <atomic>
+#include <chrono>
+#include <thread>
+#include <unordered_map>
+
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+
+#include <tlhelp32.h>
+#endif
 
 #include <charconv>
 #include <cstdio>
@@ -355,9 +370,484 @@ static bool ParseArgs(int argc, char* argv[], RunOptions& options, bool& show_he
 	return show_help || (!options.app0_dir.empty() && !options.elf.empty());
 }
 
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+// Reports any thread that burns CPU without making a kernel call, with the instruction pointer
+// so a guest spin loop can be traced back to its module.
+static void StartSpinWatchdog() {
+	std::thread([] {
+		std::unordered_map<DWORD, uint64_t> previous;
+		const auto                          process = GetCurrentProcessId();
+		const auto                          self    = GetCurrentThreadId();
+		for (;;) {
+			std::this_thread::sleep_for(std::chrono::seconds(10));
+			auto snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
+			if (snapshot == INVALID_HANDLE_VALUE) {
+				continue;
+			}
+			THREADENTRY32 entry {};
+			entry.dwSize = sizeof(entry);
+			if (Thread32First(snapshot, &entry) != 0) {
+				do {
+					if (entry.th32OwnerProcessID != process || entry.th32ThreadID == self) {
+						continue;
+					}
+					auto* handle = OpenThread(THREAD_QUERY_INFORMATION | THREAD_GET_CONTEXT |
+					                              THREAD_SUSPEND_RESUME,
+					                          FALSE, entry.th32ThreadID);
+					if (handle == nullptr) {
+						continue;
+					}
+					FILETIME creation {};
+					FILETIME exited {};
+					FILETIME kernel {};
+					FILETIME user {};
+					if (GetThreadTimes(handle, &creation, &exited, &kernel, &user) != 0) {
+						const auto to_ticks = [](const FILETIME& time) {
+							return (static_cast<uint64_t>(time.dwHighDateTime) << 32u) |
+							       time.dwLowDateTime;
+						};
+						const auto total = to_ticks(kernel) + to_ticks(user);
+						const auto found = previous.find(entry.th32ThreadID);
+						const auto delta = found == previous.end() ? 0 : total - found->second;
+						previous[entry.th32ThreadID] = total;
+						// Half the sample window spent running means a spin, not normal work.
+						if (delta > 50000000ull) {
+							CONTEXT context {};
+							context.ContextFlags = CONTEXT_FULL;
+							bool captured        = false;
+							if (SuspendThread(handle) != static_cast<DWORD>(-1)) {
+								captured = GetThreadContext(handle, &context) != 0;
+								ResumeThread(handle);
+							}
+							if (!captured) {
+								CloseHandle(handle);
+								continue;
+							}
+							LOGF("\t SPIN: os_thread=%lu cpu_ms=%" PRIu64 " rip=0x%016" PRIx64
+							     " rsp=0x%016" PRIx64 "\n",
+							     entry.th32ThreadID, delta / 10000ull, context.Rip, context.Rsp);
+							LOGF("\t SPIN:   rax=%016" PRIx64 " rbx=%016" PRIx64 " rcx=%016" PRIx64
+							     " rdx=%016" PRIx64 "\n",
+							     context.Rax, context.Rbx, context.Rcx, context.Rdx);
+							LOGF("\t SPIN:   rsi=%016" PRIx64 " rdi=%016" PRIx64 " rbp=%016" PRIx64
+							     " r8= %016" PRIx64 "\n",
+							     context.Rsi, context.Rdi, context.Rbp, context.R8);
+							LOGF("\t SPIN:   r9= %016" PRIx64 " r10=%016" PRIx64 " r11=%016" PRIx64
+							     " r12=%016" PRIx64 "\n",
+							     context.R9, context.R10, context.R11, context.R12);
+							LOGF("\t SPIN:   r13=%016" PRIx64 " r14=%016" PRIx64 " r15=%016" PRIx64
+							     "\n",
+							     context.R13, context.R14, context.R15);
+							const auto* code =
+							    reinterpret_cast<const uint8_t*>(context.Rip - 0x20);
+							LOGF("\t SPIN:   code@rip-0x20:");
+							for (uint32_t offset = 0; offset < 0x40; offset++) {
+								LOGF("%s%02x", offset == 0x20 ? " |" : " ", code[offset]);
+							}
+							LOGF("\n");
+							const auto* stack = reinterpret_cast<const uint64_t*>(context.Rsp);
+							LOGF("\t SPIN:   stack:");
+							for (uint32_t slot = 0; slot < 8; slot++) {
+								LOGF(" %016" PRIx64, stack[slot]);
+							}
+							LOGF("\n");
+						}
+					}
+					CloseHandle(handle);
+				} while (Thread32Next(snapshot, &entry) != 0);
+			}
+			CloseHandle(snapshot);
+		}
+	}).detach();
+}
+
+// KYTY_SAMPLE=<os thread id> samples that thread's instruction pointer every millisecond and
+// prints the hottest addresses on exit, as offsets into the module so llvm-symbolizer can name
+// them. Used to find where a saturated thread actually spends its time.
+extern std::atomic<uint64_t> g_kyty_flip_counter;
+
+// KYTY_HANG_DUMP=1: when no frame has been presented for eight seconds, print the wait
+// report and where the command-processor thread is, a few times, so a hang can be read.
+static void StartHangWatch() {
+	if (std::getenv("KYTY_HANG_DUMP") == nullptr) {
+		return;
+	}
+	std::thread([] {
+		uint64_t last  = 0;
+		int      stale = 0;
+		int      dumps = 0;
+		for (;;) {
+			Common::Thread::SleepMicro(2000000);
+			const auto now = g_kyty_flip_counter.load(std::memory_order_relaxed);
+			if (now != last) {
+				last  = now;
+				stale = 0;
+				continue;
+			}
+			if (++stale < 4 || dumps >= 3) {
+				continue;
+			}
+			dumps++;
+			printf("HANGDUMP flips=%" PRIu64 "\n", now);
+			Common::WaitTrace::Report(0.0, now);
+			const auto target =
+			    Common::WaitTrace::HottestOsThread(Common::WaitTrace::Kind::GpuProcess);
+			HANDLE handle = OpenThread(THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT |
+			                               THREAD_QUERY_INFORMATION,
+			                           FALSE, target);
+			if (handle == nullptr) {
+				printf("HANGDUMP cannot open gpu thread %lu\n", target);
+				fflush(stdout);
+				continue;
+			}
+			const auto base = reinterpret_cast<uint64_t>(GetModuleHandleA(nullptr));
+			for (int sample = 0; sample < 6; sample++) {
+				Common::Thread::SleepMicro(50000);
+				if (SuspendThread(handle) == static_cast<DWORD>(-1)) {
+					break;
+				}
+				CONTEXT context {};
+				context.ContextFlags = CONTEXT_CONTROL | CONTEXT_INTEGER;
+				if (GetThreadContext(handle, &context) != 0) {
+					char    rip_name[64] = "?";
+					HMODULE rip_module   = nullptr;
+					if (GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+					                           GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+					                       reinterpret_cast<LPCSTR>(context.Rip), &rip_module) != 0) {
+						char full[MAX_PATH] = "";
+						GetModuleFileNameA(rip_module, full, MAX_PATH);
+						const char* slash = std::strrchr(full, '\\');
+						std::snprintf(rip_name, sizeof(rip_name), "%s",
+						              slash != nullptr ? slash + 1 : full);
+					}
+					printf("HANGDUMP gpu thread rip=%s+0x%" PRIx64 " stack:", rip_name,
+					       rip_module != nullptr
+					           ? context.Rip - reinterpret_cast<uint64_t>(rip_module)
+					           : context.Rip);
+					const auto* stack = reinterpret_cast<const uint64_t*>(context.Rsp);
+					int         kept  = 0;
+					for (int slot = 0; slot < 1024 && kept < 12; slot++) {
+						uint64_t value = 0;
+						if (ReadProcessMemory(GetCurrentProcess(), stack + slot, &value,
+						                      sizeof(value), nullptr) == 0) {
+							break;
+						}
+						if (value >= base && value < base + 0x2000000) {
+							printf(" %" PRIx64, value - base);
+							kept++;
+						}
+					}
+					printf("\n");
+				}
+				ResumeThread(handle);
+			}
+			CloseHandle(handle);
+			fflush(stdout);
+		}
+	}).detach();
+}
+
+static void StartSampler() {
+	const char* text = std::getenv("KYTY_SAMPLE");
+	if (text == nullptr) {
+		return;
+	}
+	const auto requested = static_cast<DWORD>(std::strtoul(text, nullptr, 10));
+	const auto delay     = [] {
+		const char* value = std::getenv("KYTY_SAMPLE_DELAY");
+		return value != nullptr ? std::strtoul(value, nullptr, 10) : 45ul;
+	}();
+	const auto seconds = [] {
+		const char* value = std::getenv("KYTY_SAMPLE_SECONDS");
+		return value != nullptr ? std::strtoul(value, nullptr, 10) : 20ul;
+	}();
+
+	std::thread([requested, delay, seconds] {
+		std::this_thread::sleep_for(std::chrono::seconds(delay));
+
+		// Without an explicit id, sample whichever thread has burned the most CPU by now: that
+		// is the one holding the frame rate down.
+		auto target = requested;
+		if (target == 1) {
+			// The thread with the most CPU is the window pump; the one to look at is whichever
+			// has spent the most time inside guest command processing.
+			target = Common::WaitTrace::HottestOsThread(Common::WaitTrace::Kind::GpuProcess);
+			printf("sampler: command-processor thread %lu\n", target);
+		} else if (target == 0) {
+			const auto process = GetCurrentProcessId();
+			const auto self    = GetCurrentThreadId();
+			uint64_t   best    = 0;
+			auto*      snap    = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
+			if (snap != INVALID_HANDLE_VALUE) {
+				THREADENTRY32 entry {};
+				entry.dwSize = sizeof(entry);
+				if (Thread32First(snap, &entry) != 0) {
+					do {
+						if (entry.th32OwnerProcessID != process || entry.th32ThreadID == self) {
+							continue;
+						}
+						auto* probe = OpenThread(THREAD_QUERY_INFORMATION, FALSE, entry.th32ThreadID);
+						if (probe == nullptr) {
+							continue;
+						}
+						FILETIME creation {};
+						FILETIME exited {};
+						FILETIME kernel {};
+						FILETIME user {};
+						if (GetThreadTimes(probe, &creation, &exited, &kernel, &user) != 0) {
+							const auto to_ticks = [](const FILETIME& t) {
+								return (static_cast<uint64_t>(t.dwHighDateTime) << 32u) |
+								       t.dwLowDateTime;
+							};
+							const auto total = to_ticks(kernel) + to_ticks(user);
+							if (total > best) {
+								best   = total;
+								target = entry.th32ThreadID;
+							}
+						}
+						CloseHandle(probe);
+					} while (Thread32Next(snap, &entry) != 0);
+				}
+				CloseHandle(snap);
+			}
+			printf("sampler: auto-selected thread %lu (cpu %.1f ms)\n", target,
+			       static_cast<double>(best) / 10000.0);
+		}
+		auto* handle =
+		    OpenThread(THREAD_GET_CONTEXT | THREAD_SUSPEND_RESUME | THREAD_QUERY_INFORMATION, FALSE,
+		               target);
+		if (handle == nullptr) {
+			printf("sampler: cannot open thread %lu\n", target);
+			return;
+		}
+		const auto base = reinterpret_cast<uint64_t>(GetModuleHandleW(nullptr));
+		constexpr uint64_t                     ModuleSpan = 0x2000000;
+		std::unordered_map<uint64_t, uint32_t> histogram;
+		std::unordered_map<uint64_t, uint32_t> callers;
+		int                                    dumped = 0;
+		uint64_t                               taken = 0;
+		for (uint64_t i = 0; i < static_cast<uint64_t>(seconds) * 1000; i++) {
+			Common::Thread::SleepMicro(1000);
+			if (SuspendThread(handle) == static_cast<DWORD>(-1)) {
+				break;
+			}
+			CONTEXT context {};
+			context.ContextFlags = CONTEXT_CONTROL | CONTEXT_INTEGER;
+			if (GetThreadContext(handle, &context) != 0) {
+				histogram[context.Rip]++;
+				taken++;
+				// A blocked thread's instruction pointer only names the syscall. Scanning the
+				// stack for the nearest return address inside this module names the caller.
+				if (context.Rip < base || context.Rip >= base + ModuleSpan) {
+					// The first few samples blocked in the GPU driver's kernel interface get their
+					// raw stack printed with module attribution, enough to read the chain by hand.
+					HMODULE rip_module   = nullptr;
+					char    rip_name[64] = "";
+					if (GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+					                           GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+					                       reinterpret_cast<LPCSTR>(context.Rip), &rip_module) != 0) {
+						char full[MAX_PATH] = "";
+						GetModuleFileNameA(rip_module, full, MAX_PATH);
+						const char* slash = std::strrchr(full, '\\');
+						std::snprintf(rip_name, sizeof(rip_name), "%s", slash != nullptr ? slash + 1 : full);
+					}
+					if (dumped < 4 && std::strstr(rip_name, "win32u") != nullptr) {
+						dumped++;
+						printf("  STACK sample rip=0x%016" PRIx64 " rsp=0x%016" PRIx64 "\n",
+						       context.Rip, context.Rsp);
+						const auto* stack = reinterpret_cast<const uint64_t*>(context.Rsp);
+						for (int slot = 0; slot < 96; slot++) {
+							uint64_t value = 0;
+							if (ReadProcessMemory(GetCurrentProcess(), stack + slot, &value,
+							                      sizeof(value), nullptr) == 0) {
+								break;
+							}
+							HMODULE module = nullptr;
+							if (value < 0x10000 ||
+							    GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+							                           GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+							                       reinterpret_cast<LPCSTR>(value), &module) == 0 ||
+							    module == nullptr) {
+								continue;
+							}
+							char full[MAX_PATH] = "";
+							GetModuleFileNameA(module, full, MAX_PATH);
+							const char* slash = std::strrchr(full, '\\');
+							printf("    [%2d] %-22s +0x%" PRIx64 "\n", slot,
+							       slash != nullptr ? slash + 1 : full,
+							       value - reinterpret_cast<uint64_t>(module));
+						}
+					}
+					const auto* stack = reinterpret_cast<const uint64_t*>(context.Rsp);
+					for (int slot = 0; slot < 256; slot++) {
+						uint64_t value = 0;
+						if (ReadProcessMemory(GetCurrentProcess(), stack + slot, &value,
+						                      sizeof(value), nullptr) == 0) {
+							break;
+						}
+						if (value >= base && value < base + ModuleSpan) {
+							callers[value]++;
+							break;
+						}
+					}
+				}
+			}
+			ResumeThread(handle);
+		}
+		CloseHandle(handle);
+
+		std::vector<std::pair<uint64_t, uint32_t>> rows(histogram.begin(), histogram.end());
+		std::sort(rows.begin(), rows.end(),
+		          [](const auto& a, const auto& b) { return a.second > b.second; });
+		printf("SAMPLER thread=%lu samples=%" PRIu64 " module_base=0x%016" PRIx64 "\n", target,
+		       taken, base);
+		{
+			std::vector<std::pair<uint64_t, uint32_t>> call_rows(callers.begin(), callers.end());
+			std::sort(call_rows.begin(), call_rows.end(),
+			          [](const auto& a, const auto& b) { return a.second > b.second; });
+			printf("  -- nearest in-module caller while blocked --\n");
+			for (size_t row = 0; row < call_rows.size() && row < 16; row++) {
+				printf("  %5.1f%%  +0x%" PRIx64 "\n",
+				       100.0 * call_rows[row].second / static_cast<double>(taken == 0 ? 1 : taken),
+				       call_rows[row].first - base);
+			}
+			printf("  -- instruction pointer --\n");
+		}
+		for (size_t row = 0; row < rows.size() && row < 600; row++) {
+			const auto rip = rows[row].first;
+			char       module_name[MAX_PATH] = "?";
+			uint64_t   module_base           = 0;
+			HMODULE    module                = nullptr;
+			if (GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+			                           GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+			                       reinterpret_cast<LPCSTR>(rip), &module) != 0 &&
+			    module != nullptr) {
+				module_base = reinterpret_cast<uint64_t>(module);
+				char full[MAX_PATH] = "";
+				if (GetModuleFileNameA(module, full, MAX_PATH) != 0) {
+					const char* slash = std::strrchr(full, '\\');
+					std::snprintf(module_name, sizeof(module_name), "%s",
+					              slash != nullptr ? slash + 1 : full);
+				}
+			}
+			printf("  %5.1f%%  %-24s +0x%-10" PRIx64 " rip=0x%016" PRIx64 "\n",
+			       100.0 * rows[row].second / static_cast<double>(taken == 0 ? 1 : taken),
+			       module_name, module_base != 0 ? rip - module_base : 0, rip);
+		}
+		fflush(stdout);
+	}).detach();
+}
+
+// KYTY_HW_WATCH=<hex address> arms an x86 data breakpoint on that 8-byte slot in every thread,
+// so whichever instruction writes it is reported with its address, no matter which path it took.
+static uint64_t g_hw_watch_address = 0;
+
+static LONG CALLBACK HardwareWatchHandler(EXCEPTION_POINTERS* pointers) {
+	if (pointers->ExceptionRecord->ExceptionCode != STATUS_SINGLE_STEP ||
+	    (pointers->ContextRecord->Dr6 & 0xfull) == 0) {
+		return EXCEPTION_CONTINUE_SEARCH;
+	}
+	auto* context = pointers->ContextRecord;
+	// Only writes are armed: reading the slot here would retrigger a read breakpoint.
+	const auto value = *reinterpret_cast<uint64_t*>(g_hw_watch_address);
+	LOGF("\t HWWATCH: hit address=0x%016" PRIx64 " rip=0x%016" PRIx64 " value=0x%016" PRIx64
+	     " os_thread=%lu\n",
+	     g_hw_watch_address, context->Rip, value, GetCurrentThreadId());
+	LOGF("\t HWWATCH:   rax=%016" PRIx64 " rbx=%016" PRIx64 " rcx=%016" PRIx64 " rdx=%016" PRIx64
+	     "\n",
+	     context->Rax, context->Rbx, context->Rcx, context->Rdx);
+	LOGF("\t HWWATCH:   rsi=%016" PRIx64 " rdi=%016" PRIx64 " rbp=%016" PRIx64 " rsp=%016" PRIx64
+	     "\n",
+	     context->Rsi, context->Rdi, context->Rbp, context->Rsp);
+	LOGF("\t HWWATCH:   r12=%016" PRIx64 " r13=%016" PRIx64 " r14=%016" PRIx64 " r15=%016" PRIx64
+	     "\n",
+	     context->R12, context->R13, context->R14, context->R15);
+	const auto* code = reinterpret_cast<const uint8_t*>(context->Rip - 0x20);
+	LOGF("\t HWWATCH:   code@rip-0x20:");
+	for (uint32_t offset = 0; offset < 0x40; offset++) {
+		LOGF("%s%02x", offset == 0x20 ? " |" : " ", code[offset]);
+	}
+	LOGF("\n");
+	const auto* stack = reinterpret_cast<const uint64_t*>(context->Rsp);
+	LOGF("\t HWWATCH:   stack:");
+	for (uint32_t slot = 0; slot < 8; slot++) {
+		LOGF(" %016" PRIx64, stack[slot]);
+	}
+	LOGF("\n");
+	context->Dr6 = 0;
+	return EXCEPTION_CONTINUE_EXECUTION;
+}
+
+static void StartHardwareWatch() {
+	const char* text = std::getenv("KYTY_HW_WATCH");
+	if (text == nullptr) {
+		return;
+	}
+	g_hw_watch_address = std::strtoull(text, nullptr, 16);
+	if (g_hw_watch_address == 0 || (g_hw_watch_address & 7u) != 0) {
+		printf("KYTY_HW_WATCH needs an 8-byte aligned hex address\n");
+		return;
+	}
+	AddVectoredExceptionHandler(1, HardwareWatchHandler);
+	printf("Hardware write watch armed on 0x%016llx\n",
+	       static_cast<unsigned long long>(g_hw_watch_address));
+
+	std::thread([] {
+		std::unordered_map<DWORD, bool> armed;
+		const auto                      process = GetCurrentProcessId();
+		const auto                      self    = GetCurrentThreadId();
+		for (;;) {
+			auto snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
+			if (snapshot != INVALID_HANDLE_VALUE) {
+				THREADENTRY32 entry {};
+				entry.dwSize = sizeof(entry);
+				if (Thread32First(snapshot, &entry) != 0) {
+					do {
+						if (entry.th32OwnerProcessID != process ||
+						    entry.th32ThreadID == self || armed[entry.th32ThreadID]) {
+							continue;
+						}
+						auto* handle = OpenThread(THREAD_GET_CONTEXT | THREAD_SET_CONTEXT |
+						                              THREAD_SUSPEND_RESUME,
+						                          FALSE, entry.th32ThreadID);
+						if (handle == nullptr) {
+							continue;
+						}
+						if (SuspendThread(handle) != static_cast<DWORD>(-1)) {
+							CONTEXT context {};
+							context.ContextFlags = CONTEXT_DEBUG_REGISTERS;
+							if (GetThreadContext(handle, &context) != 0) {
+								context.Dr0 = g_hw_watch_address;
+								// L0 enabled, break on write, 8-byte length.
+								context.Dr7 = (context.Dr7 & ~0xf0003ull) |
+								              0xd0001ull;
+								context.ContextFlags = CONTEXT_DEBUG_REGISTERS;
+								if (SetThreadContext(handle, &context) != 0) {
+									armed[entry.th32ThreadID] = true;
+								}
+							}
+							ResumeThread(handle);
+						}
+						CloseHandle(handle);
+					} while (Thread32Next(snapshot, &entry) != 0);
+				}
+				CloseHandle(snapshot);
+			}
+			std::this_thread::sleep_for(std::chrono::milliseconds(200));
+		}
+	}).detach();
+}
+#endif
+
 static int Main(int argc, char* argv[]) {
 	VirtualMemory::Init();
 	InitializeThreads();
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+	StartSpinWatchdog();
+	StartHardwareWatch();
+	StartSampler();
+	StartHangWatch();
+#endif
 
 	RunOptions options;
 	bool       show_help = false;

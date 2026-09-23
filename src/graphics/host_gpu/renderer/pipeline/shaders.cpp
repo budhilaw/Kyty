@@ -18,6 +18,8 @@
 #include "graphics/shader/rectListShader.h"
 #include "graphics/shader/shader.h"
 
+#include <cstdio>
+#include <cinttypes>
 #include <algorithm>
 #include <limits>
 #include <span>
@@ -610,6 +612,9 @@ void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& p
 	info.stage             = comp_shader_stage_info;
 	info.layout            = pipeline.pipeline_layout;
 	info.basePipelineIndex = -1;
+	if (graphics.pipeline_stats_enabled) {
+		info.flags |= vk::PipelineCreateFlagBits::eCaptureStatisticsKHR;
+	}
 
 	EXIT_IF(pipeline.pipeline != nullptr);
 
@@ -622,6 +627,52 @@ void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& p
 	EXIT_NOT_IMPLEMENTED(result != vk::Result::eSuccess);
 
 	EXIT_NOT_IMPLEMENTED(pipeline.pipeline == nullptr);
+
+	if (graphics.pipeline_stats_enabled) {
+		vk::PipelineInfoKHR pipeline_query {};
+		pipeline_query.pipeline = pipeline.pipeline;
+		uint32_t count          = 0;
+		if (graphics.device.getPipelineExecutablePropertiesKHR(&pipeline_query, &count, nullptr) ==
+		        vk::Result::eSuccess &&
+		    count != 0) {
+			std::vector<vk::PipelineExecutablePropertiesKHR> properties(count);
+			(void)graphics.device.getPipelineExecutablePropertiesKHR(&pipeline_query, &count,
+			                                                         properties.data());
+			for (uint32_t i = 0; i < count; i++) {
+				vk::PipelineExecutableInfoKHR executable {};
+				executable.pipeline        = pipeline.pipeline;
+				executable.executableIndex = i;
+				uint32_t stat_count        = 0;
+				(void)graphics.device.getPipelineExecutableStatisticsKHR(&executable, &stat_count,
+				                                                         nullptr);
+				std::vector<vk::PipelineExecutableStatisticKHR> stats(stat_count);
+				(void)graphics.device.getPipelineExecutableStatisticsKHR(&executable, &stat_count,
+				                                                         stats.data());
+				std::printf("PIPESTATS cs %016" PRIx64 " subgroup=%u:",
+				            input_info.stage.program != nullptr ? input_info.stage.program->shader_hash
+				                                                : 0,
+				            properties[i].subgroupSize);
+				for (const auto& stat: stats) {
+					switch (stat.format) {
+						case vk::PipelineExecutableStatisticFormatKHR::eBool32:
+							std::printf(" [%s=%u]", stat.name, stat.value.b32);
+							break;
+						case vk::PipelineExecutableStatisticFormatKHR::eInt64:
+							std::printf(" [%s=%" PRId64 "]", stat.name, stat.value.i64);
+							break;
+						case vk::PipelineExecutableStatisticFormatKHR::eUint64:
+							std::printf(" [%s=%" PRIu64 "]", stat.name, stat.value.u64);
+							break;
+						case vk::PipelineExecutableStatisticFormatKHR::eFloat64:
+							std::printf(" [%s=%.2f]", stat.name, stat.value.f64);
+							break;
+					}
+				}
+				std::printf("\n");
+				std::fflush(stdout);
+			}
+		}
+	}
 }
 
 } // namespace Libs::Graphics

@@ -40,6 +40,7 @@
 #include "libs/controller.h"
 #include "loader/systemContent.h"
 
+#include <atomic>
 #include <cstdlib>
 #include <fmt/format.h>
 #include <memory>
@@ -51,6 +52,9 @@
 #define STB_IMAGE_IMPLEMENTATION
 #define STBI_NO_SIMD
 #include "stb_image.h"
+
+// Frames presented so far, read by the hang watchdog in main.cpp.
+std::atomic<uint64_t> g_kyty_flip_counter {0};
 
 // IWYU pragma: no_include <intrin.h>
 
@@ -1014,11 +1018,20 @@ void WindowContext::UpdateTitle() {
 	const auto frequency = Common::Timer::QueryPerformanceFrequency();
 	frame_num++;
 	fps_frames++;
+	g_kyty_flip_counter.fetch_add(1, std::memory_order_relaxed);
 	if (now - fps_start >= frequency) {
 		current_fps = static_cast<double>(fps_frames) * static_cast<double>(frequency) /
 		              static_cast<double>(now - fps_start);
 		fps_start   = now;
 		fps_frames  = 0;
+		// The window title is set from the main thread and stalls when it is busy, so the
+		// measured rate is reported here as well. Printed rather than logged so it survives
+		// a silent log direction.
+		if (std::getenv("KYTY_REPORT_FPS") != nullptr) {
+			std::printf("FPS: %.1f frame=%" PRIu64 "\n", current_fps, frame_num);
+			std::fflush(stdout);
+		}
+		Common::WaitTrace::Report(current_fps, frame_num);
 	}
 
 	const auto* device_name = graphic_ctx.GetPhysicalDeviceProperties().deviceName.data();

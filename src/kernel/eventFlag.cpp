@@ -291,6 +291,12 @@ int KYTY_SYSV_ABI KernelWaitEventFlag(KernelEventFlag ef, uint64_t bit_pattern, 
 	if (ef == nullptr) {
 		return KERNEL_ERROR_ESRCH;
 	}
+	LOGF("\t GWAIT: eventflag=0x%016" PRIx64 " pattern=0x%016" PRIx64 " mode=0x%" PRIx32
+	     " timeout=%s thread=%d\n",
+	     reinterpret_cast<uint64_t>(ef), bit_pattern, wait_mode, timeout == nullptr ? "inf" : "set",
+	     Common::Thread::GetThreadIdUnique());
+
+	Common::WaitTrace::Scope wait_scope(Common::WaitTrace::Kind::EventFlag);
 
 	if (bit_pattern == 0) {
 		return KERNEL_ERROR_EINVAL;
@@ -346,6 +352,8 @@ int KYTY_SYSV_ABI KernelSetEventFlag(KernelEventFlag ef, uint64_t bit_pattern) {
 	if (ef == nullptr) {
 		return KERNEL_ERROR_ESRCH;
 	}
+	LOGF("\t GSIGNAL: eventflag=0x%016" PRIx64 " set=0x%016" PRIx64 " thread=%d\n",
+	     reinterpret_cast<uint64_t>(ef), bit_pattern, Common::Thread::GetThreadIdUnique());
 
 	ef->Set(bit_pattern);
 

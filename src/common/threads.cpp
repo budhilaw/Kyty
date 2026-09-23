@@ -1,12 +1,17 @@
 #include "common/threads.h"
 
 #include "common/assert.h"
+#include "common/timer.h"
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <cerrno>
 #include <chrono>             // IWYU pragma: keep
+#include <cinttypes>
 #include <condition_variable> // IWYU pragma: keep
+#include <cstdio>
+#include <cstdlib>
 #include <mutex>
 
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS && KYTY_COMPILER == KYTY_COMPILER_CLANG
@@ -223,6 +228,7 @@ static std::atomic<int> g_thread_counter = 0;
 void InitializeThreads() {
 	g_main_thread     = std::this_thread::get_id();
 	g_main_thread_int = Thread::GetThreadIdUnique();
+	WaitTrace::Initialize();
 }
 
 Thread::Thread(thread_func_t func, void* arg)
@@ -375,6 +381,251 @@ void CondVar::Wait(Mutex* mutex) {
 void CondVar::SetWaitPollCallback(wait_poll_func_t callback) {
 	g_cond_wait_poll_callback = callback;
 }
+
+namespace WaitTrace {
+namespace {
+
+constexpr int MaxThreads = 256;
+
+struct Slot {
+	std::array<std::atomic<uint64_t>, static_cast<size_t>(Kind::Count)> ticks {};
+	std::array<std::atomic<uint64_t>, static_cast<size_t>(Kind::Count)> counts {};
+	std::atomic_bool                                                    used {false};
+	std::atomic<uint32_t>                                               os_id {0};
+};
+
+std::array<Slot, MaxThreads> g_slots {};
+
+const char* KindName(Kind kind) {
+	switch (kind) {
+		case Kind::EventFlag: return "evflag";
+		case Kind::Semaphore: return "sema";
+		case Kind::Equeue: return "equeue";
+		case Kind::CondVar: return "cond";
+		case Kind::Mutex: return "mutex";
+		case Kind::Sleep: return "sleep";
+		case Kind::GpuProcess: return "gpu_process";
+		case Kind::GpuSubmit: return "gpu_submit";
+		case Kind::GpuDraw: return "draw";
+		case Kind::GpuDispatch: return "dispatch";
+		case Kind::GpuBarrier: return "barrier";
+		case Kind::GpuFlipWait: return "flipwait";
+		case Kind::GpuRenderLock: return "renderlock";
+		case Kind::GpuGarbage: return "gc";
+		case Kind::GpuHandler: return "handler";
+		case Kind::GpuReadback: return "readback";
+		case Kind::GpuTickWait: return "tickwait";
+		case Kind::GpuPipeline: return "pipeline";
+		case Kind::GpuBindings: return "bindings";
+		case Kind::GpuCommit: return "commit";
+		case Kind::GpuRenderBegin: return "renderbegin";
+		default: return "?";
+	}
+}
+
+bool     g_enabled = false;
+uint64_t g_qpc_frequency = 1;
+
+constexpr size_t CallerFrames  = 4;
+constexpr size_t CallerEntries = 96;
+
+struct CallerEntry {
+	std::array<uint64_t, CallerFrames> frames {};
+	uint64_t                           count = 0;
+};
+
+std::mutex                                                                     g_caller_mutex;
+std::array<std::array<CallerEntry, CallerEntries>, static_cast<size_t>(Kind::Count)> g_callers {};
+
+// Counting has to be near free or it changes the thing being measured, so this is a performance
+// counter read plus a relaxed add on a cached slot, with no allocation and no id lookup.
+thread_local Slot* t_slot = nullptr;
+
+Slot* LocalSlot() {
+	if (t_slot == nullptr) {
+		const auto id = Thread::GetThreadIdUnique();
+		if (id < 0 || id >= MaxThreads) {
+			return nullptr;
+		}
+		t_slot = &g_slots[static_cast<size_t>(id)];
+		t_slot->used.store(true, std::memory_order_relaxed);
+#ifdef KYTY_WIN_CS
+		t_slot->os_id.store(GetCurrentThreadId(), std::memory_order_relaxed);
+#endif
+	}
+	return t_slot;
+}
+
+} // namespace
+
+void Initialize() {
+	g_enabled       = std::getenv("KYTY_WAIT_TRACE") != nullptr;
+	const auto freq = Timer::QueryPerformanceFrequency();
+	g_qpc_frequency = (freq != 0 ? freq : 1);
+}
+
+bool Enabled() {
+	return g_enabled;
+}
+
+void Note(Kind kind, uint64_t ticks, uint64_t count) {
+	auto* slot = LocalSlot();
+	if (slot == nullptr) {
+		return;
+	}
+	slot->ticks[static_cast<size_t>(kind)].fetch_add(ticks, std::memory_order_relaxed);
+	slot->counts[static_cast<size_t>(kind)].fetch_add(count, std::memory_order_relaxed);
+}
+
+Scope::Scope(Kind kind): m_kind(kind) {
+	if (g_enabled) {
+		m_start = Timer::QueryPerformanceCounter();
+	}
+}
+
+Scope::~Scope() {
+	if (m_start != 0) {
+		Note(m_kind, Timer::QueryPerformanceCounter() - m_start);
+	}
+}
+
+uint32_t HottestOsThread(Kind kind) {
+	uint32_t best_os    = 0;
+	uint64_t best_ticks = 0;
+	for (auto& slot: g_slots) {
+		const auto ticks = slot.ticks[static_cast<size_t>(kind)].load(std::memory_order_relaxed);
+		if (ticks > best_ticks) {
+			best_ticks = ticks;
+			best_os    = slot.os_id.load(std::memory_order_relaxed);
+		}
+	}
+	return best_os;
+}
+
+// A thread that is blocked all second is idle and uninteresting. What matters is the thread that
+// is awake, so rows are ordered by how much of the second each one spent NOT waiting.
+void NoteCaller(Kind kind) {
+	if (!g_enabled) {
+		return;
+	}
+#ifdef _WIN32
+	void*      raw[12] {};
+	const auto captured = RtlCaptureStackBackTrace(1, 12, raw, nullptr);
+	const auto base     = reinterpret_cast<uint64_t>(GetModuleHandleA(nullptr));
+	std::array<uint64_t, CallerFrames> frames {};
+	size_t                             kept = 0;
+	for (unsigned f = 0; f < captured && kept < CallerFrames; f++) {
+		const auto address = reinterpret_cast<uint64_t>(raw[f]);
+		if (address >= base && address - base < 0x4000000ull) {
+			frames[kept++] = address - base;
+		}
+	}
+	std::lock_guard lock(g_caller_mutex);
+	auto&           table = g_callers[static_cast<size_t>(kind)];
+	for (auto& entry: table) {
+		if (entry.count != 0 && entry.frames == frames) {
+			entry.count++;
+			return;
+		}
+		if (entry.count == 0) {
+			entry.frames = frames;
+			entry.count  = 1;
+			return;
+		}
+	}
+#else
+	(void)kind;
+#endif
+}
+
+void Report(double fps, uint64_t frame) {
+	if (!g_enabled) {
+		return;
+	}
+	const auto to_ms = [](uint64_t ticks) {
+		return static_cast<double>(ticks) * 1000.0 / static_cast<double>(g_qpc_frequency);
+	};
+
+	struct Row {
+		int    id         = 0;
+		double blocked_ms = 0.0;
+	};
+	std::array<Row, MaxThreads> rows {};
+	int                         used = 0;
+	for (int id = 0; id < MaxThreads; id++) {
+		auto& slot = g_slots[static_cast<size_t>(id)];
+		if (!slot.used.load(std::memory_order_relaxed)) {
+			continue;
+		}
+		double   blocked = 0.0;
+		uint64_t events  = 0;
+		for (size_t kind = 0; kind < static_cast<size_t>(Kind::Count); kind++) {
+			events += slot.counts[kind].load(std::memory_order_relaxed);
+			if (kind < static_cast<size_t>(Kind::GpuProcess)) {
+				blocked += to_ms(slot.ticks[kind].load(std::memory_order_relaxed));
+			}
+		}
+		// A thread blocked for the whole second never leaves its wait and so records nothing;
+		// it is idle, not busy, and would otherwise sort to the top as "awake".
+		if (events == 0) {
+			continue;
+		}
+		rows[static_cast<size_t>(used)] = {id, blocked};
+		used++;
+	}
+	std::sort(rows.begin(), rows.begin() + used,
+	          [](const Row& a, const Row& b) { return a.blocked_ms < b.blocked_ms; });
+
+	std::printf("WAITTRACE fps=%.1f frame=%" PRIu64 " (rows sorted by busiest)\n", fps, frame);
+	const int shown = (used < 12 ? used : 12);
+	for (int row = 0; row < shown; row++) {
+		const auto  id   = rows[static_cast<size_t>(row)].id;
+		auto&       slot = g_slots[static_cast<size_t>(id)];
+		std::printf("  t%-3d os=%-6u awake~%6.1fms", id, slot.os_id.load(std::memory_order_relaxed),
+		            1000.0 - rows[static_cast<size_t>(row)].blocked_ms);
+		for (size_t kind = 0; kind < static_cast<size_t>(Kind::Count); kind++) {
+			const auto ticks = slot.ticks[kind].load(std::memory_order_relaxed);
+			const auto n     = slot.counts[kind].load(std::memory_order_relaxed);
+			if (n != 0) {
+				std::printf("  %s=%.1fms/%" PRIu64, KindName(static_cast<Kind>(kind)), to_ms(ticks),
+				            n);
+			}
+		}
+		std::printf("\n");
+	}
+	{
+		std::lock_guard lock(g_caller_mutex);
+		for (size_t kind = 0; kind < static_cast<size_t>(Kind::Count); kind++) {
+			auto& table = g_callers[kind];
+			std::sort(table.begin(), table.end(),
+			          [](const CallerEntry& a, const CallerEntry& b) { return a.count > b.count; });
+			if (table[0].count == 0) {
+				continue;
+			}
+			std::printf("  CALLERS %s:", KindName(static_cast<Kind>(kind)));
+			for (size_t i = 0; i < 6 && table[i].count != 0; i++) {
+				std::printf(" %" PRIu64 "x[", table[i].count);
+				for (const auto rva: table[i].frames) {
+					std::printf("%" PRIx64 ",", rva);
+				}
+				std::printf("]");
+			}
+			std::printf("\n");
+			for (auto& entry: table) {
+				entry = {};
+			}
+		}
+	}
+	std::fflush(stdout);
+	for (auto& slot: g_slots) {
+		for (size_t kind = 0; kind < static_cast<size_t>(Kind::Count); kind++) {
+			slot.ticks[kind].store(0, std::memory_order_relaxed);
+			slot.counts[kind].store(0, std::memory_order_relaxed);
+		}
+	}
+}
+
+} // namespace WaitTrace
 
 bool CondVar::WaitFor(Mutex* mutex, uint32_t micros) {
 	bool ok = false;

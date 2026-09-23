@@ -10,6 +10,60 @@ namespace Common {
 
 void InitializeThreads();
 
+// KYTY_WAIT_TRACE=1 accounts, per guest thread, the wall time spent blocked in each kind of
+// kernel wait and the work the GPU thread does, so a frame's cost can be attributed to the
+// hand-off that actually pays for it. Reported once a second next to the frame rate.
+namespace WaitTrace {
+
+enum class Kind
+{
+	EventFlag,
+	Semaphore,
+	Equeue,
+	CondVar,
+	Mutex,
+	Sleep,
+	GpuProcess,
+	GpuSubmit,
+	GpuDraw,
+	GpuDispatch,
+	GpuBarrier,
+	GpuFlipWait,
+	GpuRenderLock,
+	GpuGarbage,
+	GpuHandler,
+	GpuReadback,
+	GpuTickWait,
+	GpuPipeline,
+	GpuBindings,
+	GpuCommit,
+	GpuRenderBegin,
+	Count
+};
+
+void               Initialize();
+[[nodiscard]] bool Enabled();
+void               Note(Kind kind, uint64_t nanoseconds, uint64_t count = 1);
+void               Report(double fps, uint64_t frame);
+// OS id of the thread that has spent the most time in this kind, for targeting a profiler.
+[[nodiscard]] uint32_t HottestOsThread(Kind kind);
+// Records the in-module return addresses of the caller so the report can say who triggers a kind.
+void NoteCaller(Kind kind);
+
+// Accumulates one blocked region; does nothing at all when the trace is off.
+class Scope {
+public:
+	explicit Scope(Kind kind);
+	~Scope();
+	KYTY_CLASS_NO_COPY(Scope);
+
+private:
+	Kind     m_kind;
+	uint64_t m_start = 0;
+};
+
+} // namespace WaitTrace
+
 using thread_func_t    = void (*)(void*);
 using wait_poll_func_t = void (*)();
 

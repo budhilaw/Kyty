@@ -409,6 +409,8 @@ int KYTY_SYSV_ABI KernelWaitEqueue(KernelEqueue eq, KernelEvent* ev, int num, in
 	     (timo == nullptr ? "inf" : fmt::format("{}", *timo).c_str()),
 	     Common::Thread::GetThreadIdUnique());
 
+	Common::WaitTrace::Scope wait_scope(Common::WaitTrace::Kind::Equeue);
+
 	if (timo == nullptr) {
 		*out = owner->WaitForEvents(ev, num, 0);
 	}

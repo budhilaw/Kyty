@@ -291,7 +291,13 @@ int KYTY_SYSV_ABI KernelWaitSema(KernelSema sem, int need, KernelUseconds* time)
 		return KERNEL_ERROR_ESRCH;
 	}
 
+	LOGF("\t GWAIT: sema=0x%016" PRIx64 " need=%d timeout=%s thread=%d\n",
+	     reinterpret_cast<uint64_t>(sem), need, time == nullptr ? "inf" : "set",
+	     Common::Thread::GetThreadIdUnique());
+	Common::WaitTrace::Scope wait_scope(Common::WaitTrace::Kind::Semaphore);
 	auto result = sem->Wait(need, time);
+	LOGF("\t GWAIT: sema=0x%016" PRIx64 " done thread=%d\n", reinterpret_cast<uint64_t>(sem),
+	     Common::Thread::GetThreadIdUnique());
 
 	int ret = OK;
 
@@ -332,6 +338,8 @@ int KYTY_SYSV_ABI KernelSignalSema(KernelSema sem, int count) {
 	if (sem == nullptr) {
 		return KERNEL_ERROR_ESRCH;
 	}
+	LOGF("\t GSIGNAL: sema=0x%016" PRIx64 " count=%d thread=%d\n", reinterpret_cast<uint64_t>(sem),
+	     count, Common::Thread::GetThreadIdUnique());
 
 	auto result = sem->Signal(count);
 
