@@ -3,6 +3,7 @@
 #include "common/assert.h"
 #include "common/logging/log.h"
 #include "common/profiler.h"
+#include "common/timer.h"
 #include "graphics/guest_gpu/gpu_defs.h"
 #include "graphics/guest_gpu/gpu_format.h"
 #include "graphics/guest_gpu/hardwareContext.h"
@@ -45,6 +46,8 @@ void RenderExecutor::ResolveRenderColorTarget(CommandBuffer& buffer, RenderColor
                                               uint32_t         render_target_slice_offset,
                                               uint32_t rt_slot, bool ignore_target_mask,
                                               bool exact_format) {
+	Common::Timer rt_timer;
+	rt_timer.Start();
 	KYTY_PROFILER_FUNCTION();
 	const auto& hw = buffer.GetRegisters();
 
@@ -356,7 +359,12 @@ void RenderExecutor::ResolveRenderColorTarget(CommandBuffer& buffer, RenderColor
 	r.desc                     = std::move(desc);
 	r.guest_mip_level          = rt.view.current_mip_level;
 	r.guest_array_layer        = view.base_layer;
+	const auto desc_ms = rt_timer.GetTimeS() * 1000.0;
 	r.image_id                 = texture_cache.FindImage(r.desc, exact_format);
+	const auto find_ms = rt_timer.GetTimeS() * 1000.0;
+	if (find_ms > 2.0) {
+		LOGF("\t RTPHASE: desc=%.1f find=%.1f\n", desc_ms, find_ms - desc_ms);
+	}
 	r.export_mapping           = target_format.export_mapping;
 	BindRenderTarget(r.image_id);
 }

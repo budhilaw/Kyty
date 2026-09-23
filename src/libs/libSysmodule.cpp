@@ -65,6 +65,7 @@ static KYTY_SYSV_ABI int SysmoduleIsLoaded(uint16_t id) {
 } // namespace Sysmodule
 
 LIB_DEFINE(InitSysmodule_1) {
+	PRINT_NAME_ENABLE(true);
 	LIB_FUNC("4fU5yvOkVG4", Sysmodule::SysmoduleGetModuleInfoForUnwind);
 	LIB_FUNC("eR2bZFAAU0Q", Sysmodule::SysmoduleUnloadModule);
 	LIB_FUNC("hHrGoGoNf+s", Sysmodule::SysmoduleLoadModuleInternalWithArg);

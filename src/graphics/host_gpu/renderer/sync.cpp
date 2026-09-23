@@ -5,6 +5,7 @@
 #include "common/logging/log.h"
 #include "common/threads.h"
 #include "graphics/host_gpu/graphicContext.h"
+#include "graphics/guest_gpu/graphicsRun.h"
 #include "graphics/host_gpu/renderer/cache/bufferCache.h"
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
@@ -67,6 +68,14 @@ static CommandBufferDebugOp DebugOperation(EndOfPipeWriteAction action) {
 	return CommandBufferDebugOp::Unknown;
 }
 
+static void EopTrace(const char* name, uint64_t dst, uint64_t value, bool writes) {
+	static std::atomic<uint32_t> eop_trace_count {0};
+	if (eop_trace_count.fetch_add(1) < 512) {
+		LOGF("\t EOPPATH: %-28s dst=0x%016" PRIx64 " value=0x%016" PRIx64 " writes=%d\n", name, dst,
+		     value, writes ? 1 : 0);
+	}
+}
+
 static bool TriggersInterrupt(EndOfPipeWriteAction action) {
 	return action == EndOfPipeWriteAction::Interrupt ||
 	       action == EndOfPipeWriteAction::InterruptWriteBack;
@@ -77,23 +86,26 @@ static void RecordEndOfPipeWrite(uint64_t submit_id, CommandBuffer& buffer, uint
                                  EndOfPipeWriteAction action, int interrupt_event_id = 0,
                                  uint32_t context_id = 0) {
 	EXIT_IF(destination == 0);
-	(void)buffer.Handle();
+	EXIT_IF(buffer.IsInvalid());
 
 	const auto width      = static_cast<uint32_t>(size);
 	const auto value_low  = static_cast<uint32_t>(value);
 	const auto value_high = static_cast<uint32_t>(value >> 32u);
 	const auto operation  = static_cast<uint32_t>(DebugOperation(action));
+	EopTrace("RecordEndOfPipeWrite", destination, value, true);
 
 	// The guest polls this address with WAIT_REG_MEM, so the value has to reach memory once the
 	// work retires. Queued before any interrupt so the handler observes it.
 	auto& scheduler = buffer.GetContext().GetCommandScheduler();
 	EXIT_IF(!scheduler.Active() || &buffer != &scheduler.Current());
+	CheckGuestWatch(destination, static_cast<uint64_t>(size), "end_of_pipe");
 	scheduler.DeferPriorityOperation([destination, value, size] {
 		if (size == EndOfPipeWriteSize::Qword) {
 			*reinterpret_cast<uint64_t*>(destination) = value;
 		} else {
 			*reinterpret_cast<uint32_t*>(destination) = static_cast<uint32_t>(value);
 		}
+		NoteGuestGpuWrite(destination);
 	});
 
 	if (TriggersInterrupt(action)) {
@@ -114,7 +126,8 @@ void WriteAtEndOfPipe32(uint64_t submit_id, CommandBuffer& buffer, uint32_t* dst
 void WriteAtEndOfPipeGds32(uint64_t submit_id, CommandBuffer& buffer, uint32_t* dst_gpu_addr,
                            uint32_t dw_offset, uint32_t dw_num) {
 	EXIT_IF(dst_gpu_addr == nullptr);
-	(void)buffer.Handle();
+	EXIT_IF(buffer.IsInvalid());
+	EopTrace("Gds32", reinterpret_cast<uint64_t>(dst_gpu_addr), dw_num, false);
 	buffer.SetDebugInfo(static_cast<uint32_t>(CommandBufferDebugOp::EopWrite), submit_id,
 	                    dw_offset, dw_num, 0, 0, reinterpret_cast<uint64_t>(dst_gpu_addr));
 }
@@ -127,7 +140,7 @@ void WriteAtEndOfPipe64(uint64_t submit_id, CommandBuffer& buffer, uint64_t* dst
 
 void WriteAtEndOfPipeClockCounter(uint64_t submit_id, CommandBuffer& buffer, uint64_t* dst_gpu_addr,
                                   uint64_t value) {
-	RecordEndOfPipeWrite(submit_id, buffer, reinterpret_cast<uint64_t>(dst_gpu_addr), 0,
+	RecordEndOfPipeWrite(submit_id, buffer, reinterpret_cast<uint64_t>(dst_gpu_addr), value,
 	                     EndOfPipeWriteSize::Qword, EndOfPipeWriteAction::Write);
 
 	LOGF_COLOR(Log::Color::BrightGreen,
@@ -137,7 +150,7 @@ void WriteAtEndOfPipeClockCounter(uint64_t submit_id, CommandBuffer& buffer, uin
 
 void WriteAtEndOfPipeClockCounterWithWriteBack(uint64_t submit_id, CommandBuffer& buffer,
                                                uint64_t* dst_gpu_addr, uint64_t value) {
-	RecordEndOfPipeWrite(submit_id, buffer, reinterpret_cast<uint64_t>(dst_gpu_addr), 0,
+	RecordEndOfPipeWrite(submit_id, buffer, reinterpret_cast<uint64_t>(dst_gpu_addr), value,
 	                     EndOfPipeWriteSize::Qword, EndOfPipeWriteAction::WriteBack);
 
 	LOGF_COLOR(Log::Color::BrightGreen,
@@ -215,7 +228,7 @@ void WriteAtEndOfPipeWithInterruptWriteBackFlip32(uint64_t submit_id, CommandBuf
                                                   int64_t flip_arg, uint64_t request_id,
                                                   int event_id) {
 	EXIT_IF(dst_gpu_addr == nullptr);
-	(void)buffer.Handle();
+	EXIT_IF(buffer.IsInvalid());
 	buffer.SetDebugInfo(static_cast<uint32_t>(CommandBufferDebugOp::EopWriteBackFlip), submit_id,
 	                    static_cast<uint32_t>(handle), static_cast<uint32_t>(index),
 	                    static_cast<uint32_t>(flip_mode), value, static_cast<uint64_t>(flip_arg));
@@ -223,6 +236,7 @@ void WriteAtEndOfPipeWithInterruptWriteBackFlip32(uint64_t submit_id, CommandBuf
 	auto& renderer  = buffer.GetContext();
 	auto& scheduler = renderer.GetCommandScheduler();
 	EXIT_IF(!scheduler.Active() || &buffer != &scheduler.Current());
+	EopTrace("InterruptWriteBackFlip32", reinterpret_cast<uint64_t>(dst_gpu_addr), value, false);
 	scheduler.DeferPriorityOperation([&renderer, event_id, request_id] {
 		renderer.GetVideoOut().CompleteFlip(request_id);
 		renderer.TriggerInterrupt(event_id, 0);
@@ -233,7 +247,7 @@ void WriteAtEndOfPipeWithFlip32(uint64_t submit_id, CommandBuffer& buffer, uint3
                                 uint32_t value, int handle, int index, int flip_mode,
                                 int64_t flip_arg, uint64_t request_id) {
 	EXIT_IF(dst_gpu_addr == nullptr);
-	(void)buffer.Handle();
+	EXIT_IF(buffer.IsInvalid());
 	buffer.SetDebugInfo(static_cast<uint32_t>(CommandBufferDebugOp::EopFlip), submit_id,
 	                    static_cast<uint32_t>(handle), static_cast<uint32_t>(index),
 	                    static_cast<uint32_t>(flip_mode), value, static_cast<uint64_t>(flip_arg));
@@ -241,13 +255,14 @@ void WriteAtEndOfPipeWithFlip32(uint64_t submit_id, CommandBuffer& buffer, uint3
 	auto& renderer  = buffer.GetContext();
 	auto& scheduler = renderer.GetCommandScheduler();
 	EXIT_IF(!scheduler.Active() || &buffer != &scheduler.Current());
+	EopTrace("WithFlip32", reinterpret_cast<uint64_t>(dst_gpu_addr), value, false);
 	scheduler.DeferPriorityOperation(
 	    [&renderer, request_id] { renderer.GetVideoOut().CompleteFlip(request_id); });
 }
 
 void WriteAtEndOfPipeOnlyFlip(uint64_t submit_id, CommandBuffer& buffer, int handle, int index,
                               int flip_mode, int64_t flip_arg, uint64_t request_id) {
-	(void)buffer.Handle();
+	EXIT_IF(buffer.IsInvalid());
 	buffer.SetDebugInfo(static_cast<uint32_t>(CommandBufferDebugOp::EopOnlyFlip), submit_id,
 	                    static_cast<uint32_t>(handle), static_cast<uint32_t>(index),
 	                    static_cast<uint32_t>(flip_mode), 0, static_cast<uint64_t>(flip_arg));
@@ -260,7 +275,7 @@ void WriteAtEndOfPipeOnlyFlip(uint64_t submit_id, CommandBuffer& buffer, int han
 }
 
 void TriggerEopEventAtEndOfPipe(CommandBuffer& buffer, int event_id, uint32_t context_id) {
-	(void)buffer.Handle();
+	EXIT_IF(buffer.IsInvalid());
 	auto& renderer  = buffer.GetContext();
 	auto& scheduler = renderer.GetCommandScheduler();
 	EXIT_IF(!scheduler.Active() || &buffer != &scheduler.Current());
@@ -307,6 +322,9 @@ int AddEqEvent(RenderContext& renderer, LibKernel::EventQueue::KernelEqueue eq, 
 	if (result == 0) {
 		renderer.AddInterruptEq(eq, id);
 	}
+	LOGF("\t EQEVENT: register eq=0x%016" PRIx64 " id=%d udata=0x%016" PRIx64 " result=%d thread=%d\n",
+	     static_cast<uint64_t>(eq), id, reinterpret_cast<uint64_t>(udata), result,
+	     Common::Thread::GetThreadIdUnique());
 
 	return result;
 }

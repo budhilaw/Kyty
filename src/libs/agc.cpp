@@ -1552,7 +1552,7 @@ int KYTY_SYSV_ABI AgcSuspendPoint() {
 	PRINT_NAME();
 
 	EXIT_IF(g_renderer == nullptr);
-	g_renderer->GetGpu().Done();
+	g_renderer->GetGpu().SuspendPoint();
 
 	return OK;
 }
@@ -4190,10 +4190,134 @@ struct TessellationDriverState {
 
 static TessellationDriverState g_tessellation_driver_state {};
 
+static bool is_reg_indirect_opcode(uint32_t op) {
+	return op == Pm4::IT_SET_CONTEXT_REG_INDIRECT || op == Pm4::IT_SET_SH_REG_INDIRECT ||
+	       op == Pm4::IT_SET_UCONFIG_REG_INDIRECT;
+}
+
+// The driver consumes a submission when the call returns: the game recycles chunk memory,
+// including the indirect register tables stored beside the packets, right after submitting.
+// The snapshot therefore carries the tables too, with the copied packets repointed at them.
+static std::vector<uint32_t> snapshot_command_stream(const uint32_t* stream,
+                                                     uint32_t size_in_dwords, const char* origin) {
+	struct Table {
+		uint32_t packet_offset;
+		uint32_t num_regs;
+	};
+	std::vector<Table> tables;
+	size_t             table_dwords = 0;
+	for (uint32_t offset = 0; offset < size_in_dwords;) {
+		const auto header = stream[offset];
+		if ((header >> 30u) != 3u) {
+			offset++;
+			continue;
+		}
+		const auto len = KYTY_PM4_LEN(header);
+		if (len == 0 || len > size_in_dwords - offset) {
+			break;
+		}
+		const auto op = (header >> 8u) & 0xffu;
+		if (is_reg_indirect_opcode(op) && len == 5u) {
+			const auto num     = stream[offset + 4] & 0x3fffu;
+			const auto address = (static_cast<uint64_t>(stream[offset + 1]) & 0xfffffffcu) |
+			                     (static_cast<uint64_t>(stream[offset + 2]) << 32u);
+			if (num != 0 && address != 0) {
+				tables.push_back({offset, num});
+				table_dwords += static_cast<size_t>(num) * 2u;
+			}
+		}
+		if (op == Pm4::IT_NOP && KYTY_PM4_R(header) == Pm4::R_RELEASE_MEM && len >= 7) {
+			NotePromisedFenceWrite(stream[offset + 3] |
+			                           (static_cast<uint64_t>(stream[offset + 4]) << 32u),
+			                       origin, "release_mem");
+		}
+		if (op == Pm4::IT_WRITE_DATA && len >= 5) {
+			NotePromisedFenceWrite(stream[offset + 2] |
+			                           (static_cast<uint64_t>(stream[offset + 3]) << 32u),
+			                       origin, "write_data");
+		}
+		offset += len;
+	}
+
+	std::vector<uint32_t> owned;
+	owned.reserve(size_in_dwords + table_dwords);
+	owned.assign(stream, stream + size_in_dwords);
+	for (const auto& table: tables) {
+		const auto  address = (static_cast<uint64_t>(owned[table.packet_offset + 1]) & 0xfffffffcu) |
+		                     (static_cast<uint64_t>(owned[table.packet_offset + 2]) << 32u);
+		const auto* entries     = reinterpret_cast<const uint32_t*>(address);
+		const auto  copy_offset = owned.size();
+		owned.insert(owned.end(), entries, entries + static_cast<size_t>(table.num_regs) * 2u);
+		const auto host = reinterpret_cast<uint64_t>(owned.data() + copy_offset);
+		owned[table.packet_offset + 1] =
+		    (owned[table.packet_offset + 1] & 0x3u) | (static_cast<uint32_t>(host) & 0xfffffffcu);
+		owned[table.packet_offset + 2] = static_cast<uint32_t>(host >> 32u);
+	}
+	return owned;
+}
+
 static void submit_dcb(uint32_t* dcb, uint32_t size_in_dwords) {
+	{
+		// Walk the packet stream past the declared size to measure how far valid packets
+		// actually extend, and whether the declared size lands on a packet boundary.
+		uint32_t   offset      = 0;
+		bool       on_boundary = false;
+		const auto limit       = size_in_dwords + 96u;
+		while (offset < limit) {
+			if (offset == size_in_dwords) {
+				on_boundary = true;
+			}
+			const auto header = dcb[offset];
+			const auto type   = header >> 30u;
+			if (type == 3u) {
+				const auto len = (((header >> 16u) & 0x3fffu) + 2u);
+				if (len > 0x400u) {
+					break;
+				}
+				offset += len;
+			} else if (type == 2u) {
+				offset += 1;
+			} else {
+				break;
+			}
+		}
+		static std::atomic<uint32_t> walk_log_count {0};
+		if (walk_log_count.fetch_add(1) < 64) {
+			LOGF("\t DCBWALK: declared=%" PRIu32 " walked_end=%" PRIu32 " extra=%" PRId64
+			     " declared_on_boundary=%d stop_dword=0x%08" PRIx32 "\n",
+			     size_in_dwords, offset, static_cast<int64_t>(offset) - size_in_dwords,
+			     on_boundary ? 1 : 0, dcb[offset]);
+			for (uint32_t i = 0; i + 4 < size_in_dwords; i++) {
+				if (dcb[i] == 0xc004105cu) {
+					const auto arg = dcb[i + 4] | (static_cast<uint64_t>(dcb[i + 5]) << 32u);
+					LOGF("\t DCBFLIP: at submit, flip packet at dw=0x%05" PRIx32 " handle=%" PRIu32
+					     " index=%" PRIu32 " arg=%" PRId64 "\n",
+					     i, dcb[i + 1], dcb[i + 2], static_cast<int64_t>(arg));
+				}
+			}
+		}
+	}
+	{
+		static std::atomic<uint32_t> submit_log_count {0};
+		static std::atomic<uint64_t> previous_end {0};
+		const auto begin = reinterpret_cast<uint64_t>(dcb);
+		const auto end   = begin + static_cast<uint64_t>(size_in_dwords) * 4u;
+		const auto prev  = previous_end.exchange(end);
+		const auto seq = submit_log_count.fetch_add(1);
+		LOGF("\t DCB: seq=%" PRIu32 " begin=0x%016" PRIx64 " end=0x%016" PRIx64 " dw=%" PRIu32
+		     " contiguous=%d tail:",
+		     seq, begin, end, size_in_dwords, (prev != 0 && prev == begin) ? 1 : 0);
+		for (uint32_t i = (size_in_dwords >= 8 ? size_in_dwords - 8 : 0); i < size_in_dwords + 8;
+		     i++) {
+			LOGF("%s%08" PRIx32, i == size_in_dwords ? " |" : " ", dcb[i]);
+		}
+		LOGF("\n");
+	}
 	GraphicsDbgDumpDcb("d", size_in_dwords, dcb);
 	EXIT_IF(g_renderer == nullptr);
-	g_renderer->GetGpu().Submit(std::span {dcb, size_in_dwords}, {});
+	auto                            owned = snapshot_command_stream(dcb, size_in_dwords, "dcb");
+	const std::span<const uint32_t> commands {owned.data(), size_in_dwords};
+	g_renderer->GetGpu().Submit(commands, {}, std::move(owned), dcb);
 }
 
 int KYTY_SYSV_ABI AgcDriverSubmitDcb(const Packet* packet) {
@@ -4206,6 +4330,13 @@ int KYTY_SYSV_ABI AgcDriverSubmitDcb(const Packet* packet) {
 	     "\t flags  = 0x%02" PRIx8 "\n",
 	     reinterpret_cast<uint64_t>(packet->addr), packet->dw_num, packet->flags);
 
+	LOGF("\t SUBMITQ: AgcDriverSubmitDcb flags=0x%02" PRIx8 " reserved=%02x%02x%02x dw=%" PRIu32
+	     " past-end: %08" PRIx32 " %08" PRIx32 " %08" PRIx32 " %08" PRIx32 " %08" PRIx32
+	     " %08" PRIx32 "\n",
+	     packet->flags, packet->reserved[0], packet->reserved[1], packet->reserved[2],
+	     packet->dw_num, packet->addr[packet->dw_num], packet->addr[packet->dw_num + 1],
+	     packet->addr[packet->dw_num + 2], packet->addr[packet->dw_num + 3],
+	     packet->addr[packet->dw_num + 4], packet->addr[packet->dw_num + 5]);
 	submit_dcb(packet->addr, packet->dw_num);
 
 	return OK;
@@ -4233,6 +4364,8 @@ int KYTY_SYSV_ABI AgcDriverSubmitMultiDcbs(uint32_t* const* dcb_gpu_addrs,
 		     i, reinterpret_cast<uint64_t>(dcb), i, size_in_dwords);
 
 		if (dcb != nullptr) {
+			LOGF("\t SUBMITQ: AgcDriverSubmitMultiDcbs[%" PRIu32 "/%" PRIu32 "] dw=%" PRIu32 "\n",
+			     i, count, size_in_dwords);
 			submit_dcb(dcb, size_in_dwords);
 		}
 	}
@@ -4252,7 +4385,9 @@ static void submit_acb(uint32_t queue, uint32_t* acb, uint32_t size_in_dwords) {
 	GraphicsDbgDumpDcb("a", size_in_dwords, acb);
 
 	EXIT_IF(g_renderer == nullptr);
-	g_renderer->GetGpu().SubmitCompute(queue, std::span {acb, size_in_dwords});
+	auto                            owned = snapshot_command_stream(acb, size_in_dwords, "acb");
+	const std::span<const uint32_t> commands {owned.data(), size_in_dwords};
+	g_renderer->GetGpu().SubmitCompute(queue, commands, std::move(owned), acb);
 }
 
 static uint32_t get_driver_queue(const void* queue_context) {
@@ -4266,6 +4401,9 @@ static void submit_command_buffer(uint32_t queue, uint32_t* commands, uint32_t s
 		return;
 	}
 
+	LOGF("\t SUBMITQ: guest_queue=0x%02" PRIx32 " -> %s dw=%" PRIu32 " addr=0x%016" PRIx64 "\n",
+	     queue, (queue >= 0x20 && queue < 0x58) ? "acb" : "dcb", size_in_dwords,
+	     reinterpret_cast<uint64_t>(commands));
 	if (queue >= 0x20 && queue < 0x58) {
 		submit_acb(queue, commands, size_in_dwords);
 	} else {

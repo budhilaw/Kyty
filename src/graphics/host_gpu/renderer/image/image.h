@@ -47,9 +47,13 @@ struct ImageBinding {
 
 class Image final {
 public:
-	Image(GraphicContext& graphics, CommandScheduler& scheduler, const ImageInfo& info);
+	Image(GraphicContext& graphics, CommandScheduler& scheduler, const ImageInfo& info,
+	      uint32_t capacity_layers = 0);
 	~Image();
 	KYTY_CLASS_NO_COPY(Image);
+
+	// Exposes more of the physically allocated array layers without touching the backing.
+	void GrowLayers(const ImageInfo& grown);
 
 	[[nodiscard]] vk::ImageView FindView(const ImageViewInfo& view_info);
 	using Barriers = std::vector<vk::ImageMemoryBarrier2>;
@@ -140,6 +144,7 @@ public:
 
 	ImageInfo        info;
 	VulkanImage      backing;
+	uint32_t         capacity_layers = 0;
 	std::vector<CachedImageView> views;
 	ImageUsage       usage;
 	ImageBinding     binding;

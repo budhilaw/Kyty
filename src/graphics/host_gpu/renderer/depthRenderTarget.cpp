@@ -162,12 +162,28 @@ static TextureCache::ImageDesc MakeDepthTargetDesc(const CommandBuffer& buffer,
 			DepthFatal("invalid depth view: base=%u last=%u", z.depth_view.slice_start,
 			           z.depth_view.slice_max);
 	}
+	// A single-level Z surface is fully described by its base address and DB_DEPTH_SIZE_XY, so a
+	// MIPID left over from an earlier surface selects nothing and is ignored.
+	if (z.depth_view.current_mip_level != 0 && z.z_info.max_mip_level == 0) {
+		static std::atomic_bool logged = false;
+		if (!logged.exchange(true, std::memory_order_relaxed)) {
+			LOGF("DepthTarget: ignoring DB_DEPTH_VIEW.MIPID %u on a single-level surface\n",
+			     static_cast<uint32_t>(z.depth_view.current_mip_level));
+		}
+	}
 	// EXPCLEAR permits an HTile acceleration state; the host attachment is already expanded.
 	if (z.z_info.partially_resident ||
 	    z.stencil_info.partially_resident || z.z_info.max_mip_level != 0 ||
-	    z.depth_view.current_mip_level != 0 || unsupported_shading_rate_encoding ||
+	    unsupported_shading_rate_encoding ||
 	    depth_address == 0 || (depth_address & 0xffffu) != 0) {
-		DepthFatal("unsupported depth register state");
+		DepthFatal("unsupported depth register state: z_prt=%d s_prt=%d max_mip=%u view_mip=%u "
+		           "shading_rate=%u htile=%d depth_addr=0x%016" PRIx64 " stencil_addr=0x%016" PRIx64
+		           " write_buffer=%d",
+		           z.z_info.partially_resident ? 1 : 0, z.stencil_info.partially_resident ? 1 : 0,
+		           static_cast<uint32_t>(z.z_info.max_mip_level),
+		           static_cast<uint32_t>(z.depth_view.current_mip_level),
+		           static_cast<uint32_t>(z.shading_rate_encoding), has_htile ? 1 : 0, depth_address,
+		           stencil_address, write_buffer ? 1 : 0);
 	}
 	if (has_stencil) {
 		if (z.stencil_info.format != Prospero::StencilFormat::k8UInt || !htile_stencil_compat ||
@@ -307,7 +323,16 @@ void RenderExecutor::ResolveRenderDepthTarget(CommandBuffer& buffer, RenderDepth
 	    (!z.depth_view.depth_write_disable && z.z_write_base_addr != z.z_read_base_addr) ||
 	    (has_stencil && !z.depth_view.stencil_write_disable &&
 	     z.stencil_write_base_addr != z.stencil_read_base_addr)) {
-		DepthFatal("unsupported depth register state");
+		DepthFatal("unsupported depth register state: copy_depth=%d copy_stencil=%d "
+		           "copy_centroid=%d copy_sample=%u zfunc=%u z_write_disable=%d z_read=0x%016" PRIx64
+		           " z_write=0x%016" PRIx64 " s_write_disable=%d s_read=0x%016" PRIx64
+		           " s_write=0x%016" PRIx64,
+		           rc.copy_depth_to_color ? 1 : 0, rc.copy_stencil_to_color ? 1 : 0,
+		           rc.copy_centroid ? 1 : 0, static_cast<uint32_t>(rc.copy_sample),
+		           static_cast<uint32_t>(dc.zfunc), z.depth_view.depth_write_disable ? 1 : 0,
+		           z.z_read_base_addr, z.z_write_base_addr,
+		           z.depth_view.stencil_write_disable ? 1 : 0, z.stencil_read_base_addr,
+		           z.stencil_write_base_addr);
 	}
 	r.desc = MakeDepthTargetDesc(buffer, z);
 	r.depth_clear_enable      = rc.depth_clear_enable;

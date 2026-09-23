@@ -436,6 +436,7 @@ int KYTY_SYSV_ABI PlayGoGetSupportedOptionalChunk(int handle, int32_t type,
 } // namespace PlayGo
 
 LIB_DEFINE(InitPlayGo_1) {
+	PRINT_NAME_ENABLE(true);
 	LIB_FUNC("ts6GlZOKRrE", PlayGo::PlayGoInitialize);
 	LIB_FUNC("MPe0EeBGM-E", PlayGo::PlayGoTerminate);
 	LIB_FUNC("M1Gma1ocrGE", PlayGo::PlayGoOpen);

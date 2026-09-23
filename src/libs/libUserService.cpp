@@ -259,6 +259,7 @@ static KYTY_SYSV_ABI int UserServicePlatformPrivacyWs1Stub(uint64_t, uint64_t, u
 } // namespace UserService
 
 LIB_DEFINE(InitUserService_1) {
+	PRINT_NAME_ENABLE(true);
 	LIB_FUNC("j3YMu1MVNNo", UserService::UserServiceInitialize);
 	LIB_FUNC("az-0R6eviZ0", UserService::UserServiceInitialize2);
 	LIB_FUNC("CdWp0oHWGr0", UserService::UserServiceGetInitialUser);

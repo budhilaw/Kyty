@@ -811,7 +811,11 @@ static bool KytyExceptionHandler(const Common::HostException::ExceptionInfo& exc
 			}
 		}
 		std::printf("--- Guest fault context ---\n");
-		std::printf("thread: %s\n", thread_name);
+		unsigned long os_thread = 0;
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+		os_thread = GetCurrentThreadId();
+#endif
+		std::printf("thread: %s (os_thread=%lu)\n", thread_name, os_thread);
 		std::printf("rax=%016" PRIx64 " rbx=%016" PRIx64 " rcx=%016" PRIx64 " rdx=%016" PRIx64 "\n"
 		            "rsi=%016" PRIx64 " rdi=%016" PRIx64 " rbp=%016" PRIx64 " rsp=%016" PRIx64 "\n"
 		            "r8 =%016" PRIx64 " r9 =%016" PRIx64 " r10=%016" PRIx64 " r11=%016" PRIx64 "\n"
@@ -819,6 +823,20 @@ static bool KytyExceptionHandler(const Common::HostException::ExceptionInfo& exc
 		            info->rax, info->rbx, info->rcx, info->rdx, info->rsi, info->rdi, info->rbp,
 		            info->rsp, info->r8, info->r9, info->r10, info->r11, info->r12, info->r13,
 		            info->r14, info->r15);
+		// The pointer registers usually locate the object whose contents explain the fault.
+		for (const auto& [name, value]: {std::pair {"rdi", info->rdi}, std::pair {"rax", info->rax},
+		                                std::pair {"r12", info->r12}}) {
+			const auto base = value & ~uint64_t {0xf};
+			if (value == 0 || !IsReadableRange(base, 64)) {
+				continue;
+			}
+			const auto* bytes = reinterpret_cast<const uint8_t*>(base);
+			std::printf("mem@%s (0x%016" PRIx64 "):", name, base);
+			for (int i = 0; i < 64; i++) {
+				std::printf("%s%02x", (i % 16 == 0) ? "\n " : " ", bytes[i]);
+			}
+			std::printf("\n");
+		}
 		if (IsReadableRange(info->exception_address - 48, 96)) {
 			const auto* code = reinterpret_cast<const uint8_t*>(info->exception_address - 48);
 			std::printf("code (pc-48 .. pc+48, fault at byte 48):");

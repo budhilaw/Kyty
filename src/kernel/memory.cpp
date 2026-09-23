@@ -897,6 +897,16 @@ uint64_t ClampRangeSize(uint64_t vaddr, uint64_t size) {
 }
 
 void WriteBacking(uint64_t vaddr, const void* data, uint64_t size) noexcept {
+	// KYTY_WATCH_ADDR names a guest address to report whenever a GPU read-back covers it.
+	static const uint64_t watch = [] {
+		const char* text = std::getenv("KYTY_WATCH_ADDR");
+		return text != nullptr ? std::strtoull(text, nullptr, 0) : 0;
+	}();
+	if (watch != 0 && vaddr <= watch && watch < vaddr + size) {
+		LOGF("\t WATCHHIT: write_backing covered 0x%016" PRIx64 " (range 0x%016" PRIx64
+		     " size 0x%016" PRIx64 ")\n",
+		     watch, vaddr, size);
+	}
 	if (!TryWriteBacking(vaddr, data, size)) {
 		EXIT("Memory: required direct-backing write failed, addr=0x%016" PRIx64
 		     " size=0x%016" PRIx64 "\n",
@@ -3178,11 +3188,15 @@ static bool ReplaceFixedRangeWithReserved(uint64_t start, uint64_t size) {
 	const auto                 end     = start + size;
 	auto                       current = start;
 
+	LOGF("\t reserve-fixed replace: begin 0x%016" PRIx64 " size=0x%016" PRIx64 "\n", start, size);
 	while (current < end) {
 		VirtualRanges::Range range {};
 		if (!g_virtual_ranges->Query(current, 1, &range)) {
 			break;
 		}
+		LOGF("\t reserve-fixed replace:   chunk at 0x%016" PRIx64 " range=0x%016" PRIx64
+		     "+0x%016" PRIx64 " type=%s\n",
+		     current, range.start, range.size, magic_enum::enum_name(range.type).data());
 		if (range.start >= end) {
 			break;
 		}
@@ -3204,10 +3218,18 @@ static bool ReplaceFixedRangeWithReserved(uint64_t start, uint64_t size) {
 		DecodeMemoryProtection(replaced.range.protection, &replaced.mode, &replaced.gpu_mode);
 		if (range.type == VirtualRangeType::Direct &&
 		    !g_guest_address_space->BackingContains(current, chunk)) {
+			LOGF_COLOR(Log::Color::Red,
+			           "\t reserve-fixed replace: direct backing missing at 0x%016" PRIx64
+			           ", size=0x%016" PRIx64 "\n",
+			           current, chunk);
 			return false;
 		}
 		if (range.type == VirtualRangeType::Flexible &&
 		    !g_flexible_memory->Snapshot(current, chunk, &replaced.flexible_blocks)) {
+			LOGF_COLOR(Log::Color::Red,
+			           "\t reserve-fixed replace: flexible snapshot failed at 0x%016" PRIx64
+			           ", size=0x%016" PRIx64 "\n",
+			           current, chunk);
 			return false;
 		}
 		if (range.type == VirtualRangeType::Pooled) {
@@ -3315,6 +3337,10 @@ static bool ReplaceFixedRangeWithReserved(uint64_t start, uint64_t size) {
 	}
 
 	if (!g_guest_address_space->ReserveFixed(start, size)) {
+		LOGF_COLOR(Log::Color::Red,
+		           "\t reserve-fixed replace: host reservation failed at 0x%016" PRIx64
+		           ", size=0x%016" PRIx64 ", chunks=%zu\n",
+		           start, size, chunks.size());
 		if (!restore_chunks()) {
 			EXIT("reserve-fixed host-reservation rollback failed\n");
 		}

@@ -246,6 +246,7 @@ static int KYTY_SYSV_ABI AppContentTemporaryDataGetAvailableSpaceKb(
 } // namespace AppContentTemporary
 
 LIB_DEFINE(InitAppContent_1_Temporary) {
+	PRINT_NAME_ENABLE(true);
 	LIB_FUNC("buYbeLOGWmA", AppContentTemporary::AppContentTemporaryDataMount2);
 	LIB_FUNC("a5N7lAG0y2Q", AppContentTemporary::AppContentTemporaryDataFormat);
 	LIB_FUNC("SaKib2Ug0yI", AppContentTemporary::AppContentTemporaryDataGetAvailableSpaceKb);
@@ -254,6 +255,7 @@ LIB_DEFINE(InitAppContent_1_Temporary) {
 } // namespace LibAppContentTemporary
 
 LIB_DEFINE(InitAppContent_1) {
+	PRINT_NAME_ENABLE(true);
 	LIB_FUNC("R9lA82OraNs", AppContent::AppContentInitialize);
 	LIB_FUNC("99b82IKXpH4", AppContent::AppContentAppParamGetInt);
 	LIB_FUNC("VANhIWcqYak", AppContent::AppContentAddcontMount);

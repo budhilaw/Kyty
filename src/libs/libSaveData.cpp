@@ -1132,6 +1132,7 @@ namespace LibSaveDataNative {
 LIB_VERSION("SaveData_native", 1, "SaveData_native", 1, 1);
 
 LIB_DEFINE(InitSaveDataNative_1) {
+	PRINT_NAME_ENABLE(true);
 	LIB_FUNC("TywrFKCoLGY", ::Libs::SaveData::SaveDataInitialize3);
 	LIB_FUNC("dyIhnXq-0SM", ::Libs::SaveData::SaveDataDirNameSearch);
 	LIB_FUNC("PHnuI4LhuRk", ::Libs::SaveData::SaveDataDirNameSearch);
@@ -1163,6 +1164,7 @@ LIB_DEFINE(InitSaveDataNative_1) {
 } // namespace LibSaveDataNative
 
 LIB_DEFINE(InitSaveData_1) {
+	PRINT_NAME_ENABLE(true);
 	LIB_FUNC("TywrFKCoLGY", SaveData::SaveDataInitialize3);
 	LIB_FUNC("dyIhnXq-0SM", SaveData::SaveDataDirNameSearch);
 	LIB_FUNC("ZP4e7rlzOUk", SaveData::SaveDataMount3);

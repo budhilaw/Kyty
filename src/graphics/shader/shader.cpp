@@ -16,6 +16,7 @@
 #include "graphics/shader/shaderCompiler.h"
 #include "graphics/shader/shaderVertexMetadata.h"
 #include "libs/errno.h"
+#include "kernel/memory.h"
 
 #include <algorithm>
 #include <atomic>
@@ -559,6 +560,28 @@ static bool ShaderGetStaticVertexInputInfo(uint64_t shader_addr, const HW::UserS
 		ShaderApplyAttribSemantics(info, metadata.input_semantics.data(),
 		                           metadata.input_semantics_count, attrib, buffer);
 		ShaderDetectBuffers(info);
+		for (int bi = 0; bi < info.buffers_num; bi++) {
+			uint32_t probe = 0;
+			if (LibKernel::Memory::TryReadBacking(info.buffers[bi].addr, &probe, sizeof(probe))) {
+				continue;
+			}
+			LOGF("\t VBTABLE: unreadable V# base=0x%016" PRIx64 " shader=0x%016" PRIx64
+			     " attrib_table=0x%016" PRIx64 " buffer_table=0x%016" PRIx64
+			     " attrib_reg=%d buffer_reg=%d user_sgpr_num=%u\n",
+			     info.buffers[bi].addr, shader_addr, reinterpret_cast<uint64_t>(attrib),
+			     reinterpret_cast<uint64_t>(buffer), metadata.vertex_attrib_reg,
+			     metadata.vertex_buffer_reg, user_sgpr_num);
+			LOGF("\t VBTABLE:   user sgprs:");
+			for (uint32_t s = 0; s < user_sgpr_num && s < HW::UserSgprInfo::SGPRS_MAX; s++) {
+				LOGF(" %08" PRIx32, user_sgpr.value[s]);
+			}
+			LOGF("\n\t VBTABLE:   buffer table dwords:");
+			for (uint32_t d = 0; d < 16; d++) {
+				LOGF(" %08" PRIx32, buffer[d]);
+			}
+			LOGF("\n");
+			break;
+		}
 	}
 	return true;
 }

@@ -507,6 +507,7 @@ static int KYTY_SYSV_ABI SystemGestureGetTouchEventByEventID(
 }
 
 LIB_DEFINE(InitSystemGesture_1) {
+	PRINT_NAME_ENABLE(true);
 	LIB_FUNC("qpo-mEOwje0", SystemGesture::SystemGestureOpen);
 	LIB_FUNC("j4yXIA2jJ68", SystemGesture::SystemGestureClose);
 	LIB_FUNC("3pcAvmwKCvM", SystemGesture::SystemGestureInitializePrimitiveTouchRecognizer);
@@ -534,6 +535,7 @@ LIB_DEFINE(InitSystemGesture_1) {
 } // namespace SystemGesture
 
 LIB_DEFINE(InitSystemService_1) {
+	PRINT_NAME_ENABLE(true);
 	LIB_FUNC("Vo5V8KAwCmk", SystemService::SystemServiceHideSplashScreen);
 	LIB_FUNC("fZo48un7LK4", SystemService::SystemServiceParamGetInt);
 	LIB_FUNC("SsC-m-S9JTA", SystemService::SystemServiceParamGetString);

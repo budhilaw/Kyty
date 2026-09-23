@@ -651,7 +651,8 @@ Prospero::BufferFormat RenderTargetTransferFormat(uint32_t bytes_per_element) {
 
 } // namespace ImageOps
 
-Image::Image(GraphicContext& graphics, CommandScheduler& scheduler, const ImageInfo& image_info)
+Image::Image(GraphicContext& graphics, CommandScheduler& scheduler, const ImageInfo& image_info,
+             uint32_t requested_capacity_layers)
     : info(image_info), m_graphics(graphics), m_scheduler(scheduler) {
 	KYTY_PROFILER_FUNCTION();
 	ImageOps::Validate(info);
@@ -666,7 +667,10 @@ Image::Image(GraphicContext& graphics, CommandScheduler& scheduler, const ImageI
 	create.imageType     = HostImageType(info.type);
 	create.extent        = info.extent;
 	create.mipLevels     = info.resources.levels;
-	create.arrayLayers   = info.IsVolume() ? 1u : info.resources.layers;
+	create.arrayLayers   = info.IsVolume()
+	                           ? 1u
+	                           : std::max(info.resources.layers, requested_capacity_layers);
+	capacity_layers      = create.arrayLayers;
 	create.format        = info.pixel_format;
 	create.tiling        = vk::ImageTiling::eOptimal;
 	create.initialLayout = vk::ImageLayout::eUndefined;
@@ -690,6 +694,35 @@ Image::Image(GraphicContext& graphics, CommandScheduler& scheduler, const ImageI
 		     create.extent.width, create.extent.height, create.extent.depth,
 		     static_cast<int>(create.format), create.arrayLayers, create.mipLevels);
 	}
+	// Spare layers are physical capacity only; transitions and copies work in guest layers.
+	if (!info.IsVolume()) {
+		backing.layers = info.resources.layers;
+	}
+}
+
+void Image::GrowLayers(const ImageInfo& grown) {
+	const auto old_layers = info.resources.layers;
+	const auto new_layers = grown.resources.layers;
+	EXIT_IF(info.IsVolume() || new_layers < old_layers || new_layers > capacity_layers ||
+	        grown.resources.levels != info.resources.levels);
+	auto& subresource_states = backing.subresource_states;
+	if (new_layers != old_layers) {
+		// Layers beyond the old count were never transitioned individually, so they start
+		// from an undefined layout the next barrier may discard.
+		std::vector<VulkanImageState> grown_states(
+		    static_cast<size_t>(info.resources.levels) * new_layers, VulkanImageState {});
+		for (uint32_t level = 0; level < info.resources.levels; level++) {
+			for (uint32_t layer = 0; layer < old_layers; layer++) {
+				grown_states[static_cast<size_t>(level) * new_layers + layer] =
+				    subresource_states.empty()
+				        ? backing.state
+				        : subresource_states[static_cast<size_t>(level) * old_layers + layer];
+			}
+		}
+		subresource_states = std::move(grown_states);
+	}
+	info           = grown;
+	backing.layers = new_layers;
 }
 
 uint64_t Image::HashGuestEdges() const {

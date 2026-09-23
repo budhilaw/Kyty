@@ -721,11 +721,14 @@ int KYTY_SYSV_ABI PadOpen(int user_id, int type, int index, const void* param) {
 	constexpr int pad_error_invalid_arg = -2137915391; /* 0x80920001 */
 
 	if (!PadOpenArgsAreValid(user_id, type, index)) {
+		LOGF("\t PADOPEN: rejected user_id=%d type=%d index=%d\n", user_id, type, index);
 		return pad_error_invalid_arg;
 	}
 
 	int handle = 1;
 
+	LOGF("\t PADOPEN: accepted user_id=%d type=%d index=%d handle=%d\n", user_id, type, index,
+	     handle);
 	return handle;
 }
 
@@ -844,6 +847,17 @@ int KYTY_SYSV_ABI PadReadState(int handle, PadData* data) {
 
 	pad_fill_data(data, state, connected, connected_count);
 
+	{
+		static std::atomic<uint64_t> polls {0};
+		static std::atomic<uint32_t> last_buttons {0};
+		const auto                   count = polls.fetch_add(1);
+		const auto                   previous = last_buttons.exchange(state.buttons);
+		if (count % 600 == 0 || previous != state.buttons) {
+			LOGF("\t PADPOLL: read #%" PRIu64 " connected=%d count=%d buttons=0x%08" PRIx32 "\n",
+			     count, static_cast<int>(connected), connected_count, state.buttons);
+		}
+	}
+
 	return OK;
 }
 
@@ -875,6 +889,15 @@ int KYTY_SYSV_ABI PadRead(int handle, PadData* data, int num) {
 
 	for (int i = 0; i < ret_num; i++) {
 		pad_fill_data(&data[i], states[i], connected, connected_count);
+	}
+
+	{
+		static std::atomic<uint64_t> reads {0};
+		const auto                   count = reads.fetch_add(1);
+		if (count % 600 == 0) {
+			LOGF("\t PADPOLL: PadRead #%" PRIu64 " connected=%d num=%d buttons=0x%08" PRIx32 "\n",
+			     count, static_cast<int>(connected), ret_num, states[0].buttons);
+		}
 	}
 
 	return ret_num;

@@ -5,6 +5,7 @@
 #include "common/emulatorConfig.h"
 #include "common/logging/log.h"
 #include "common/profiler.h"
+#include "common/timer.h"
 #include "graphics/guest_gpu/gpu_format.h"
 #include "graphics/guest_gpu/tile.h"
 #include "graphics/host_gpu/graphicContext.h"
@@ -256,8 +257,8 @@ bool TextureCache::SafeToDownload(const Image& image) {
 	return !m_buffer_cache.HasGpuDirtyBytes(range.address, range.size);
 }
 
-ImageId TextureCache::InsertImage(const ImageInfo& info) {
-	const auto id = m_slot_images.insert(m_graphics, m_scheduler, info);
+ImageId TextureCache::InsertImage(const ImageInfo& info, uint32_t capacity_layers) {
+	const auto id = m_slot_images.insert(m_graphics, m_scheduler, info, capacity_layers);
 	if (!info.data.Empty()) {
 		RegisterImage(id);
 	}
@@ -902,8 +903,54 @@ TextureCache::OverlapResult TextureCache::ResolveOverlap(const ImageInfo& reques
 	return {merged_id};
 }
 
+// A render target array that grows one slice per draw would otherwise reallocate and copy the
+// whole image every draw, so layer-only growth reuses spare physical layers and reallocations
+// reserve room for the next ones.
 ImageId TextureCache::ExpandImage(const ImageInfo& info, ImageId source_id) {
+	Common::Timer expand_timer;
+	expand_timer.Start();
+	{
+		auto& source = m_slot_images[source_id];
+		const bool layer_only_growth =
+		    !info.IsVolume() && !source.info.IsVolume() &&
+		    info.resources.layers > source.info.resources.layers &&
+		    info.resources.levels == source.info.resources.levels &&
+		    info.data.address == source.info.data.address &&
+		    info.pixel_format == source.info.pixel_format && info.type == source.info.type &&
+		    info.extent == source.info.extent && info.pitch == source.info.pitch &&
+		    info.tile_mode == source.info.tile_mode && info.samples == source.info.samples &&
+		    info.bytes_per_block == source.info.bytes_per_block &&
+		    info.metadata.kind == source.info.metadata.kind;
+		if (layer_only_growth && info.resources.layers <= source.capacity_layers) {
+			UnregisterImage(source_id);
+			source.GrowLayers(info);
+			RegisterImage(source_id);
+			return source_id;
+		}
+		if (layer_only_growth) {
+			constexpr uint32_t max_reserved_layers = 512;
+			const auto reserved = std::min<uint32_t>(
+			    max_reserved_layers,
+			    std::max<uint32_t>(info.resources.layers, source.capacity_layers * 2u));
+			RefreshCopySource(source_id);
+			const auto expanded_id = InsertImage(info, reserved);
+			auto&      expanded    = m_slot_images[expanded_id];
+			auto&      old         = m_slot_images[source_id];
+			expanded.usage         = old.usage;
+			if (old.binding.is_bound || old.binding.is_target) {
+				old.binding.needs_rebind = true;
+			}
+			InitializeImage(expanded_id);
+			CopyImage(expanded_id, source_id);
+			FreeImage(source_id);
+			LOGF("\t EXPAND: reserved layers %u->%u (capacity %u) size=0x%" PRIx64 " ms=%.1f\n",
+			     old.info.resources.layers, info.resources.layers, reserved, info.data.size,
+			     expand_timer.GetTimeS() * 1000.0);
+			return expanded_id;
+		}
+	}
 	RefreshCopySource(source_id);
+	const auto refresh_ms  = expand_timer.GetTimeS() * 1000.0;
 	const auto expanded_id = InsertImage(info);
 	auto&      expanded    = m_slot_images[expanded_id];
 	auto&      source      = m_slot_images[source_id];
@@ -912,6 +959,7 @@ ImageId TextureCache::ExpandImage(const ImageInfo& info, ImageId source_id) {
 		source.binding.needs_rebind = true;
 	}
 	InitializeImage(expanded_id);
+	const auto    init_ms = expand_timer.GetTimeS() * 1000.0;
 	const int32_t mip = source.info.MipOf(info);
 	const int32_t layer = source.info.SliceOf(info, mip);
 	if (layer >= 0) {
@@ -920,7 +968,16 @@ ImageId TextureCache::ExpandImage(const ImageInfo& info, ImageId source_id) {
 	} else {
 		CopyImage(expanded_id, source_id);
 	}
+	const auto copy_ms = expand_timer.GetTimeS() * 1000.0;
 	FreeImage(source_id);
+	const auto free_ms = expand_timer.GetTimeS() * 1000.0;
+	if (free_ms > 2.0) {
+		LOGF("\t EXPAND: refresh=%.1f insert+init=%.1f copy=%.1f free=%.1f layers %u->%u "
+		     "levels %u->%u size=0x%" PRIx64 "\n",
+		     refresh_ms, init_ms - refresh_ms, copy_ms - init_ms, free_ms - copy_ms,
+		     source.info.resources.layers, info.resources.layers, source.info.resources.levels,
+		     info.resources.levels, info.data.size);
+	}
 	return expanded_id;
 }
 
@@ -1268,8 +1325,11 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_format) {
 	ImageId result {};
 	{
 		std::scoped_lock lock {m_lock};
+		Common::Timer    find_timer;
+		find_timer.Start();
 		const auto       candidates =
 		    FindImagesInRegion(desc.info.data.address, desc.info.data.size, false);
+		const auto region_ms = find_timer.GetTimeS() * 1000.0;
 
 		for (const auto id: candidates) {
 			const auto& image = m_slot_images[id];
@@ -1285,7 +1345,14 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_format) {
 				view_mip                = -1;
 				view_layer              = -1;
 				const auto& merged_info = result ? m_slot_images[result].info : desc.info;
+				Common::Timer overlap_timer;
+				overlap_timer.Start();
 				const auto  overlap     = ResolveOverlap(merged_info, desc.type, candidate, result);
+				if (overlap_timer.GetTimeS() > 0.002) {
+					LOGF("\t XTCPATH: ResolveOverlap ms=%.1f result=%u mip=%d layer=%d\n",
+					     overlap_timer.GetTimeS() * 1000.0, overlap.image ? 1u : 0u, overlap.mip,
+					     overlap.layer);
+				}
 				if (overlap.image) {
 					result     = overlap.image;
 					view_mip   = overlap.mip;
@@ -1299,17 +1366,32 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_format) {
 			if (exact_format && resolved.info.pixel_format != desc.info.pixel_format) {
 				result = {};
 			} else if (resolved.info.resources < desc.info.resources) {
+				LOGF("\t XTCPATH: freeing smaller image levels=%u layers=%u wanted levels=%u "
+				     "layers=%u\n",
+				     resolved.info.resources.levels, resolved.info.resources.layers,
+				     desc.info.resources.levels, desc.info.resources.layers);
 				FreeImage(result);
 				result = {};
 			}
 		}
 		if (!result) {
+			Common::Timer insert_timer;
+			insert_timer.Start();
 			result         = InsertImage(desc.info);
+			if (insert_timer.GetTimeS() > 0.002) {
+				LOGF("\t TCPHASE: InsertImage ms=%.1f size=0x%016" PRIx64 "\n",
+				     insert_timer.GetTimeS() * 1000.0, desc.info.data.size);
+			}
 			auto& inserted = m_slot_images[result];
 			if (m_buffer_cache.HasGpuDirtyBytes(inserted.info.data.address,
 			                                    inserted.info.data.size)) {
 				inserted.MarkBufferModified();
 			}
+		}
+		const auto resolve_ms = find_timer.GetTimeS() * 1000.0;
+		if (resolve_ms > 2.0) {
+			LOGF("\t XTCPHASE: region=%.1f resolve=%.1f candidates=%zu\n", region_ms,
+			     resolve_ms - region_ms, candidates.size());
 		}
 		auto& image = m_slot_images[result];
 		if (desc.type == BindingType::VideoOut &&
@@ -1331,7 +1413,12 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_format) {
 		image.tick_accessed_last = m_scheduler.CurrentTick();
 		TouchImage(image);
 	}
+	Common::Timer dcc_timer;
+	dcc_timer.Start();
 	MaterializeDccClear(result, desc, metadata_base_layer);
+	if (dcc_timer.GetTimeS() > 0.002) {
+		LOGF("\t TCPHASE: MaterializeDccClear ms=%.1f\n", dcc_timer.GetTimeS() * 1000.0);
+	}
 	return result;
 }
 
