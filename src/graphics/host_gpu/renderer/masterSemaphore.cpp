@@ -1,7 +1,15 @@
 #include "graphics/host_gpu/renderer/masterSemaphore.h"
 
 #include "common/assert.h"
+#include "common/timer.h"
 #include "graphics/host_gpu/graphicContext.h"
+
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+#include <windows.h>
+#else
+#include <immintrin.h>
+#define YieldProcessor() _mm_pause()
+#endif
 
 namespace Libs::Graphics {
 
@@ -42,6 +50,24 @@ void MasterSemaphore::Wait(uint64_t tick) {
 	Refresh();
 	if (IsFree(tick)) {
 		return;
+	}
+
+	// Thousands of these waits happen per second, mostly for work the GPU finishes within
+	// microseconds. A kernel wait costs a scheduler round trip of the better part of a
+	// millisecond each time, so the counter is polled briefly before falling back to one.
+	{
+		const auto frequency = Common::Timer::QueryPerformanceFrequency();
+		const auto deadline =
+		    Common::Timer::QueryPerformanceCounter() + frequency * 2 / 1000; // 2 ms
+		while (Common::Timer::QueryPerformanceCounter() < deadline) {
+			for (int i = 0; i < 64; i++) {
+				YieldProcessor();
+			}
+			Refresh();
+			if (IsFree(tick)) {
+				return;
+			}
+		}
 	}
 
 	vk::SemaphoreWaitInfo wait_info {};

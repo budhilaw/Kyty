@@ -11,6 +11,8 @@
 #include "graphics/host_gpu/renderer/cache/multiLevelPageTable.h"
 #include "graphics/host_gpu/renderer/cache/streamBuffer.h"
 
+#include <memory>
+#include <unordered_map>
 #include <map>
 #include <span>
 #include <utility>
@@ -108,6 +110,34 @@ private:
 	// Queues backing publication; callers wait before clearing dirty pages or reusing their data.
 	[[nodiscard]] bool DownloadBufferMemory(Buffer& buffer, uint64_t vaddr, uint64_t size);
 
+	// A download issued ahead of the CPU read that will need it. Its pages stay tracked as
+	// GPU-owned until the data has landed, so an early read waits for this tick only.
+	struct PendingDownload {
+		uint64_t begin = 0;
+		uint64_t size  = 0;
+		uint64_t tick  = 0;
+	};
+	void RetirePendingDownloads(bool wait_all);
+	bool TryWaitPendingDownload(uint64_t vaddr, uint64_t size);
+	std::vector<PendingDownload> m_pending_downloads;
+
+	// Tick of the last GPU write per 64 KiB block, and of the last write too large to record
+	// per block. A CPU read whose writers have all retired is served from a second queue
+	// without waiting for the rest of the queued frame.
+	std::unordered_map<uint64_t, uint64_t> m_gpu_write_ticks;
+	uint64_t                               m_unbounded_write_tick = 0;
+	vk::CommandPool                        m_readback_pool        = nullptr;
+	vk::CommandBuffer                      m_readback_command     = nullptr;
+	vk::Semaphore                          m_readback_semaphore   = nullptr;
+	uint64_t                               m_readback_tick        = 0;
+	std::unique_ptr<Buffer>                m_readback_buffer;
+	void                                   InitializeReadbackQueue();
+	[[nodiscard]] bool TryImmediateReadback(Buffer& buffer, uint64_t vaddr, uint64_t size);
+
+public:
+	void PrefetchReadbacks();
+
+private:
 	GraphicContext&                                   m_graphics;
 	CommandScheduler&                                 m_scheduler;
 	FaultManager                                      m_fault_manager;

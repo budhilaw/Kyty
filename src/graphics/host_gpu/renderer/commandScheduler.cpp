@@ -2,10 +2,12 @@
 
 #include "common/assert.h"
 #include "common/logging/log.h"
+#include "common/threads.h"
 #include "graphics/host_gpu/graphicContext.h"
 
 #include <algorithm>
 #include <cstdio>
+#include <cstdlib>
 #include <optional>
 
 namespace Libs::Graphics {
@@ -165,12 +167,25 @@ void CommandScheduler::EndRendering() {
 	}
 }
 
+static bool SkipEmptySubmits() {
+	// KYTY_KEEP_EMPTY_SUBMIT restores a submit per flush for comparison.
+	static const bool skip = std::getenv("KYTY_KEEP_EMPTY_SUBMIT") == nullptr;
+	return skip;
+}
+
 void CommandScheduler::Flush() {
 	SubmitInfo submit;
 	Flush(submit);
 }
 
 void CommandScheduler::Flush(SubmitInfo& submit) {
+	// A stream can carry hundreds of end-of-pipe writes per frame, and each one asked for a
+	// flush. Those record no commands, so submitting an empty buffer only costs a queue round
+	// trip: the work they are meant to follow has already been submitted.
+	if (SkipEmptySubmits() && !m_command.IsInvalid() && !m_command.HasRecordedWork() &&
+	    submit.num_wait_semaphores == 0 && submit.num_signal_semaphores == 0) {
+		return;
+	}
 	Submit(submit);
 	BeginNext();
 }
@@ -192,6 +207,8 @@ void CommandScheduler::Finish() {
 }
 
 void CommandScheduler::Wait(uint64_t tick) {
+	Common::WaitTrace::Scope wait_scope(Common::WaitTrace::Kind::GpuTickWait);
+	Common::WaitTrace::NoteCaller(Common::WaitTrace::Kind::GpuTickWait);
 	EXIT_IF(tick > CurrentTick());
 	if (tick == CurrentTick()) {
 		CheckActive();
@@ -247,9 +264,16 @@ void CommandScheduler::DeferOperation(Common::UniqueFunction<void>&& operation) 
 void CommandScheduler::DeferPriorityOperation(Common::UniqueFunction<void>&& operation) {
 	CheckActive();
 	EXIT_IF(!operation);
+	// With nothing recorded since the last submit the pipe is already drained up to the tick
+	// that was submitted, so the operation must not wait for a tick that may never be issued.
+	const auto tick = (SkipEmptySubmits() && !m_command.IsInvalid() &&
+	                   !m_command.HasRecordedWork() && CurrentTick() > 0)
+	                      ? CurrentTick() - 1
+	                      : CurrentTick();
+
 	std::unique_lock lock(m_operation_mutex);
 	if (m_operation_state == OperationState::Open) {
-		m_priority_operations.push({std::move(operation), CurrentTick()});
+		m_priority_operations.push({std::move(operation), tick});
 		lock.unlock();
 		m_operation_available.notify_one();
 		return;
@@ -263,6 +287,15 @@ void CommandScheduler::DeferPriorityOperation(Common::UniqueFunction<void>&& ope
 	                           [this] { return m_operation_state == OperationState::Closed; });
 	lock.unlock();
 	operation();
+}
+
+void CommandScheduler::ReportPriorityQueue(size_t* depth, uint64_t* head_tick, bool* active,
+                                           uint64_t* active_tick) {
+	std::lock_guard lock(m_operation_mutex);
+	*depth       = m_priority_operations.size();
+	*head_tick   = m_priority_operations.empty() ? 0 : m_priority_operations.front().tick;
+	*active      = m_priority_active;
+	*active_tick = m_priority_active_tick;
 }
 
 void CommandScheduler::PriorityOperationsThread(std::stop_token stop) {
@@ -281,8 +314,20 @@ void CommandScheduler::PriorityOperationsThread(std::stop_token stop) {
 			m_priority_active      = true;
 			m_priority_active_tick = operation.tick;
 		}
+		{
+			static std::atomic<uint32_t> pre_log_count {0};
+			if (pre_log_count.fetch_add(1) < 64) {
+				LOGF("\t ORDER: priority op waiting tick=%" PRIu64 " current=%" PRIu64
+				     " known_gpu=%" PRIu64 "\n",
+				     operation.tick, CurrentTick(), m_master.KnownGpuTick());
+			}
+		}
 		m_master.Wait(operation.tick);
 		if (!stop.stop_requested()) {
+			static std::atomic<uint32_t> run_log_count {0};
+			if (run_log_count.fetch_add(1) < 64) {
+				LOGF("\t ORDER: priority op run tick=%" PRIu64 "\n", operation.tick);
+			}
 			RunOperation(std::move(operation.callback));
 		}
 		{
@@ -344,6 +389,8 @@ CommandBuffer& CommandScheduler::BeginCommand() {
 }
 
 uint64_t CommandScheduler::Submit(SubmitInfo submit) {
+	Common::WaitTrace::Scope submit_scope(Common::WaitTrace::Kind::GpuSubmit);
+	Common::WaitTrace::NoteCaller(Common::WaitTrace::Kind::GpuSubmit);
 	EXIT_IF(m_command.IsInvalid());
 	EXIT_IF(submit.num_wait_semaphores > SubmitInfo::MaxSemaphores ||
 	        submit.num_signal_semaphores >= SubmitInfo::MaxSemaphores);
@@ -387,7 +434,8 @@ uint64_t CommandScheduler::Submit(SubmitInfo submit) {
 	}
 	EXIT_NOT_IMPLEMENTED(result != vk::Result::eSuccess);
 
-	m_command.m_buffer = nullptr;
+	m_command.m_buffer   = nullptr;
+	m_work_since_submit = 0;
 	return tick;
 }
 

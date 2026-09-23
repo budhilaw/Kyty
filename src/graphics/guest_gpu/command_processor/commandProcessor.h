@@ -25,7 +25,29 @@ enum class ContextStateOperation : uint32_t {
 
 class Pm4Execution {
 public:
-	[[nodiscard]] bool MadeProgress() const noexcept { return m_made_progress; }
+	[[nodiscard]] bool        MadeProgress() const noexcept { return m_made_progress; }
+	[[nodiscard]] const char* SuspendReason() const noexcept { return m_suspend_reason; }
+	[[nodiscard]] uint32_t    SuspendOffset() const noexcept {
+		   return m_buffer_stack.empty() ? 0 : m_buffer_stack.back().offset_dw;
+	}
+	[[nodiscard]] uint64_t AwaitedAddress() const noexcept { return m_awaited_address; }
+	void SetAwaitedAddress(uint64_t address) noexcept { m_awaited_address = address; }
+	[[nodiscard]] uint64_t WaitSeq() const noexcept { return m_wait_seq; }
+	[[nodiscard]] uint64_t BaselineSeq() const noexcept { return m_baseline_seq; }
+	void SetBaselineSeq(uint64_t seq) noexcept { m_baseline_seq = seq; }
+	[[nodiscard]] uint64_t WaitRef() const noexcept { return m_wait_ref; }
+	[[nodiscard]] uint64_t WaitMask() const noexcept { return m_wait_mask; }
+	[[nodiscard]] uint32_t WaitFunc() const noexcept { return m_wait_func; }
+	void BeginWait(uint64_t address, uint64_t seq) noexcept {
+		m_awaited_address = address;
+		m_wait_seq        = seq;
+	}
+	void SetWaitOperands(uint64_t ref, uint64_t mask, uint32_t func) noexcept {
+		m_wait_ref  = ref;
+		m_wait_mask = mask;
+		m_wait_func = func;
+	}
+	void ClearWait() noexcept { m_awaited_address = 0; }
 
 private:
 	friend class CommandProcessor;
@@ -37,6 +59,13 @@ private:
 
 	std::vector<BufferCursor> m_buffer_stack;
 	std::span<const uint32_t> m_next_buffer;
+	const char*               m_suspend_reason  = nullptr;
+	uint64_t                  m_awaited_address = 0;
+	uint64_t                  m_wait_seq        = 0;
+	uint64_t                  m_baseline_seq    = 0;
+	uint64_t                  m_wait_ref        = 0;
+	uint64_t                  m_wait_mask       = 0;
+	uint32_t                  m_wait_func       = 0;
 	bool                      m_chain         = false;
 	bool                      m_suspended     = false;
 	bool                      m_made_progress = false;
@@ -62,6 +91,8 @@ public:
 
 	void            BufferInit();
 	void            BufferFlush();
+	// Submits only once enough draws and dispatches have accumulated since the last submit.
+	void            BufferFlushIfBusy();
 	void            BufferFlushAndWait();
 	void            BufferWait();
 	HW::Context&    GetCtx() { return m_ctx; }
@@ -136,6 +167,16 @@ public:
 
 	[[nodiscard]] uint64_t GetSubmitId() const { return m_submit_id; }
 	void                   SetSubmitId(uint64_t submit_id) { m_submit_id = submit_id; }
+	void SetStreamOrigin(const uint32_t* copy_base, const uint32_t* guest_base) {
+		m_stream_copy   = copy_base;
+		m_stream_origin = guest_base;
+	}
+	[[nodiscard]] const uint32_t* LiveGuestPacket(const uint32_t* copy_packet) const {
+		if (m_stream_copy == nullptr || m_stream_origin == nullptr || copy_packet == nullptr) {
+			return nullptr;
+		}
+		return m_stream_origin + (copy_packet - m_stream_copy);
+	}
 	[[nodiscard]] bool     IsAsyncComputeQueue() const { return m_interrupt_event_id >= 0x20; }
 
 private:
@@ -145,7 +186,7 @@ private:
 	                      void* dst_gpu_addr, T value, uint32_t interrupt_selector,
 	                      uint32_t interrupt_context_id);
 	void ProcessPm4(Pm4Execution& execution);
-	void SuspendPm4();
+	void SuspendPm4(const char* reason);
 	CommandScheduler&   GetScheduler() const { return m_renderer.GetCommandScheduler(); }
 	CommandBuffer&      CurrentBuffer() { return GetScheduler().Current(); }
 	void                CheckBuffer() const { GetScheduler().CheckActive(); }
@@ -174,6 +215,8 @@ private:
 	FlipInfo  m_flip;
 	const int m_interrupt_event_id;
 	uint64_t  m_submit_id                   = 0;
+	const uint32_t* m_stream_copy           = nullptr;
+	const uint32_t* m_stream_origin         = nullptr;
 	uint64_t  m_synthetic_occlusion_counter = 0;
 	bool      m_predicate_skip              = false;
 };

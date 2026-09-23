@@ -38,6 +38,10 @@ public:
 	void                      PopPendingOperations();
 	void                      DrainPriorityOperations();
 	void                      WaitPriorityOperations(uint64_t tick);
+	// Reports the deferred end-of-pipe queue so a stalled scheduler can say whether a write is
+	// waiting on a tick that has not been submitted yet.
+	void ReportPriorityQueue(size_t* depth, uint64_t* head_tick, bool* active,
+	                         uint64_t* active_tick);
 	void                      DeferOperation(Common::UniqueFunction<void>&& operation);
 	void                      DeferPriorityOperation(Common::UniqueFunction<void>&& operation);
 	[[nodiscard]] static bool InDeferredOperation() noexcept;
@@ -46,12 +50,17 @@ public:
 	void                           CheckActive() const;
 	CommandBuffer&                 Current();
 	[[nodiscard]] uint64_t         CurrentTick() const noexcept { return m_master.CurrentTick(); }
+	[[nodiscard]] uint64_t KnownGpuTick() const noexcept { return m_master.KnownGpuTick(); }
+	void                   NoteWork() noexcept { m_work_since_submit++; }
+	[[nodiscard]] uint32_t WorkSinceSubmit() const noexcept { return m_work_since_submit; }
 	[[nodiscard]] bool             IsFree(uint64_t tick);
 	[[nodiscard]] MasterSemaphore& GetMasterSemaphore() noexcept { return m_master; }
 	[[nodiscard]] RenderContext&   Context() const noexcept { return m_context; }
 	[[nodiscard]] GraphicContext&  Graphics() const noexcept { return m_graphics; }
 
 private:
+	uint32_t m_work_since_submit = 0;
+
 	class CommandPool {
 	public:
 		CommandPool(GraphicContext& graphics, MasterSemaphore& master);

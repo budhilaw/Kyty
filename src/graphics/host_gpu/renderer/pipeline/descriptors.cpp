@@ -790,6 +790,25 @@ void RenderExecutor::FindBuffers(PreparedBindings& prepared) {
 			prepared.buffer_sources.push_back({});
 			continue;
 		}
+		{
+			// The game leaves placeholder descriptors bound with bases outside the address
+			// space; they read as zero on hardware, and clamping their range would abort. This
+			// consults the mapping only: touching the page would fault, and a fault on a
+			// GPU-written page costs a full GPU drain per descriptor.
+			if (!m_context.IsMapped(address, sizeof(uint32_t))) {
+				static std::atomic<uint32_t> log_count {0};
+				if (log_count.fetch_add(1) < 32) {
+					LOGF("\t BUFDESC: binding null buffer for descriptor %" PRIu32 "/%zu addr=0x%016" PRIx64
+					     " size=0x%016" PRIx64 " raw= %08" PRIx32 " %08" PRIx32 " %08" PRIx32
+					     " %08" PRIx32 "\n",
+					     i, program.info.buffers.size(), address, requested_size,
+					     snapshot.buffers[i].dwords[0], snapshot.buffers[i].dwords[1],
+					     snapshot.buffers[i].dwords[2], snapshot.buffers[i].dwords[3]);
+				}
+				prepared.buffer_sources.push_back({});
+				continue;
+			}
+		}
 		const auto size = Libs::LibKernel::Memory::ClampRangeSize(address, requested_size);
 		prepared.buffer_sources.push_back({address, size, cache.FindBuffer(address, size)});
 	}

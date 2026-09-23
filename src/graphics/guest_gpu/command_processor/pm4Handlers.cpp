@@ -15,6 +15,7 @@
 #include "libs/agc.h"
 #include "libs/errno.h"
 
+#include <cstdlib>
 #include <algorithm>
 #include <array>
 #include <atomic>
@@ -2045,6 +2046,14 @@ KYTY_CP_OP_PARSER(CpOpIndirectCxRegs) {
 				LOGF("\t temporary: skipping unknown indirect CX extended offset = 0x%08" PRIx32
 				     ", value = 0x%08" PRIx32 "\n",
 				     cmd_offset, value);
+				const auto* live = cp.LiveGuestPacket(buffer);
+				LOGF("\t   INDIRECTCX: entry %" PRIu32 "/%" PRIu32 " table=0x%016" PRIx64
+				     " copy packet: %08" PRIx32 " %08" PRIx32 " %08" PRIx32 " %08" PRIx32
+				     " live packet: %08" PRIx32 " %08" PRIx32 " %08" PRIx32 " %08" PRIx32 "\n",
+				     i, indirect_num_dw, reinterpret_cast<uint64_t>(indirect_buffer), buffer[0],
+				     buffer[1], buffer[2], buffer[3], live != nullptr ? live[0] : 0u,
+				     live != nullptr ? live[1] : 0u, live != nullptr ? live[2] : 0u,
+				     live != nullptr ? live[3] : 0u);
 			}
 			continue;
 		}
@@ -2319,6 +2328,16 @@ KYTY_CP_OP_PARSER(CpOpReleaseMem) {
 	EXIT_NOT_IMPLEMENTED(data_sel != 0 && data_sel != 1 && data_sel != 2 && data_sel != 3 &&
 	                     data_sel != 5);
 
+	{
+		static std::atomic<uint32_t> rm_log_count {0};
+		if (rm_log_count.fetch_add(1) < 256) {
+			LOGF("\t RELEASEMEM: dst=0x%016" PRIx64 " value=0x%016" PRIx64 " data_sel=%" PRIu32
+			     " int_sel=%" PRIu32 " release_dst=%" PRIu32 "\n",
+			     reinterpret_cast<uint64_t>(dst_gpu_addr), value, data_sel, interrupt_selector,
+			     release_dst);
+		}
+	}
+
 	LogUnknownReleaseMemGcr(gcr_cntl);
 
 	const bool gl2_writeback = ((gcr_cntl & GcrGl2Writeback) != 0);
@@ -2376,7 +2395,15 @@ KYTY_CP_OP_PARSER(CpOpReleaseMem) {
 		cp.WriteAtEndOfPipe32(cache_policy, event_write_dest, eop_event_type, cache_action,
 		                      event_index, event_source, dst_gpu_addr, static_cast<uint32_t>(value),
 		                      interrupt_selector, interrupt_context_id);
-		cp.BufferFlush();
+		// A label without an interrupt does not need its own queue submission: the game sees
+		// the value at once, and the end-of-pipe write retires with the next natural submit.
+		// Splitting a frame into hundreds of tiny submissions was costing more than the draws.
+		static const bool flush_labels = std::getenv("KYTY_FLUSH_LABELS") != nullptr;
+		if (flush_labels || interrupt_selector == 0x01 || interrupt_selector == 0x02) {
+			cp.BufferFlush();
+		} else {
+			cp.BufferFlushIfBusy();
+		}
 
 		return 7;
 	}

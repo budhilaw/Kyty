@@ -25,12 +25,36 @@ bool CommandBuffer::IsInvalid() const {
 
 vk::CommandBuffer CommandBuffer::Handle() const {
 	EXIT_IF(IsInvalid());
+	// Every recorded command goes through this accessor, so it is where the buffer stops being
+	// empty. Callers that only need the scheduler, not the buffer, must not ask for it.
+	if (m_pending_barrier) {
+		m_pending_barrier = false;
+		// The pass is ended here directly: going through EndRendering() would re-enter this
+		// accessor and end it twice.
+		if (m_rendering) {
+			m_buffer.endRendering();
+			m_rendering    = false;
+			m_render_state = {};
+		}
+		vk::MemoryBarrier2 barrier {};
+		barrier.srcStageMask  = vk::PipelineStageFlagBits2::eAllCommands;
+		barrier.srcAccessMask = vk::AccessFlagBits2::eMemoryWrite;
+		barrier.dstStageMask  = vk::PipelineStageFlagBits2::eAllCommands;
+		barrier.dstAccessMask = vk::AccessFlagBits2::eMemoryRead | vk::AccessFlagBits2::eMemoryWrite;
+		vk::DependencyInfo dependency {};
+		dependency.memoryBarrierCount = 1;
+		dependency.pMemoryBarriers    = &barrier;
+		m_buffer.pipelineBarrier2(dependency);
+	}
+	m_recorded = true;
 	return m_buffer;
 }
 
 void CommandBuffer::Begin() {
 	EXIT_IF(m_rendering || IsInvalid());
-	auto buffer = Handle();
+	// Nothing may be recorded before vkBeginCommandBuffer, so this must not go through
+	// Handle(), which would emit a pending barrier first.
+	auto buffer = m_buffer;
 
 	vk::CommandBufferBeginInfo begin_info {};
 	begin_info.flags = vk::CommandBufferUsageFlagBits::eOneTimeSubmit;
@@ -38,11 +62,14 @@ void CommandBuffer::Begin() {
 	auto result = buffer.begin(&begin_info);
 
 	EXIT_NOT_IMPLEMENTED(result != vk::Result::eSuccess);
+	m_recorded = false;
+	m_context.GpuTimerBegin(buffer);
 }
 
 void CommandBuffer::End() const {
 	EndRendering();
 	auto buffer = Handle();
+	m_context.GpuTimerMark(buffer, 0, 0);
 
 	auto result = buffer.end();
 
@@ -112,7 +139,9 @@ void CommandBuffer::EndRendering() const {
 	if (!m_rendering) {
 		return;
 	}
-	Handle().endRendering();
+	// Not Handle(): a pending barrier belongs after the pass, before the next command.
+	m_buffer.endRendering();
+	m_recorded     = true;
 	m_rendering    = false;
 	m_render_state = {};
 }

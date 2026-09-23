@@ -1,12 +1,30 @@
 #include "graphics/host_gpu/renderer/renderContext.h"
 
 #include "common/assert.h"
+#include "common/threads.h"
+#include "common/timer.h"
 #include "common/logging/log.h"
 #include "graphics/guest_gpu/graphicsRun.h"
 #include "graphics/presentation/videoOut.h"
 #include "libs/errno.h"
 
+#include <vector>
+#include <cstdlib>
 #include <algorithm>
+#include <array>
+#include <cinttypes>
+#include <cstdio>
+#include <utility>
+
+#ifdef _WIN32
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#include <windows.h>
+#endif
 
 namespace Libs::Graphics {
 
@@ -65,6 +83,81 @@ bool RenderContext::HandleFault(PageFaultAccess access, uint64_t fault_vaddr) no
 		m_buffer_cache.InvalidateMemory(fault_vaddr, fault_size);
 		m_texture_cache.InvalidateMemory(fault_vaddr, fault_size);
 	} else {
+		// Every read of GPU-written memory drains the GPU, so the trace reports how often it
+		// happens and which pages keep causing it.
+		if (Common::WaitTrace::Enabled()) {
+			static Common::Mutex                           stats_mutex;
+			static uint64_t                                stats_start = 0;
+			static uint64_t                                stats_count = 0;
+			static std::array<std::pair<uint64_t, uint64_t>, 8> stats_pages {};
+			static std::array<uint64_t, 8>                      stats_gpu {};
+			static std::array<uint32_t, 8>                      stats_thread {};
+			static std::array<std::array<uint64_t, 5>, 8>       stats_stack {};
+			Common::LockGuard                              lock(stats_mutex);
+			const auto now  = Common::Timer::QueryPerformanceCounter();
+			const auto page = fault_vaddr & ~uint64_t {0x3fff};
+			const bool on_gpu_thread = GuestGpu::IsGpuThread();
+			stats_count++;
+			bool found = false;
+			for (size_t i = 0; i < stats_pages.size(); i++) {
+				if (stats_pages[i].first == page) {
+					stats_pages[i].second++;
+					stats_gpu[i] += on_gpu_thread ? 1 : 0;
+					found = true;
+					break;
+				}
+			}
+			if (!found) {
+				for (size_t i = 0; i < stats_pages.size(); i++) {
+					if (stats_pages[i].first == 0) {
+						stats_pages[i] = {page, 1};
+						stats_gpu[i]   = on_gpu_thread ? 1 : 0;
+#ifdef _WIN32
+						stats_thread[i] = GetCurrentThreadId();
+						void*      frames[32] {};
+						const auto captured = RtlCaptureStackBackTrace(0, 32, frames, nullptr);
+						const auto base = reinterpret_cast<uint64_t>(GetModuleHandleA(nullptr));
+						size_t     kept = 0;
+						for (unsigned f = 0; f < captured && kept < stats_stack[i].size(); f++) {
+							HMODULE module = nullptr;
+							if (GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+							                           GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+							                       static_cast<const char*>(frames[f]), &module) &&
+							    reinterpret_cast<uint64_t>(module) == base) {
+								stats_stack[i][kept++] = reinterpret_cast<uint64_t>(frames[f]) - base;
+							}
+						}
+#endif
+						break;
+					}
+				}
+			}
+			const auto frequency = Common::Timer::QueryPerformanceFrequency();
+			if (stats_start == 0) {
+				stats_start = now;
+			} else if (frequency != 0 && now - stats_start >= frequency) {
+				std::printf("READFAULT %" PRIu64 "/s:", stats_count);
+				for (size_t i = 0; i < stats_pages.size(); i++) {
+					if (stats_pages[i].first != 0) {
+						std::printf(" 0x%" PRIx64 "x%" PRIu64 "(gpu%" PRIu64 " tid%" PRIu32 " [",
+						            stats_pages[i].first, stats_pages[i].second, stats_gpu[i],
+						            stats_thread[i]);
+						for (const auto rva: stats_stack[i]) {
+							std::printf("%" PRIx64 ",", rva);
+						}
+						std::printf("])");
+					}
+				}
+				std::printf("\n");
+				std::fflush(stdout);
+				stats_start = now;
+				stats_count = 0;
+				stats_pages.fill({});
+				stats_gpu.fill(0);
+				stats_thread.fill(0);
+				stats_stack.fill({});
+			}
+		}
 		m_buffer_cache.ReadMemory(fault_vaddr, fault_size);
 	}
 	return true;
@@ -126,7 +219,132 @@ void RenderContext::PrepareBda() {
 	m_fault_process_pending = true;
 }
 
+void RenderContext::PrefetchReadbacks() {
+	m_buffer_cache.PrefetchReadbacks();
+}
+
+void RenderContext::GpuTimerBegin(vk::CommandBuffer command) {
+	if (!m_timer_initialized) {
+		m_timer_initialized = true;
+		m_timer_enabled     = std::getenv("KYTY_GPU_TIMING") != nullptr;
+		if (m_timer_enabled) {
+			vk::QueryPoolCreateInfo info {};
+			info.queryType  = vk::QueryType::eTimestamp;
+			info.queryCount = GpuTimerBlockQueries * GpuTimerBlockCount;
+			if (m_graphics.device.createQueryPool(&info, nullptr, &m_timer_pool) !=
+			    vk::Result::eSuccess) {
+				m_timer_enabled = false;
+			} else {
+				m_timer_blocks.resize(GpuTimerBlockCount);
+				for (uint32_t i = 0; i < GpuTimerBlockCount; i++) {
+					m_timer_blocks[i].first = i * GpuTimerBlockQueries;
+				}
+			}
+		}
+	}
+	m_timer_current = -1;
+	if (!m_timer_enabled) {
+		return;
+	}
+	for (size_t i = 0; i < m_timer_blocks.size(); i++) {
+		auto& block = m_timer_blocks[i];
+		if (block.active) {
+			if (!m_command_scheduler.IsFree(block.tick)) {
+				continue;
+			}
+			GpuTimerCollect(block);
+		}
+		block.active = true;
+		block.used   = 0;
+		block.tick   = m_command_scheduler.CurrentTick();
+		block.entries.clear();
+		command.resetQueryPool(m_timer_pool, block.first, GpuTimerBlockQueries);
+		m_timer_current = static_cast<int>(i);
+		GpuTimerMark(command, 0, 0);
+		return;
+	}
+}
+
+void RenderContext::GpuTimerMark(vk::CommandBuffer command, uint64_t label, uint8_t kind) {
+	if (m_timer_current < 0) {
+		return;
+	}
+	auto& block = m_timer_blocks[static_cast<size_t>(m_timer_current)];
+	if (block.used >= GpuTimerBlockQueries) {
+		return;
+	}
+	command.writeTimestamp(vk::PipelineStageFlagBits::eBottomOfPipe, m_timer_pool,
+	                       block.first + block.used);
+	block.entries.push_back({block.first + block.used, label, kind});
+	block.used++;
+}
+
+void RenderContext::GpuTimerCollect(GpuTimerBlock& block) {
+	block.active = false;
+	if (block.used < 2) {
+		return;
+	}
+	std::vector<uint64_t> results(static_cast<size_t>(block.used) * 2);
+	const auto            result = m_graphics.device.getQueryPoolResults(
+        m_timer_pool, block.first, block.used, results.size() * sizeof(uint64_t), results.data(),
+        sizeof(uint64_t) * 2, vk::QueryResultFlagBits::e64 | vk::QueryResultFlagBits::eWithAvailability);
+	if (result != vk::Result::eSuccess) {
+		return;
+	}
+	const double period_ms = m_graphics.physical_device_properties.limits.timestampPeriod * 1e-6;
+	for (uint32_t i = 1; i < block.used; i++) {
+		if (results[i * 2 + 1] == 0 || results[(i - 1) * 2 + 1] == 0) {
+			continue;
+		}
+		const auto  delta = results[i * 2] - results[(i - 1) * 2];
+		const auto& entry = block.entries[i];
+		auto&       stat  = m_timer_stats[entry.label];
+		stat.ms += static_cast<double>(delta) * period_ms;
+		stat.count++;
+		stat.kind = entry.kind;
+		m_timer_kind_ms[entry.kind == 2 ? 2 : (entry.kind == 0 ? 0 : 1)] += static_cast<double>(delta) * period_ms;
+	}
+}
+
+void RenderContext::GpuTimerReport() {
+	if (!m_timer_enabled) {
+		return;
+	}
+	const auto now       = Common::Timer::QueryPerformanceCounter();
+	const auto frequency = Common::Timer::QueryPerformanceFrequency();
+	if (m_timer_last_report == 0) {
+		m_timer_last_report = now;
+		return;
+	}
+	if (frequency == 0 || now - m_timer_last_report < frequency) {
+		return;
+	}
+	m_timer_last_report = now;
+	for (auto& block: m_timer_blocks) {
+		if (block.active && static_cast<int>(&block - m_timer_blocks.data()) != m_timer_current &&
+		    m_command_scheduler.IsFree(block.tick)) {
+			GpuTimerCollect(block);
+		}
+	}
+	std::vector<std::pair<uint64_t, GpuTimerStat>> rows(m_timer_stats.begin(), m_timer_stats.end());
+	std::sort(rows.begin(), rows.end(),
+	          [](const auto& a, const auto& b) { return a.second.ms > b.second.ms; });
+	std::printf("GPUTIME other=%.1fms dispatch=%.1fms draw=%.1fms\n", m_timer_kind_ms[0],
+	            m_timer_kind_ms[1], m_timer_kind_ms[2]);
+	for (size_t i = 0; i < rows.size() && i < 18; i++) {
+		const auto& [label, stat] = rows[i];
+		std::printf("  %s %016" PRIx64 " %7.1fms /%" PRIu64 "\n",
+		            stat.kind == 1 ? "cs " : (stat.kind == 2 ? "ps " : (stat.kind == 3 ? "csD" : "-- ")), label, stat.ms,
+		            stat.count);
+	}
+	std::fflush(stdout);
+	m_timer_stats.clear();
+	m_timer_kind_ms[0] = m_timer_kind_ms[1] = m_timer_kind_ms[2] = 0.0;
+}
+
 void RenderContext::RunGarbageCollector() {
+	Common::WaitTrace::Scope gc_scope(Common::WaitTrace::Kind::GpuGarbage);
+	GpuTimerReport();
 	if (m_fault_process_pending) {
 		m_fault_process_pending = false;
 		m_buffer_cache.ProcessFaultBuffer();
@@ -173,11 +391,15 @@ void RenderContext::TriggerInterrupt(int event_id, uint32_t context_id) {
 		}
 	}
 
+	LOGF("\t EQEVENT: trigger id=%d context=%" PRIu32 " registrations=%zu\n", event_id, context_id,
+	     registrations.size());
 	for (const auto& registration: registrations) {
 		const auto result = LibKernel::EventQueue::KernelTriggerEvent(
 		    registration.eq, static_cast<uintptr_t>(registration.event_id),
 		    LibKernel::EventQueue::KERNEL_EVFILT_GRAPHICS,
 		    reinterpret_cast<void*>(static_cast<uintptr_t>(context_id)));
+		LOGF("\t EQEVENT:   delivered eq=0x%016" PRIx64 " id=%d result=%d\n",
+		     static_cast<uint64_t>(registration.eq), registration.event_id, result);
 		if (result == LibKernel::KERNEL_ERROR_EBADF || result == LibKernel::KERNEL_ERROR_ENOENT) {
 			DeleteInterruptEq(registration.eq, registration.event_id);
 			continue;

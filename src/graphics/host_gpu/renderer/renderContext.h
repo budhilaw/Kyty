@@ -15,6 +15,7 @@
 #include "graphics/host_gpu/renderer/pipeline/pipelineCache.h"
 #include "kernel/eventQueue.h"
 
+#include <unordered_map>
 #include <memory>
 #include <shared_mutex>
 #include <vector>
@@ -55,6 +56,13 @@ public:
 	void               UnmapMemory(uint64_t vaddr, uint64_t size);
 	void               PrepareBda();
 	void               RunGarbageCollector();
+	void               PrefetchReadbacks();
+
+	// KYTY_GPU_TIMING=1: a timestamp after every draw and dispatch, aggregated per shader and
+	// printed once a second, so GPU time can be attributed to passes.
+	void GpuTimerBegin(vk::CommandBuffer command);
+	void GpuTimerMark(vk::CommandBuffer command, uint64_t label, uint8_t kind);
+	void GpuTimerReport();
 
 	void AddInterruptEq(LibKernel::EventQueue::KernelEqueue eq, int event_id);
 	void DeleteInterruptEq(LibKernel::EventQueue::KernelEqueue eq, int event_id);
@@ -84,6 +92,35 @@ private:
 
 	Common::Mutex                        m_interrupt_mutex;
 	std::vector<InterruptEqRegistration> m_interrupt_eqs;
+
+	struct GpuTimerEntry {
+		uint32_t query = 0;
+		uint64_t label = 0;
+		uint8_t  kind  = 0;
+	};
+	struct GpuTimerBlock {
+		uint32_t                   first  = 0;
+		uint32_t                   used   = 0;
+		uint64_t                   tick   = 0;
+		bool                       active = false;
+		std::vector<GpuTimerEntry> entries;
+	};
+	struct GpuTimerStat {
+		double   ms    = 0.0;
+		uint64_t count = 0;
+		uint8_t  kind  = 0;
+	};
+	static constexpr uint32_t GpuTimerBlockQueries = 512;
+	static constexpr uint32_t GpuTimerBlockCount   = 64;
+	bool                      m_timer_enabled      = false;
+	bool                      m_timer_initialized  = false;
+	vk::QueryPool             m_timer_pool         = nullptr;
+	std::vector<GpuTimerBlock> m_timer_blocks;
+	int                        m_timer_current = -1;
+	std::unordered_map<uint64_t, GpuTimerStat> m_timer_stats;
+	double                                     m_timer_kind_ms[3] {};
+	uint64_t                                   m_timer_last_report = 0;
+	void                                       GpuTimerCollect(GpuTimerBlock& block);
 };
 
 } // namespace Libs::Graphics

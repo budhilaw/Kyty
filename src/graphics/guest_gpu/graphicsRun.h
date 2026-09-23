@@ -15,8 +15,19 @@
 #include <mutex>
 #include <span>
 #include <thread>
+#include <vector>
 
 namespace Libs::Graphics {
+
+// Records a GPU-side write to guest memory so a descheduled WAIT_REG_MEM can still observe a
+// value that was overwritten before its queue ran again.
+void NoteGuestGpuWrite(uint64_t address);
+
+// Records that a submitted command stream contains a packet writing this address.
+void NotePromisedFenceWrite(uint64_t address, const char* origin, const char* packet);
+
+// Logs when a GPU write covers the address in KYTY_WATCH_ADDR.
+void CheckGuestWatch(uint64_t address, uint64_t size, const char* who);
 
 class RenderContext;
 
@@ -31,12 +42,18 @@ public:
 	void               SendCommand(Common::UniqueFunction<void>&& command);
 	void               SendCommandSync(Common::UniqueFunction<void>&& command);
 
-	// Submitted command memory is borrowed and must remain valid until GPU execution completes.
+	// Submitted command memory is borrowed and must remain valid until GPU execution completes,
+	// unless the caller hands over owned storage that the spans point into.
 	void              Submit(std::span<const uint32_t> draw_commands,
-	                         std::span<const uint32_t> constant_commands);
-	void              SubmitCompute(uint32_t queue, std::span<const uint32_t> commands);
+	                         std::span<const uint32_t> constant_commands,
+	                         std::vector<uint32_t>     owned_commands = {},
+	                         const uint32_t*           guest_origin   = nullptr);
+	void              SubmitCompute(uint32_t queue, std::span<const uint32_t> commands,
+	                                std::vector<uint32_t> owned_commands = {},
+	                                const uint32_t*       guest_origin   = nullptr);
 	void              SubmitFlipPreparation(uint64_t request_id);
 	void              Done();
+	void              SuspendPoint();
 	[[nodiscard]] int GetFrameNum() const;
 
 	[[nodiscard]] static bool IsGpuThread() noexcept;
@@ -55,6 +72,8 @@ private:
 		uint32_t                  queue_id = 0;
 		std::span<const uint32_t> commands;
 		std::span<const uint32_t> constant_commands;
+		std::vector<uint32_t>     owned_commands;
+		const uint32_t*           guest_origin = nullptr;
 		Pm4Execution              command_execution;
 		Pm4Execution              constant_execution;
 		bool                      reset_processor   = false;
@@ -62,9 +81,14 @@ private:
 		bool                      command_complete  = false;
 		bool                      constant_complete = false;
 		bool                      blocked           = false;
+		// GPU write sequence when the wait last failed: any write after it can release the wait.
+		uint64_t                  blocked_seq       = 0;
+		// A hardware ring starts on submission, so a wait may observe any write made since then.
+		uint64_t                  submit_seq        = 0;
 		uint64_t                  flip_request_id   = 0;
 	};
 
+	static void       ReportQueueStall(GuestGpu& gpu);
 	void              Enqueue(Submission submission);
 	void              WaitForIdle();
 	void              ProcessCommands();

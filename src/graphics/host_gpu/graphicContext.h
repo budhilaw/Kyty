@@ -42,6 +42,10 @@ struct GraphicContext {
 	Common::Mutex                      queue_mutex;
 	uint32_t                           queue_family = static_cast<uint32_t>(-1);
 	vk::Queue                          queue        = nullptr;
+	// Second queue of the same family, used for readbacks whose producing work has retired.
+	vk::Queue                          readback_queue = nullptr;
+	// KYTY_PIPELINE_STATS=1: driver statistics (registers, spills) are printed per pipeline.
+	bool                               pipeline_stats_enabled = false;
 
 	[[nodiscard]] const vk::PhysicalDeviceProperties& GetPhysicalDeviceProperties() const {
 		return physical_device_properties;

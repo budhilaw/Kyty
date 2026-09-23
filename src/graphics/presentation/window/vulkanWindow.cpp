@@ -37,6 +37,7 @@
 #include "libs/controller.h"
 #include "loader/systemContent.h"
 
+#include <cstdlib>
 #include <algorithm>
 #include <cstdio>
 #include <cstring>
@@ -51,6 +52,8 @@
 #define KYTY_ENABLE_DEBUG_PRINTF
 
 namespace Libs::Graphics {
+
+static uint32_t g_created_queue_count = 1;
 
 struct VulkanExtensions {
 	bool enable_validation_layers = false;
@@ -505,11 +508,22 @@ static vk::Device VulkanCreateDevice(GraphicContext& graphics,
 	EXIT_IF(physical_device == nullptr);
 	EXIT_IF(queue_family == static_cast<uint32_t>(-1));
 
-	const float               queue_priority = 1.0f;
+	uint32_t family_queue_count = 1;
+	{
+		uint32_t count = 0;
+		physical_device.getQueueFamilyProperties(&count, nullptr);
+		std::vector<vk::QueueFamilyProperties> families(count);
+		physical_device.getQueueFamilyProperties(&count, families.data());
+		if (queue_family < count) {
+			family_queue_count = families[queue_family].queueCount;
+		}
+	}
+	g_created_queue_count = family_queue_count >= 2 ? 2u : 1u;
+	const float               queue_priorities[2] = {1.0f, 1.0f};
 	vk::DeviceQueueCreateInfo queue_create_info {};
 	queue_create_info.queueFamilyIndex = queue_family;
-	queue_create_info.queueCount       = 1;
-	queue_create_info.pQueuePriorities = &queue_priority;
+	queue_create_info.queueCount       = g_created_queue_count;
+	queue_create_info.pQueuePriorities = queue_priorities;
 
 	vk::PhysicalDeviceColorWriteEnableFeaturesEXT color_write_ext {};
 	color_write_ext.colorWriteEnable = VK_TRUE;
@@ -682,6 +696,12 @@ static vk::Device VulkanCreateDevice(GraphicContext& graphics,
 		provoking_vertex.pNext = const_cast<void*>(create_info.pNext);
 		provoking_vertex.transformFeedbackPreservesProvokingVertex = VK_FALSE;
 		create_info.pNext = &provoking_vertex;
+	}
+	vk::PhysicalDevicePipelineExecutablePropertiesFeaturesKHR executable_properties {};
+	if (graphics.pipeline_stats_enabled) {
+		executable_properties.pipelineExecutableInfo = VK_TRUE;
+		executable_properties.pNext = const_cast<void*>(create_info.pNext);
+		create_info.pNext           = &executable_properties;
 	}
 	create_info.pQueueCreateInfos       = &queue_create_info;
 	create_info.queueCreateInfoCount    = 1;
@@ -1070,6 +1090,12 @@ void WindowContext::CreateVulkan() {
 				device_extensions.push_back(extension);
 			}
 		}
+		if (std::getenv("KYTY_PIPELINE_STATS") != nullptr &&
+		    HasExtension(available_extensions,
+		                 VK_KHR_PIPELINE_EXECUTABLE_PROPERTIES_EXTENSION_NAME)) {
+			device_extensions.push_back(VK_KHR_PIPELINE_EXECUTABLE_PROPERTIES_EXTENSION_NAME);
+			graphic_ctx.pipeline_stats_enabled = true;
+		}
 		if (HasExtension(available_extensions, VK_EXT_ATTACHMENT_FEEDBACK_LOOP_LAYOUT_EXTENSION_NAME) &&
 		    HasExtension(available_extensions, VK_EXT_ATTACHMENT_FEEDBACK_LOOP_DYNAMIC_STATE_EXTENSION_NAME)) {
 			device_extensions.push_back(VK_EXT_ATTACHMENT_FEEDBACK_LOOP_LAYOUT_EXTENSION_NAME);
@@ -1084,6 +1110,10 @@ void WindowContext::CreateVulkan() {
 	VULKAN_HPP_DEFAULT_DISPATCHER.init(graphic_ctx.device);
 	graphic_ctx.device.getQueue(graphic_ctx.queue_family, 0, &graphic_ctx.queue);
 	EXIT_IF(graphic_ctx.queue == nullptr);
+	if (g_created_queue_count >= 2) {
+		graphic_ctx.device.getQueue(graphic_ctx.queue_family, 1, &graphic_ctx.readback_queue);
+	}
+	LOGF("\treadback queue: %s\n", graphic_ctx.readback_queue != nullptr ? "yes" : "no");
 
 	if (!graphic_ctx.CreateAllocator()) {
 		EXIT("Could not create Vulkan memory allocator");

@@ -113,6 +113,15 @@ public:
 	void EndRendering() const;
 
 	[[nodiscard]] vk::CommandBuffer Handle() const;
+
+	// Whether anything has been recorded into this buffer since it was begun. An end-of-pipe
+	// write records no commands, so submitting for one alone only costs a queue round trip.
+	[[nodiscard]] bool HasRecordedWork() const noexcept { return m_recorded; }
+
+	// A full memory barrier is requested before every end-of-pipe write, thousands of times per
+	// second. It only matters to whatever command comes next, so it is recorded lazily, right
+	// before that command, and costs nothing when nothing follows.
+	void RequestGlobalBarrier() const noexcept { m_pending_barrier = true; }
 	[[nodiscard]] GraphicContext&   GetGraphics() const noexcept { return m_graphics; }
 	[[nodiscard]] RenderContext&    GetContext() const noexcept { return m_context; }
 	[[nodiscard]] HW::Context&      GetRegisters() const noexcept { return *m_registers; }
@@ -142,6 +151,8 @@ private:
 	uint64_t            m_debug_arg4      = 0;
 	mutable RenderState m_render_state;
 	mutable bool        m_rendering   = false;
+	mutable bool        m_recorded    = false;
+	mutable bool        m_pending_barrier = false;
 	HW::Context*        m_registers   = nullptr;
 	HW::UserConfig*     m_user_config = nullptr;
 	HW::Shader*         m_shaders     = nullptr;
@@ -156,6 +167,8 @@ public:
 
 	void DispatchDirect(uint64_t submit_id, CommandBuffer& buffer, uint32_t thread_group_x,
 	                    uint32_t thread_group_y, uint32_t thread_group_z, uint32_t mode);
+	void DispatchIndirect(uint64_t submit_id, CommandBuffer& buffer, uint64_t args_vaddr,
+	                      uint32_t mode);
 
 	[[nodiscard]] PreparedBindings PrepareBindings(const ShaderStageRuntime& runtime);
 	void                           FindBuffers(PreparedBindings& bindings);
@@ -166,6 +179,9 @@ public:
 	                    std::span<PreparedBindings* const> bindings);
 
 private:
+	void Dispatch(uint64_t submit_id, CommandBuffer& buffer, uint32_t thread_group_x,
+	              uint32_t thread_group_y, uint32_t thread_group_z, uint32_t mode,
+	              uint64_t indirect_args_vaddr);
 	void DrawIndex(uint64_t submit_id, CommandBuffer& buffer, const DrawIndexArgs& args);
 	void DrawAuto(uint64_t submit_id, CommandBuffer& buffer, const DrawAutoArgs& args);
 

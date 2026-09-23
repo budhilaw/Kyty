@@ -6,6 +6,7 @@
 #include "common/file.h"
 #include "common/logging/log.h"
 #include "common/profiler.h"
+#include "common/timer.h"
 #include "common/stringUtils.h"
 #include "common/threads.h"
 #include "graphics/guest_gpu/gpu_defs.h"
@@ -31,6 +32,7 @@
 #include "kernel/pthread.h"
 #include "libs/errno.h"
 
+#include <cstdlib>
 #include <algorithm>
 #include <array>
 #include <atomic>
@@ -47,6 +49,18 @@
 #include <vector>
 
 namespace Libs::Graphics {
+
+struct DrawTimeLogger {
+	Common::Timer timer;
+	const char*   name;
+	explicit DrawTimeLogger(const char* draw_name): name(draw_name) { timer.Start(); }
+	~DrawTimeLogger() {
+		const auto ms = timer.GetTimeS() * 1000.0;
+		if (ms > 2.0) {
+			LOGF("\t DRAWTIME: %s ms=%.1f\n", name, ms);
+		}
+	}
+};
 
 std::pair<int32_t, uint32_t> ResolveDrawOffsets(uint32_t index_offset,
 	                                           const ShaderVertexInputInfo& vs_input_info) {
@@ -736,6 +750,27 @@ static PreparedVertexBuffers AcquireVertexBuffers(CommandBuffer&               b
 	auto& cache = buffer.GetContext().GetBufferCache();
 	for (uint32_t i = 0; i < merged_count; i++) {
 		auto& range = merged_ranges[i];
+		{
+			uint32_t probe = 0;
+			if (!Libs::LibKernel::Memory::TryReadBacking(range.base_address, &probe, sizeof(probe))) {
+				LOGF("\t VBRANGE: invalid vertex range base=0x%016" PRIx64 " size=0x%016" PRIx64
+				     " fetch_buffer_reg=%d fetch_attrib_reg=%d buffers=%d\n",
+				     range.base_address, range.RequestedSize(), vs_input_info.fetch_buffer_reg,
+				     vs_input_info.fetch_attrib_reg, vs_input_info.buffers_num);
+				for (int b = 0; b < vs_input_info.buffers_num; b++) {
+					const auto& vb = vs_input_info.buffers[b];
+					LOGF("\t VBRANGE:   buffer[%d] addr=0x%016" PRIx64 " stride=%u records=%u\n", b,
+					     vb.addr, static_cast<uint32_t>(vb.stride),
+					     static_cast<uint32_t>(vb.num_records));
+				}
+				for (int r = 0; r < vs_input_info.resources_num; r++) {
+					const auto& res = vs_input_info.resources[r];
+					LOGF("\t VBRANGE:   resource[%d] raw= %08" PRIx32 " %08" PRIx32 " %08" PRIx32
+					     " %08" PRIx32 "\n",
+					     r, res.fields[0], res.fields[1], res.fields[2], res.fields[3]);
+				}
+			}
+		}
 		// PPSA20298
 		const auto size =
 		    Libs::LibKernel::Memory::ClampRangeSize(range.base_address, range.RequestedSize());
@@ -909,7 +944,13 @@ bool RenderExecutor::PrepareDrawRenderState(CommandBuffer& buffer, const DrawCal
                                             uint32_t            render_target_slice_offset,
 	                                        DrawRenderState& state) {
 	state.ps_active = DrawHasActivePixelShader(buffer);
-	RefreshShaders(buffer, draw, state);
+	Common::Timer prepare_timer;
+	prepare_timer.Start();
+	{
+		Common::WaitTrace::Scope scope(Common::WaitTrace::Kind::GpuPipeline);
+		RefreshShaders(buffer, draw, state);
+	}
+	const auto shaders_ms = prepare_timer.GetTimeS() * 1000.0;
 	uint32_t mrt_mask = 0;
 	if (state.ps_active) {
 		for (const auto& output: state.ps_input_info.stage.program->info.outputs) {
@@ -933,7 +974,13 @@ bool RenderExecutor::PrepareDrawRenderState(CommandBuffer& buffer, const DrawCal
 	if (draw.IsIndexed()) {
 		LogDrawPhase(draw.Name(), "ResolveRenderDepthTarget");
 	}
+	const auto color_ms = prepare_timer.GetTimeS() * 1000.0;
 	ResolveRenderDepthTarget(buffer, state.depth_info);
+	const auto depth_ms = prepare_timer.GetTimeS() * 1000.0;
+	if (depth_ms > 2.0) {
+		LOGF("\t PREPPHASE: shaders=%.1f color=%.1f depth=%.1f colors=%u\n", shaders_ms,
+		     color_ms - shaders_ms, depth_ms - color_ms, state.color_count);
+	}
 
 	if (state.color_count == 0 && !state.depth_info.image_id && !state.ps_active) {
 		LogFramebufferSkip(draw.Name(), state.color_info[0], state.depth_info, buffer,
@@ -1053,6 +1100,7 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 	const auto vertex_stages =
 	    std::span {state.vertex_info.data(), state.programs.VertexStageCount()};
 	const bool mesh_active = state.vertex_info[0].stage.program->stage == ShaderType::Mesh;
+	m_context.GetCommandScheduler().NoteWork();
 	uint32_t   mesh_groups = 0;
 	if (mesh_active) {
 		const auto& mesh = state.vertex_info[0].mesh;
@@ -1089,6 +1137,7 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 		                              index_source.guest_element_size);
 	}
 	LogDrawPhase(draw.Name(), "PrepareBindings");
+	auto bind_scope = std::make_unique<Common::WaitTrace::Scope>(Common::WaitTrace::Kind::GpuBindings);
 	GraphicsBindings                 bindings;
 	std::array<PreparedBindings*, 4> descriptor_stages {};
 	uint32_t                         stage_count = 0;
@@ -1116,10 +1165,14 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 	if (draw.IsIndexed()) {
 		LogDrawPhase(draw.Name(), "CreatePipeline");
 	}
-	auto& pipeline = m_context.GetPipelineCache().GetGraphicsPipeline(
-	    std::span {state.color_info, state.color_count}, state.depth_info, vertex_stages, buffer,
-	    state.ps_active ? &state.ps_input_info : nullptr, topology, primitive_restart_enable,
-	    state.programs);
+	bind_scope.reset();
+	auto& pipeline = [&]() -> decltype(auto) {
+		Common::WaitTrace::Scope scope(Common::WaitTrace::Kind::GpuPipeline);
+		return m_context.GetPipelineCache().GetGraphicsPipeline(
+		    std::span {state.color_info, state.color_count}, state.depth_info, vertex_stages,
+		    buffer, state.ps_active ? &state.ps_input_info : nullptr, topology,
+		    primitive_restart_enable, state.programs);
+	}();
 
 	// Resource preparation above may synchronously finish and restart the scheduler. From this
 	// point onward, every operation targets the current command buffer and cannot touch guest
@@ -1132,7 +1185,10 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 	if (bindings.pixel && !draw.IsIndexed()) {
 		SetDrawDebugPhase(buffer, submit_id, draw, 0x300u);
 	}
-	CommitBindings(buffer, vk::PipelineBindPoint::eGraphics, pipeline, stages);
+	{
+		Common::WaitTrace::Scope scope(Common::WaitTrace::Kind::GpuCommit);
+		CommitBindings(buffer, vk::PipelineBindPoint::eGraphics, pipeline, stages);
+	}
 	if (mesh_active) {
 		const uint32_t draw_data[] {
 		    draw.index_count,
@@ -1162,8 +1218,11 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 	if (!draw.IsIndexed()) {
 		SetDrawDebugPhase(buffer, submit_id, draw, 0x400u);
 	}
-	m_context.GetCommandScheduler().BeginRendering(rendering);
-	vk_buffer.bindPipeline(vk::PipelineBindPoint::eGraphics, pipeline.pipeline);
+	{
+		Common::WaitTrace::Scope scope(Common::WaitTrace::Kind::GpuRenderBegin);
+		m_context.GetCommandScheduler().BeginRendering(rendering);
+		vk_buffer.bindPipeline(vk::PipelineBindPoint::eGraphics, pipeline.pipeline);
+	}
 	if (!draw.IsIndexed()) {
 		SetDrawDebugPhase(buffer, submit_id, draw, 0x500u);
 	}
@@ -1185,9 +1244,15 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 	if (state.ps_active && HasShaderBufferWrites(state.ps_input_info.stage)) {
 		shader_write_stages |= vk::PipelineStageFlagBits::eFragmentShader;
 	}
-	if (shader_write_stages) {
+	static const bool light_barriers = std::getenv("KYTY_LIGHT_BARRIERS") != nullptr;
+	if (shader_write_stages && !light_barriers) {
 		m_context.GetCommandScheduler().EndRendering();
 		ShaderWriteBarrier(vk_buffer, shader_write_stages);
+	}
+	{
+		const auto* program = state.ps_active ? state.ps_input_info.stage.program
+		                                      : state.vertex_info[0].stage.program;
+		m_context.GpuTimerMark(vk_buffer, program != nullptr ? program->shader_hash : 0, 2);
 	}
 	LogDrawPhase(draw.Name(), "DrawComplete");
 	if (!draw.IsIndexed()) {
@@ -1198,6 +1263,8 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 void RenderExecutor::DrawIndex(uint64_t submit_id, CommandBuffer& buffer,
                                const DrawIndexArgs& args) {
 	KYTY_PROFILER_FUNCTION();
+	Common::WaitTrace::Scope draw_scope(Common::WaitTrace::Kind::GpuDraw);
+	DrawTimeLogger draw_time("DrawIndex");
 
 	EXIT_IF(buffer.IsInvalid());
 	EXIT_IF(args.offset_source == DrawOffsetSource::DrawState && args.first_instance != 0);
@@ -1310,10 +1377,15 @@ void RenderExecutor::DrawIndex(uint64_t submit_id, CommandBuffer& buffer,
 // NOLINTNEXTLINE(readability-function-cognitive-complexity)
 void RenderExecutor::DrawAuto(uint64_t submit_id, CommandBuffer& buffer, const DrawAutoArgs& args) {
 	KYTY_PROFILER_FUNCTION();
+	Common::WaitTrace::Scope draw_scope(Common::WaitTrace::Kind::GpuDraw);
+	DrawTimeLogger draw_time("DrawAuto");
 
 	EXIT_IF(buffer.IsInvalid());
 	EXIT_IF(args.offset_source == DrawOffsetSource::DrawState && args.first_instance != 0);
+	Common::Timer phase_timer;
+	phase_timer.Start();
 	m_context.GetCommandScheduler().PopPendingOperations();
+	const auto pop_ms = phase_timer.GetTimeS() * 1000.0;
 	auto& ucfg   = buffer.GetUserConfig();
 	auto& sh_ctx = buffer.GetShaders();
 
@@ -1322,6 +1394,7 @@ void RenderExecutor::DrawAuto(uint64_t submit_id, CommandBuffer& buffer, const D
 	                    args.first_instance);
 
 	Common::LockGuard lock(m_context.GetMutex());
+	const auto lock_ms = phase_timer.GetTimeS() * 1000.0;
 	if (args.vertex_count == 0 || args.instance_count == 0) {
 		return;
 	}
@@ -1329,6 +1402,11 @@ void RenderExecutor::DrawAuto(uint64_t submit_id, CommandBuffer& buffer, const D
 	if (ConsumeMetadataColorOperation(buffer) || DepthStencilCopy(buffer) ||
 	    DepthToColorCopy(buffer, args.render_target_slice_offset) ||
 	    ResolveColorTargets(buffer, args.render_target_slice_offset)) {
+		const auto special_ms = phase_timer.GetTimeS() * 1000.0;
+		if (special_ms > 2.0) {
+			LOGF("\t DRAWPHASE: special-op draw pop=%.1f lock=%.1f total=%.1f\n", pop_ms, lock_ms,
+			     special_ms);
+		}
 		ResetBindings();
 		return;
 	}
@@ -1363,9 +1441,15 @@ void RenderExecutor::DrawAuto(uint64_t submit_id, CommandBuffer& buffer, const D
 		return;
 	}
 	DrawRenderState state {};
+	const auto      prepare_start_ms = phase_timer.GetTimeS() * 1000.0;
 	if (!PrepareDrawRenderState(buffer, draw, args.render_target_slice_offset, state)) {
 		ResetBindings();
 		return;
+	}
+	const auto prepare_ms = phase_timer.GetTimeS() * 1000.0;
+	if (prepare_ms > 2.0) {
+		LOGF("\t DRAWPHASE: pop=%.1f lock=%.1f checks=%.1f prepare=%.1f\n", pop_ms, lock_ms,
+		     prepare_start_ms - lock_ms, prepare_ms - prepare_start_ms);
 	}
 
 	const bool rect_list = Prospero::IsRectList(ucfg.GetPrimType());
