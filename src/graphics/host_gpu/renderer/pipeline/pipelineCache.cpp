@@ -396,6 +396,39 @@ struct PipelineCache::ProgramCache {
 			    entry->second.resource_plan, runtime, entry->second.resources,
 			    entry->second.specialization));
 		}
+		if (!entry->second.permutations.empty()) {
+			// Diagnostic: which specialization field forced another variant of this shader.
+			const auto& previous = entry->second.permutations.back().specialization;
+			const auto& current  = entry->second.specialization;
+			std::string diff;
+			for (size_t i = 0; i < std::min(previous.buffers.size(), current.buffers.size()); i++) {
+				const auto& a = previous.buffers[i];
+				const auto& b = current.buffers[i];
+				if (!(a == b)) {
+					diff += fmt::format(" buf{}: stride {:x}->{:x} fmt {}->{} swz {:x}->{:x};", i,
+					                    a.packed_stride, b.packed_stride, static_cast<uint32_t>(a.descriptor_format),
+					                    static_cast<uint32_t>(b.descriptor_format), a.descriptor_swizzle,
+					                    b.descriptor_swizzle);
+				}
+			}
+			for (size_t i = 0; i < std::min(previous.images.size(), current.images.size()); i++) {
+				const auto& a = previous.images[i];
+				const auto& b = current.images[i];
+				if (!(a == b)) {
+					diff += fmt::format(" img{}: class {}->{} dim {}->{} mips {}->{} conv {}->{} swz {:x}->{:x} "
+					                    "root {}->{} map {}->{} iter {}->{} cube {}->{};",
+					                    i, static_cast<uint32_t>(a.numeric_class), static_cast<uint32_t>(b.numeric_class),
+					                    static_cast<uint32_t>(a.dimension), static_cast<uint32_t>(b.dimension),
+					                    a.mip_count, b.mip_count, static_cast<uint32_t>(a.conversion_format),
+					                    static_cast<uint32_t>(b.conversion_format), a.shader_swizzle, b.shader_swizzle,
+					                    a.indirect_root, b.indirect_root, a.indirect_mapping_offset,
+					                    b.indirect_mapping_offset, a.indirect_search_iterations,
+					                    b.indirect_search_iterations, a.cube, b.cube);
+				}
+			}
+			LOGF("PERMUTATION hash=0x%016" PRIx64 " count=%zu:%s\n", params.hash,
+			     entry->second.permutations.size() + 1u, diff.c_str());
+		}
 		entry->second.permutations.push_back(CompilePermutation(
 		    params, options, std::move(translated), entry->second.specialization, push_data_cursor));
 		const auto& permutation = entry->second.permutations.back();

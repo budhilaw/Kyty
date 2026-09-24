@@ -100,6 +100,20 @@ void EmitReturn(ValueEmitContext& ctx) {
 
 // Experimental runaway-loop cap for compute shaders; off unless KYTY_LOOP_CAP=1. It can cut
 // legitimate long loops short, which corrupts game data.
+// Iterations a capped loop may run. The built-in cap targets a shadow filter whose tap count
+// arrives corrupted: its real loops take at most a few dozen taps, while 16384 iterations over
+// 3.7 million threads kept the GPU busy for seconds and made Windows reset the device.
+static uint32_t LoopCapLimit() {
+	static const uint32_t limit = [] {
+		const char* text = std::getenv("KYTY_LOOP_CAP_LIMIT");
+		if (text != nullptr) {
+			return static_cast<uint32_t>(std::strtoul(text, nullptr, 0));
+		}
+		return std::getenv("KYTY_LOOP_CAP") == nullptr ? 64u : (1u << 14u);
+	}();
+	return limit;
+}
+
 // KYTY_LOOP_CAP=1 caps loops in every shader; a list of hex hashes caps only those.
 static bool LoopCapEnabled(const EmitterState& state) {
 	static const std::string setting = [] {
@@ -200,7 +214,7 @@ void EmitStructuredTerminator(ValueEmitContext& ctx, const IR::Block* block,
 				state.builder.AddFunction(spv::OpStore, counter, next);
 				const auto exceeded = state.builder.AllocateId();
 				state.builder.AddFunction(spv::OpUGreaterThan, TypeBool(state), exceeded, next,
-				                          ConstantU32(state, 1u << 14u));
+				                          ConstantU32(state, LoopCapLimit()));
 				const auto capped = state.builder.AllocateId();
 				if (true_exits) {
 					state.builder.AddFunction(spv::OpLogicalOr, TypeBool(state), capped, condition,
