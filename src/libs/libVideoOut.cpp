@@ -52,7 +52,9 @@ namespace LibGen5::VrrStatus {
 LIB_VERSION("VideoOutVrrStatus", 1, "VideoOut", 1, 1);
 
 LIB_DEFINE(InitVideoOutVrrStatus_1) {
-	LIB_FUNC("kP2L8t3j-aM", VideoOut::VideoOutGetVrrStatus);
+	// PPSA05684 names this NID sceVideoOutAddVrrStatusFlagsPrivilege in its own assertion and
+	// passes flags, not a status pointer; VRR is never active, so accepting the flags is enough.
+	LIB_FUNC("kP2L8t3j-aM", VideoOut::VideoOutAddVrrStatusFlagsPrivilege);
 }
 
 } // namespace LibGen5::VrrStatus

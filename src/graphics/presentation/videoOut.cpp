@@ -1691,16 +1691,20 @@ KYTY_SYSV_ABI int VideoOutGetOutputStatus(int handle, VideoOutOutputStatus* stat
 	return OK;
 }
 
+KYTY_SYSV_ABI int VideoOutAddVrrStatusFlagsPrivilege(int handle, uint64_t flags) {
+	PRINT_NAME();
+	LOGF("\t handle = %d flags = 0x%016" PRIx64 "\n", handle, flags);
+	return OK;
+}
+
 KYTY_SYSV_ABI int VideoOutGetVrrStatus(int handle, int32_t* status) {
 	PRINT_NAME();
 
 	if (status == nullptr) {
 		return VIDEO_OUT_ERROR_INVALID_ADDRESS;
 	}
-	if (DriverState().Get(handle) == nullptr) {
-		return VIDEO_OUT_ERROR_INVALID_HANDLE;
-	}
-
+	// PPSA05684 queries VRR with a handle Kyty does not track and asserts on any error; VRR is
+	// never active here, so every handle reports it off.
 	// Kyty currently presents at a fixed refresh rate and does not negotiate VRR.
 	*status = 0;
 	return OK;

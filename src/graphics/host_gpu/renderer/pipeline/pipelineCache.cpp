@@ -129,9 +129,9 @@ void PipelineCacheLog(fmt::format_string<Args...> format, Args&&... args) {
 	Log::WriteToConsoleAndLog(message);
 }
 
-bool ReadShaderGuestMemory(void*, uint64_t address, std::span<uint32_t> values) {
-	return !values.empty() &&
-	       Libs::LibKernel::Memory::TryReadGpuCleanBacking(address, values.data(), values.size_bytes());
+bool ReadShaderGuestMemory(void*, uint64_t address, uint32_t* value) {
+	return value != nullptr &&
+	       Libs::LibKernel::Memory::ReadGpuBackingOrDownload(address, value, sizeof(*value));
 }
 
 void DumpShaderSpirv(const char* stage_name, uint64_t shader_hash,

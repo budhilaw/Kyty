@@ -1383,7 +1383,9 @@ void RuntimeLinker::RelocateProgram(Program* program) {
 	EXIT_IF(program == nullptr);
 	EXIT_IF(std::find(m_programs.begin(), m_programs.end(), program) == m_programs.end());
 
-	RelocateAll();
+	// Upstream re-links every module here (#511); for PPSA05684 that rebinds a VideoOut VRR
+	// import to a failing path, so only the new program is relocated.
+	Relocate(program);
 	if (!GamePatch::ApplyPending(program)) {
 		EXIT("Failed to apply pending game cheat\n");
 	}
