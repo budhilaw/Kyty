@@ -9,6 +9,7 @@
 #include "graphics/guest_gpu/gpu_defs.h"
 #include "graphics/guest_gpu/graphicsRun.h"
 #include "graphics/guest_gpu/hardwareContext.h"
+#include "graphics/guest_gpu/pm4.h"
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/renderer/image/imageInfo.h"
 #include "graphics/host_gpu/renderer/pipeline/descriptors.h"
@@ -55,7 +56,7 @@ static bool FillSourcesDisjoint(std::span<const ShaderRecompiler::IR::Descriptor
 bool RenderExecutor::TryConsumeComputeMetaClear(const ShaderComputeInputInfo& input,
                                                 const CommandBuffer&          buffer) {
 	const auto& program   = *input.stage.program;
-	const auto& resources = input.stage.resources;
+	const auto& resources = *input.stage.resources;
 	if (resources.buffers.size() != program.info.buffers.size()) {
 		EXIT("compute runtime buffer count does not match shader metadata\n");
 	}
@@ -89,7 +90,7 @@ bool ResolveComputeBufferFill(const ShaderComputeInputInfo& input, uint32_t grou
                               uint32_t group_y, uint32_t group_z, uint32_t mode,
                               ShaderBufferResource& resolved_descriptor, uint32_t& resolved_clear,
                               uint64_t& resolved_size) {
-	const auto& resources = input.stage.resources;
+	const auto& resources = *input.stage.resources;
 	const auto& fill      = resources.uniform_fill;
 	if (fill.kind != ShaderRecompiler::IR::UniformFillKind::Buffer) {
 		return false;
@@ -132,7 +133,7 @@ bool RenderExecutor::TryConsumeComputeImageClear(const ShaderComputeInputInfo& i
                                                 CommandBuffer& command, uint32_t group_x,
                                                 uint32_t group_y, uint32_t group_z, uint32_t mode) {
 	const auto& program   = *input.stage.program;
-	const auto& resources = input.stage.resources;
+	const auto& resources = *input.stage.resources;
 	const auto& fill      = resources.uniform_fill;
 	auto&       cache     = command.GetContext().GetTextureCache();
 	if (fill.kind == ShaderRecompiler::IR::UniformFillKind::Image) {
@@ -202,12 +203,6 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
                                     uint32_t thread_group_x, uint32_t thread_group_y,
                                     uint32_t thread_group_z, uint32_t mode) {
 	Dispatch(submit_id, buffer, thread_group_x, thread_group_y, thread_group_z, mode, 0);
-}
-
-void RenderExecutor::DispatchIndirect(uint64_t submit_id, CommandBuffer& buffer,
-                                      uint64_t args_vaddr, uint32_t mode) {
-	EXIT_IF(args_vaddr == 0);
-	Dispatch(submit_id, buffer, 1, 1, 1, mode, args_vaddr);
 }
 
 void RenderExecutor::Dispatch(uint64_t submit_id, CommandBuffer& buffer, uint32_t thread_group_x,
@@ -303,7 +298,7 @@ void RenderExecutor::Dispatch(uint64_t submit_id, CommandBuffer& buffer, uint32_
 	}
 
 	const auto& program   = *input_info.stage.program;
-	const auto& resources = input_info.stage.resources;
+	const auto& resources = *input_info.stage.resources;
 	if (!indirect && TryConsumeComputeMetaClear(input_info, buffer)) {
 		ResetBindings();
 		return;
@@ -408,7 +403,8 @@ void RenderExecutor::Dispatch(uint64_t submit_id, CommandBuffer& buffer, uint32_
 		return m_context.GetPipelineCache().GetComputePipeline(input_info, compute_program);
 	}();
 	auto bind_scope = std::make_unique<Common::WaitTrace::Scope>(Common::WaitTrace::Kind::GpuBindings);
-	auto bindings = PrepareBindings(input_info.stage);
+	auto& bindings = m_compute_bindings;
+	PrepareBindings(input_info.stage, bindings);
 	FindBuffers(bindings);
 	if (program.info.uses_dma) {
 		MapUserDataPointers(bindings);
@@ -505,6 +501,63 @@ void RenderExecutor::Dispatch(uint64_t submit_id, CommandBuffer& buffer, uint32_
 	                           ((uint64_t {thread_group_y} & 0xfffffu) << 20u) |
 	                           ((uint64_t {thread_group_z} & 0xfffffu) << 40u) |
 	                           (indirect ? (uint64_t {1} << 63u) : 0));
+	ResetBindings();
+}
+
+void RenderExecutor::DispatchIndirect(uint64_t submit_id, CommandBuffer& buffer,
+                                      uint64_t args_addr, uint32_t mode) {
+	EXIT_IF(buffer.IsInvalid() || args_addr == 0 || (args_addr & 3u) != 0 ||
+	        (mode & Pm4::COMPUTE_DISPATCH_INITIATOR_USE_THREAD_DIMENSIONS) != 0);
+	m_context.GetCommandScheduler().PopPendingOperations();
+	buffer.SetDebugInfo(static_cast<uint32_t>(CommandBufferDebugOp::DispatchIndirect), submit_id,
+	                    static_cast<uint32_t>(args_addr), static_cast<uint32_t>(args_addr >> 32u),
+	                    0, mode, buffer.GetShaders().GetCs().cs_regs.data_addr);
+	Common::LockGuard lock(m_context.GetMutex());
+	const auto& cs_regs = buffer.GetShaders().GetCs();
+	if (cs_regs.cs_regs.data_addr == 0) {
+		return;
+	}
+	ShaderComputeInputInfo input_info {};
+	const auto compute_program = m_context.GetPipelineCache().GetComputeProgram(
+	    cs_regs, buffer.GetRegisters().GetShaderRegisters(), input_info);
+	buffer.EndRendering();
+	auto& pipeline = m_context.GetPipelineCache().GetComputePipeline(input_info, compute_program);
+	auto& bindings = m_compute_bindings;
+	PrepareBindings(input_info.stage, bindings);
+	FindBuffers(bindings);
+	const auto& program = *input_info.stage.program;
+	if (program.info.uses_dma) {
+		m_context.PrepareBda();
+	}
+	RebindImages(bindings);
+	// Acquiring arguments can merge cache buffers; finalize shader bindings afterward.
+	const auto [args_buffer, args_offset] = m_context.GetBufferCache().ObtainBuffer(
+	    args_addr, sizeof(vk::DispatchIndirectCommand), false);
+	EXIT_IF(args_buffer == nullptr || (args_offset & 3u) != 0);
+	RebindBuffers(bindings);
+	PreparedBindings* descriptor_stage = &bindings;
+	CommitBindings(buffer, vk::PipelineBindPoint::eCompute, pipeline,
+	               std::span {&descriptor_stage, 1u});
+	const auto vk_buffer = buffer.Handle();
+	const bool has_storage_writes = HasShaderBufferWrites(input_info.stage) ||
+	    std::any_of(program.info.images.begin(), program.info.images.end(), [](const auto& image) {
+		    return image.written && image.resource_class ==
+		                                ShaderRecompiler::IR::ImageResourceClass::Storage;
+	    });
+	if (has_storage_writes) {
+		ShaderWriteHazardBarrier(vk_buffer, vk::PipelineStageFlagBits::eComputeShader);
+	}
+	vk::MemoryBarrier barrier {};
+	barrier.srcAccessMask = vk::AccessFlagBits::eShaderWrite | vk::AccessFlagBits::eTransferWrite;
+	barrier.dstAccessMask = vk::AccessFlagBits::eIndirectCommandRead;
+	vk_buffer.pipelineBarrier(vk::PipelineStageFlagBits::eAllGraphics |
+	                              vk::PipelineStageFlagBits::eComputeShader |
+	                              vk::PipelineStageFlagBits::eTransfer,
+	                          vk::PipelineStageFlagBits::eDrawIndirect, {},
+	                          1, &barrier, 0, nullptr, 0, nullptr);
+	vk_buffer.bindPipeline(vk::PipelineBindPoint::eCompute, pipeline.pipeline);
+	vk_buffer.dispatchIndirect(args_buffer->Handle(), args_offset);
+	ShaderAccessBarrier(vk_buffer, vk::PipelineStageFlagBits::eComputeShader);
 	ResetBindings();
 }
 

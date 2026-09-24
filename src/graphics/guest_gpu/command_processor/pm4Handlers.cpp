@@ -1377,26 +1377,13 @@ KYTY_CP_OP_PARSER(CpOpDispatchIndirect) {
 	EXIT_NOT_IMPLEMENTED(cmd_id != 0xc0011600 && cmd_id != 0xc0021600);
 
 	if (cmd_id == 0xc0021600) {
-		struct DispatchIndirectArgs {
-			uint32_t thread_group_x;
-			uint32_t thread_group_y;
-			uint32_t thread_group_z;
-		};
-
-		const auto args_addr = buffer[0] | (static_cast<uint64_t>(buffer[1]) << 32u);
-		uint32_t   mode      = buffer[2];
-
-		EXIT_NOT_IMPLEMENTED(args_addr == 0);
-		// The GPU may still be writing the counts; read them on the GPU like the offset form.
-		cp.DispatchIndirectAt(args_addr, mode);
-
+		cp.DispatchIndirect(buffer[0] | (static_cast<uint64_t>(buffer[1]) << 32u), buffer[2]);
 		return 3;
 	}
 
-	uint32_t data_offset = buffer[0];
-	uint32_t mode        = buffer[1];
-
-	cp.DispatchIndirect(data_offset, mode);
+	const auto base_addr = cp.GetDispatchIndirectArgsBaseAddress();
+	EXIT_NOT_IMPLEMENTED(base_addr == 0);
+	cp.DispatchIndirect(base_addr + buffer[0], buffer[1]);
 
 	return 2;
 }

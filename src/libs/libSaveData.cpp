@@ -27,6 +27,7 @@ namespace SaveData {
 
 // TODO(): specify dir at launcher
 static constexpr char     SAVE_DATA_DIR[]      = "_SaveData";
+static constexpr uint64_t SAVE_DATA_BLOCKS_MIN = 48;
 static constexpr uint64_t SAVE_DATA_BLOCKS_MAX = 16384;
 
 struct SceSaveDataDirName {
@@ -120,6 +121,20 @@ struct SaveDataParam {
 	int64_t  mtime;
 	uint8_t  reserved[32];
 };
+
+struct SaveParamTextField {
+	char*  data;
+	size_t size;
+};
+
+static SaveParamTextField param_text_field(SaveDataParam& param, uint32_t type) {
+	switch (type) {
+		case 1: return {param.title, sizeof(param.title)};
+		case 2: return {param.sub_title, sizeof(param.sub_title)};
+		case 3: return {param.detail, sizeof(param.detail)};
+		default: return {nullptr, 0};
+	}
+}
 
 struct SaveDataMountInfo {
 	uint64_t blocks;
@@ -305,9 +320,9 @@ static bool valid_memory_range(const SaveDataMemoryData& data, size_t size) {
 	       data.buf_size <= size - static_cast<size_t>(data.offset);
 }
 
-// Keep memory.dat as raw guest bytes. Replacing a flushed temporary file protects the
+// Replacing a flushed temporary file protects the
 // previous save if writing fails or the emulator exits partway through an update.
-static int write_memory_file(const std::filesystem::path& path, const void* data, uint32_t size) {
+static int write_save_file(const std::filesystem::path& path, const void* data, uint32_t size) {
 	const auto   temporary = std::filesystem::path(path.string() + ".tmp");
 	Common::File file;
 	if (!file.Create(temporary)) {
@@ -329,6 +344,77 @@ static int write_memory_file(const std::filesystem::path& path, const void* data
 	return SAVE_DATA_ERROR_INTERNAL;
 }
 
+static int read_save_blocks(const std::filesystem::path& directory, uint64_t* blocks) {
+	Common::File file(directory / "sce_sys" / "blocks.bin", Common::File::Mode::Read);
+	if (file.IsInvalid() || file.Size() != sizeof(*blocks)) {
+		return SAVE_DATA_ERROR_BROKEN;
+	}
+	uint64_t value = 0;
+	uint32_t read = 0;
+	file.Read(&value, sizeof(value), &read);
+	if (read != sizeof(value) || value < SAVE_DATA_BLOCKS_MIN || value > SAVE_DATA_BLOCKS_MAX) {
+		return SAVE_DATA_ERROR_BROKEN;
+	}
+	*blocks = value;
+	return OK;
+}
+
+static int read_save_param(const std::filesystem::path& path, SaveDataParam* param) {
+	std::error_code error;
+	const bool exists = std::filesystem::exists(path, error);
+	if (error) {
+		return SAVE_DATA_ERROR_INTERNAL;
+	}
+	if (!exists) {
+		return SAVE_DATA_ERROR_NOT_FOUND;
+	}
+	Common::File file(path, Common::File::Mode::Read);
+	if (file.IsInvalid()) {
+		return SAVE_DATA_ERROR_INTERNAL;
+	}
+	if (file.Size() != sizeof(*param)) {
+		return SAVE_DATA_ERROR_BROKEN;
+	}
+	uint32_t read = 0;
+	file.Read(param, sizeof(*param), &read);
+	return read == sizeof(*param) ? OK : SAVE_DATA_ERROR_BROKEN;
+}
+
+static std::filesystem::path save_param_path(const std::filesystem::path& directory) {
+	return directory / "sce_sys" / "param.bin";
+}
+
+static int64_t newest_save_time(const std::filesystem::path& directory) {
+	int64_t mtime = 0;
+	std::error_code error;
+	for (std::filesystem::recursive_directory_iterator it(
+	         directory, std::filesystem::directory_options::skip_permission_denied, error),
+	     end;
+	     it != end; it.increment(error)) {
+		if (error) {
+			error.clear();
+			continue;
+		}
+		if (it->is_regular_file(error) && !error) {
+			const auto time = Common::File::GetLastWriteTimeUTC(it->path());
+			if (!time.IsInvalid()) {
+				mtime = std::max(mtime, static_cast<int64_t>(time.ToUnix()));
+			}
+		}
+		error.clear();
+	}
+	return mtime;
+}
+
+static int load_save_param(const std::filesystem::path& directory, SaveDataParam* param) {
+	*param = {};
+	const int status = read_save_param(save_param_path(directory), param);
+	if (status == OK) {
+		param->mtime = newest_save_time(directory);
+	}
+	return status;
+}
+
 static int save_memory(const std::filesystem::path& directory, const SaveDataMemory& memory) {
 	std::error_code error;
 	std::filesystem::create_directories(directory, error);
@@ -336,10 +422,10 @@ static int save_memory(const std::filesystem::path& directory, const SaveDataMem
 		return SAVE_DATA_ERROR_INTERNAL;
 	}
 	// Display metadata is a separate host sidecar, leaving memory.dat as raw guest bytes.
-	int result = write_memory_file(directory / "param.bin", &memory.param, sizeof(memory.param));
+	int result = write_save_file(directory / "param.bin", &memory.param, sizeof(memory.param));
 	if (result == OK) {
 		result =
-		    write_memory_file(directory / "memory.dat", memory.data.data(), memory.data.size());
+		    write_save_file(directory / "memory.dat", memory.data.data(), memory.data.size());
 	}
 	return result;
 }
@@ -369,23 +455,7 @@ static int load_memory(const std::filesystem::path& directory, SaveDataMemory* m
 		return SAVE_DATA_ERROR_BROKEN;
 	}
 	file.Close();
-	const bool has_param = std::filesystem::exists(directory / "param.bin", error);
-	if (error) {
-		return SAVE_DATA_ERROR_INTERNAL;
-	}
-	if (has_param) {
-		if (!file.Open(directory / "param.bin", Common::File::Mode::Read)) {
-			return SAVE_DATA_ERROR_INTERNAL;
-		}
-		if (file.Size() != sizeof(memory->param)) {
-			return SAVE_DATA_ERROR_BROKEN;
-		}
-		file.Read(&memory->param, sizeof(memory->param), &read);
-		if (read != sizeof(memory->param)) {
-			return SAVE_DATA_ERROR_BROKEN;
-		}
-	}
-	return OK;
+	return read_save_param(directory / "param.bin", &memory->param);
 }
 
 static void queue_save_data_event(uint32_t type, int32_t user_id,
@@ -435,11 +505,11 @@ static bool dir_name_match(const char* str, const char* pattern) {
 	return *str == '\0' && *pattern == '\0';
 }
 
-static int mount_save_data(int slot, std::string_view dir_name, const std::string& directory,
+static int mount_save_data(int slot, const std::filesystem::path& directory,
                            uint32_t status, SaveDataMountResult* result) {
 	const std::string mount_point = SaveDataMountSlots::MountPoint(static_cast<size_t>(slot));
 	LibKernel::FileSystem::Mount(directory, mount_point);
-	g_mount_slots.Mount(static_cast<size_t>(slot), dir_name);
+	g_mount_slots.Mount(static_cast<size_t>(slot), directory);
 	std::snprintf(result->mount_point.data, sizeof(result->mount_point.data), "%s",
 	              mount_point.c_str());
 	result->required_blocks = 0;
@@ -526,7 +596,8 @@ int KYTY_SYSV_ABI SaveDataDirNameSearch(const SaveDataDirNameSearchCond* cond,
 	if (Common::File::IsDirectoryExisting(root)) {
 		for (const auto& entry: Common::File::GetDirEntries(root)) {
 			if (!entry.is_file && entry.name != "." && entry.name != ".." &&
-			    !entry.name.starts_with("sce_") && valid_path_component(entry.name)) {
+			    !entry.name.starts_with("sce_") && valid_path_component(entry.name) &&
+			    Common::File::IsFileExisting(save_param_path(root / entry.name))) {
 				if (cond->dir_name == nullptr || cond->dir_name->data[0] == '\0' ||
 				    dir_name_match(Common::ToLower(entry.name).c_str(),
 				                   Common::ToLower(std::string(cond->dir_name->data)).c_str())) {
@@ -558,12 +629,20 @@ int KYTY_SYSV_ABI SaveDataDirNameSearch(const SaveDataDirNameSearchCond* cond,
 		std::snprintf(result->dir_names[i].data, sizeof(result->dir_names[i].data), "%s",
 		              dir_list[i].c_str());
 		if (result->params != nullptr) {
-			result->params[i] = {};
+			const int status = load_save_param(root / dir_list[i], &result->params[i]);
+			if (status != OK) {
+				return status;
+			}
 		}
 		if (result->infos != nullptr) {
-			result->infos[i]             = {};
-			result->infos[i].blocks      = SAVE_DATA_BLOCKS_MAX;
-			result->infos[i].free_blocks = SAVE_DATA_BLOCKS_MAX;
+			auto& info = result->infos[i];
+			info = {};
+			const int status = read_save_blocks(root / dir_list[i], &info.blocks);
+			if (status != OK) {
+				return status;
+			}
+			// Host-directory saves report their allocation as free space.
+			info.free_blocks = info.blocks;
 		}
 	}
 
@@ -594,12 +673,12 @@ int KYTY_SYSV_ABI SaveDataMount3(const SaveDataMount3* mount, SaveDataMountResul
 
 	Common::LockGuard lock(g_mount_mutex);
 	const std::string dir_name  = mount->dir_name->data;
-	const auto        mount_dir = save_directory(get_title_id(), dir_name, mount->user_id).string();
+	const auto        mount_dir = save_directory(get_title_id(), dir_name, mount->user_id);
 	const bool create  = ((mount->mount_mode & 4u) != 0);
 	const bool create2 = ((mount->mount_mode & 32u) != 0);
 	const bool open    = (!create && !create2 && ((mount->mount_mode & 3u) != 0));
 
-	const int slot = g_mount_slots.FindAvailable(dir_name);
+	const int slot = g_mount_slots.FindAvailable(mount_dir);
 	if (slot == SaveDataMountSlots::BUSY) {
 		return SAVE_DATA_ERROR_BUSY;
 	}
@@ -621,13 +700,32 @@ int KYTY_SYSV_ABI SaveDataMount3(const SaveDataMount3* mount, SaveDataMountResul
 
 	bool created = false;
 	if ((create || create2) && !Common::File::IsDirectoryExisting(mount_dir)) {
-		Common::File::CreateDirectories(mount_dir);
+		if (mount->blocks < SAVE_DATA_BLOCKS_MIN || mount->blocks > SAVE_DATA_BLOCKS_MAX) {
+			return SAVE_DATA_ERROR_PARAMETER;
+		}
+		const auto metadata = mount_dir / "sce_sys";
+		std::error_code error;
+		std::filesystem::create_directories(metadata, error);
+		if (error) {
+			return SAVE_DATA_ERROR_INTERNAL;
+		}
+		const int status = write_save_file(metadata / "blocks.bin", &mount->blocks,
+		                                   sizeof(mount->blocks));
+		if (status != OK) {
+			std::filesystem::remove_all(mount_dir, error);
+			return status;
+		}
+		const SaveDataParam initial {};
+		const int param_status = write_save_file(save_param_path(mount_dir), &initial,
+		                                         sizeof(initial));
+		if (param_status != OK) {
+			std::filesystem::remove_all(mount_dir, error);
+			return param_status;
+		}
 		created = true;
-
-		EXIT_NOT_IMPLEMENTED((!Common::File::IsDirectoryExisting(mount_dir)));
 	}
 
-	return mount_save_data(slot, dir_name, mount_dir, created ? 1u : 0u, mount_result);
+	return mount_save_data(slot, mount_dir, created ? 1u : 0u, mount_result);
 }
 
 int KYTY_SYSV_ABI SaveDataSetupSaveDataMemory2(const SaveDataMemorySetup2* setup_param,
@@ -653,7 +751,7 @@ int KYTY_SYSV_ABI SaveDataSetupSaveDataMemory2(const SaveDataMemorySetup2* setup
 	Common::LockGuard lock(g_mount_mutex);
 	const auto        directory = memory_directory(setup_param->user_id, setup_param->slot_id);
 	if (g_save_data_memory.contains(directory) ||
-	    g_mount_slots.FindAvailable(memory_dir_name(setup_param->slot_id)) ==
+	    g_mount_slots.FindAvailable(directory) ==
 	        SaveDataMountSlots::BUSY) {
 		return SAVE_DATA_ERROR_BUSY;
 	}
@@ -815,8 +913,8 @@ int KYTY_SYSV_ABI SaveDataTransferringMount(const SaveDataTransferringMount* mou
 
 	Common::LockGuard lock(g_mount_mutex);
 	const std::string dir_name = mount->dir_name->data;
-	const auto mount_dir = save_directory(mount->title_id->data, dir_name, mount->user_id).string();
-	const int slot = g_mount_slots.FindAvailable(dir_name);
+	const auto mount_dir = save_directory(mount->title_id->data, dir_name, mount->user_id);
+	const int slot = g_mount_slots.FindAvailable(mount_dir);
 	if (slot == SaveDataMountSlots::BUSY) {
 		return SAVE_DATA_ERROR_BUSY;
 	}
@@ -828,7 +926,7 @@ int KYTY_SYSV_ABI SaveDataTransferringMount(const SaveDataTransferringMount* mou
 		return SAVE_DATA_ERROR_NOT_FOUND;
 	}
 
-	return mount_save_data(slot, dir_name, mount_dir, 0, mount_result);
+	return mount_save_data(slot, mount_dir, 0, mount_result);
 }
 
 int KYTY_SYSV_ABI SaveDataUmount2(uint32_t mode, const SaveDataMountPoint* mount_point) {
@@ -913,7 +1011,7 @@ int KYTY_SYSV_ABI SaveDataDelete(const SaveDataDelete* del) {
 	Common::LockGuard lock(g_mount_mutex);
 	const auto dir = save_directory(del->title_id != nullptr ? del->title_id->data : get_title_id(),
 	                                del->dir_name->data, del->user_id);
-	if (g_mount_slots.FindAvailable(del->dir_name->data) == SaveDataMountSlots::BUSY ||
+	if (g_mount_slots.FindAvailable(dir) == SaveDataMountSlots::BUSY ||
 	    g_save_data_memory.contains(dir)) {
 		return SAVE_DATA_ERROR_BUSY;
 	}
@@ -927,7 +1025,8 @@ int KYTY_SYSV_ABI SaveDataGetParam(const SaveDataMountPoint* mount_point, uint32
                                    void* param_buf, size_t param_buf_size, size_t* got_size) {
 	PRINT_NAME();
 
-	if (mount_point == nullptr || param_buf == nullptr) {
+	if (mount_point == nullptr || param_buf == nullptr || param_type > 5 ||
+	    std::memchr(mount_point->data, 0, sizeof(mount_point->data)) == nullptr) {
 		return SAVE_DATA_ERROR_PARAMETER;
 	}
 
@@ -935,21 +1034,44 @@ int KYTY_SYSV_ABI SaveDataGetParam(const SaveDataMountPoint* mount_point, uint32
 	     "\t param_type     = %u\n"
 	     "\t param_buf_size = %" PRIu64 "\n",
 	     mount_point->data, param_type, param_buf_size);
-
-	if (param_type == 0) {
-		if (param_buf_size < sizeof(SaveDataParam)) {
-			return SAVE_DATA_ERROR_PARAMETER;
-		}
-		std::memset(param_buf, 0, sizeof(SaveDataParam));
-		if (got_size != nullptr) {
-			*got_size = sizeof(SaveDataParam);
-		}
-		return OK;
+	Common::LockGuard lock(g_mount_mutex);
+	const int slot = g_mount_slots.Find(mount_point->data);
+	if (slot == SaveDataMountSlots::FULL) {
+		return SAVE_DATA_ERROR_NOT_MOUNTED;
 	}
 
-	std::memset(param_buf, 0, param_buf_size);
+	SaveDataParam param {};
+	const int status = load_save_param(g_mount_slots.Directory(static_cast<size_t>(slot)), &param);
+	if (status != OK) {
+		return status;
+	}
+	size_t size = 0;
+	if (param_type == 0) {
+		size = sizeof(param);
+		if (param_buf_size < size) {
+			return SAVE_DATA_ERROR_PARAMETER;
+		}
+		std::memcpy(param_buf, &param, size);
+	} else if (param_type == 4 || param_type == 5) {
+		size = param_type == 4 ? sizeof(param.user_param) : sizeof(param.mtime);
+		if (param_buf_size < size) {
+			return SAVE_DATA_ERROR_PARAMETER;
+		}
+		std::memcpy(param_buf, param_type == 4 ? static_cast<const void*>(&param.user_param)
+		                                         : static_cast<const void*>(&param.mtime), size);
+	} else {
+		if (param_buf_size == 0) {
+			return SAVE_DATA_ERROR_PARAMETER;
+		}
+		const auto field = param_text_field(param, param_type);
+		size = std::min(static_cast<size_t>(
+		                    std::find(field.data, field.data + field.size, '\0') - field.data),
+		                param_buf_size - 1);
+		std::memcpy(param_buf, field.data, size);
+		static_cast<char*>(param_buf)[size++] = '\0';
+	}
 	if (got_size != nullptr) {
-		*got_size = param_buf_size;
+		*got_size = size;
 	}
 
 	return OK;
@@ -1002,7 +1124,7 @@ int KYTY_SYSV_ABI SaveDataSyncSaveDataMemory(const SaveDataMemorySync* sync_para
 		return SAVE_DATA_ERROR_MEMORY_NOT_READY;
 	}
 	const auto dir_name = memory_dir_name(sync_param->slot_id);
-	if (g_mount_slots.FindAvailable(dir_name) == SaveDataMountSlots::BUSY) {
+	if (g_mount_slots.FindAvailable(it->first) == SaveDataMountSlots::BUSY) {
 		return SAVE_DATA_ERROR_BUSY;
 	}
 	const int status = save_memory(it->first, it->second);
@@ -1075,39 +1197,76 @@ int KYTY_SYSV_ABI SaveDataSetParam(const SaveDataMountPoint* mount_point, uint32
                                    const void* param_buf, size_t param_buf_size) {
 	PRINT_NAME();
 
-	EXIT_NOT_IMPLEMENTED(mount_point == nullptr);
+	if (mount_point == nullptr || param_buf == nullptr || param_type > 4 ||
+	    std::memchr(mount_point->data, 0, sizeof(mount_point->data)) == nullptr ||
+	    (param_type == 0 && param_buf_size < sizeof(SaveDataParam)) ||
+	    (param_type == 4 && param_buf_size < sizeof(uint32_t)) ||
+	    (param_type >= 1 && param_type <= 3 && param_buf_size == 0)) {
+		return SAVE_DATA_ERROR_PARAMETER;
+	}
 
 	LOGF("\t mount_point    = %s\n"
 	     "\t param_type     = %u\n"
 	     "\t param_buf_size = %" PRIu64 "\n",
 	     mount_point->data, param_type, param_buf_size);
+	Common::LockGuard lock(g_mount_mutex);
+	const int slot = g_mount_slots.Find(mount_point->data);
+	if (slot == SaveDataMountSlots::FULL) {
+		return SAVE_DATA_ERROR_NOT_MOUNTED;
+	}
 
 	if (param_type == 0) {
 		const auto* p = static_cast<const SaveDataParam*>(param_buf);
 
-		LOGF("\t title      = %s\n"
-		     "\t sub_title  = %s\n"
-		     "\t detail     = %s\n"
+		LOGF("\t title      = %.128s\n"
+		     "\t sub_title  = %.128s\n"
+		     "\t detail     = %.1024s\n"
 		     "\t user_param = %u\n",
 		     p->title, p->sub_title, p->detail, p->user_param);
-	} else {
-		LOGF("\t unsupported param_type, accepting as no-op\n");
+		return write_save_file(save_param_path(g_mount_slots.Directory(static_cast<size_t>(slot))),
+		                       p, sizeof(*p));
 	}
-
-	return OK;
+	SaveDataParam param {};
+	const auto path = save_param_path(g_mount_slots.Directory(static_cast<size_t>(slot)));
+	const int status = read_save_param(path, &param);
+	if (status != OK) {
+		return status;
+	}
+	if (param_type == 4) {
+		std::memcpy(&param.user_param, param_buf, sizeof(param.user_param));
+	} else {
+		const auto field = param_text_field(param, param_type);
+		const auto* text = static_cast<const char*>(param_buf);
+		const size_t length = std::min(param_buf_size, field.size - 1);
+		const auto* end = static_cast<const char*>(std::memchr(text, '\0', length));
+		const size_t count = end != nullptr ? static_cast<size_t>(end - text) : length;
+		std::memset(field.data, 0, field.size);
+		std::memcpy(field.data, text, count);
+	}
+	return write_save_file(path, &param, sizeof(param));
 }
 
 int KYTY_SYSV_ABI SaveDataGetMountInfo(const SaveDataMountPoint* mount_point,
                                        SaveDataMountInfo*        info) {
 	PRINT_NAME();
 
-	EXIT_NOT_IMPLEMENTED(mount_point == nullptr);
-	EXIT_NOT_IMPLEMENTED(info == nullptr);
-
+	if (mount_point == nullptr || info == nullptr ||
+	    std::memchr(mount_point->data, 0, sizeof(mount_point->data)) == nullptr) {
+		return SAVE_DATA_ERROR_PARAMETER;
+	}
+	Common::LockGuard lock(g_mount_mutex);
+	const int slot = g_mount_slots.Find(mount_point->data);
+	if (slot == SaveDataMountSlots::FULL) {
+		return SAVE_DATA_ERROR_NOT_MOUNTED;
+	}
+	uint64_t blocks = 0;
+	const int status = read_save_blocks(g_mount_slots.Directory(static_cast<size_t>(slot)), &blocks);
+	if (status != OK) {
+		return status;
+	}
 	*info = {};
-
-	info->blocks      = SAVE_DATA_BLOCKS_MAX;
-	info->free_blocks = SAVE_DATA_BLOCKS_MAX;
+	info->blocks = blocks;
+	info->free_blocks = blocks;
 
 	return OK;
 }

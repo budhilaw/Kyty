@@ -4,13 +4,13 @@
 [![Build KytyPS5 (Linux)](https://img.shields.io/github/actions/workflow/status/KytyPS5/KytyPS5/build.yml?branch=main&event=push&label=Build%20KytyPS5%20%28Linux%29)](https://github.com/KytyPS5/KytyPS5/actions/workflows/build.yml)
 [![Build KytyPS5 (macOS)](https://img.shields.io/github/actions/workflow/status/KytyPS5/KytyPS5/build.yml?branch=main&event=push&label=Build%20KytyPS5%20%28macOS%29)](https://github.com/KytyPS5/KytyPS5/actions/workflows/build.yml)
 [![Platform](https://img.shields.io/badge/platform-Windows%20x64%20%7C%20Linux%20x64%20%7C%20macOS%20x86__64-0078D4.svg)](#system-requirements)
-[![Status](https://img.shields.io/badge/status-early%20development-orange.svg)](#current-status)
+[![Status](https://img.shields.io/badge/status-active%20development-orange.svg)](#current-status)
 [![License](https://img.shields.io/badge/license-GPL--2.0-blue.svg)](LICENSE)
 
 KytyPS5 is a free and open-source PlayStation 5 emulator written in C++ for Windows and Linux,
 with experimental macOS support. It is based on a heavily modified version of
-[Kyty](https://github.com/InoriRus/Kyty). The project is in an early stage of development, so
-compatibility is limited and behavior may change significantly between builds.
+[Kyty](https://github.com/InoriRus/Kyty). The project is in active development, and behavior
+can change significantly between builds.
 
 > [!IMPORTANT]
 > KytyPS5 is not affiliated with Sony Interactive Entertainment or PlayStation. The project does
@@ -20,12 +20,12 @@ compatibility is limited and behavior may change significantly between builds.
 ## Current Status
 
 KytyPS5 can boot 2D games and a selection of 3D games, including titles built with Unreal Engine
-4/5, Unity, and custom engines. No external low-level emulation modules are currently required.
+4/5, Unity, and custom engines. External low-level emulation modules are neither required nor
+planned.
 
-Development is focused on compatibility and boot reliability.
+Development is currently focused on expanding game compatibility and improving boot reliability.
 
-Windows is the primary platform and receives the most testing. Linux builds and runs; see
-[Building on Linux](#building-on-linux).
+Windows and Linux are the primary platforms and receive the most testing.
 
 macOS support is experimental. The emulator is built for x86-64 and runs on Apple Silicon under
 Rosetta 2, with Vulkan provided by MoltenVK. A small number of titles have been verified in-game
@@ -36,16 +36,16 @@ Community game test results are available in the
 
 ## Bugs and Issues
 
-The project is in an early stage, so please be mindful when opening new issues. Expect crashes,
-graphical glitches, low compatibility, and poor performance.
+Compatibility, stability, and performance can vary between versions. You may encounter crashes
+or graphical glitches, so please include the version you tested when reporting an issue.
 
 ## Screenshots
 
 <table align="center">
   <tr>
     <td align="center">
-      <strong>Disgaea 6</strong><br>
-      <img src="docs/screenshots/ps5-01.png" width="300" alt="Disgaea 6 running in KytyPS5">
+      <strong>Astro Bot</strong><br>
+      <img src="docs/screenshots/ps5-01.png" width="300" alt="Astro Bot running in KytyPS5">
     </td>
     <td align="center">
       <strong>Dreaming Sarah</strong><br>
@@ -64,12 +64,12 @@ graphical glitches, low compatibility, and poor performance.
   </tr>
   <tr>
     <td align="center">
-      <strong>Hellboy</strong><br>
-      <img src="docs/screenshots/ps5-02.png" width="300" alt="Hellboy running in KytyPS5">
+      <strong>Demon's Souls</strong><br>
+      <img src="docs/screenshots/ps5-02.png" width="300" alt="Demon's Souls running in KytyPS5">
     </td>
     <td align="center">
-      <strong>Paleo Pines</strong><br>
-      <img src="docs/screenshots/ps5-06.png" width="300" alt="Paleo Pines running in KytyPS5">
+      <strong>Hellboy</strong><br>
+      <img src="docs/screenshots/ps5-06.png" width="300" alt="Hellboy running in KytyPS5">
     </td>
   </tr>
 </table>
@@ -166,15 +166,15 @@ The finished application and its runtime dependencies will be placed in
 
 ### Building on Linux
 
-Install the toolchain and the libraries the bundled SDL2 needs. Without the audio, Wayland and
-udev development packages SDL2 quietly configures itself without those backends, and the resulting
+Install the toolchain and the libraries the bundled SDL3 needs. Without the audio, Wayland and
+udev development packages SDL3 quietly configures itself without those backends, and the resulting
 build has no working sound and no gamepad hotplug:
 
 ```bash
 sudo apt-get install --no-install-recommends \
   clang lld ninja-build cmake git glslang-tools pkg-config \
   libgl1-mesa-dev libx11-dev libxcursor-dev libxext-dev libxfixes-dev \
-  libxi-dev libxrandr-dev libxss-dev libxkbcommon-dev \
+  libxi-dev libxrandr-dev libxss-dev libxtst-dev libxkbcommon-dev \
   libasound2-dev libpulse-dev libudev-dev libdbus-1-dev libwayland-dev wayland-protocols
 ```
 
@@ -204,7 +204,7 @@ The CMake source root is the repository root.
 
 ### Building on NixOS
 
-A development shell provides Clang, CMake, Ninja, Qt 6, the Vulkan headers, and the SDL2 backend
+A development shell provides Clang, CMake, Ninja, Qt 6, the Vulkan headers, and the SDL3 backend
 libraries. Enter it and configure exactly as on other Linux distributions; the shell exports
 `CMAKE_PREFIX_PATH` and `QT_PLUGIN_PATH`, so the `-DCMAKE_PREFIX_PATH="$Qt6_DIR"` argument is not
 needed:
@@ -370,5 +370,6 @@ licenses included with those components.
 
 - [InoriRus/Kyty](https://github.com/InoriRus/Kyty) — KytyPS5 is based on a heavily modified version
   of the original Kyty project.
-- [shadps4-emu/shadPS4](https://github.com/shadps4-emu/shadPS4) — reference for memory-model
-  understanding and the AVPlayer implementation.
+- [shadps4-emu/shadPS4](https://github.com/shadps4-emu/shadPS4) — reference for understanding PS4
+  memory behavior, GPU resource aliasing and cache coherency,
+  and the AVPlayer implementation.

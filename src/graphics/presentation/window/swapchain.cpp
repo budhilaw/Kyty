@@ -171,6 +171,13 @@ void Presenter::Frame::Configure(GraphicContext& graphics, vk::Extent2D extent, 
 		EXIT("unsupported prepared frame, extent=%ux%u format=%d\n", extent.width, extent.height,
 		     static_cast<int>(format));
 	}
+	auto&      dst        = image;
+	const bool compatible = dst.image != nullptr && dst.extent.width == extent.width &&
+	                        dst.extent.height == extent.height && dst.format == format;
+	if (compatible) {
+		return;
+	}
+
 	const auto features = graphics.GetFormatProperties(format).optimalTilingFeatures;
 	const auto required =
 	    vk::FormatFeatureFlagBits::eBlitSrc | vk::FormatFeatureFlagBits::eSampledImageFilterLinear |
@@ -180,12 +187,6 @@ void Presenter::Frame::Configure(GraphicContext& graphics, vk::Extent2D extent, 
 		     static_cast<int>(format), static_cast<vk::FormatFeatureFlags::MaskType>(features));
 	}
 
-	auto&      dst        = image;
-	const bool compatible = dst.image != nullptr && dst.extent.width == extent.width &&
-	                        dst.extent.height == extent.height && dst.format == format;
-	if (compatible) {
-		return;
-	}
 	if (dst.image != nullptr) {
 		graphics.DeleteImage(dst);
 	}
@@ -279,6 +280,7 @@ public:
 
 	void                 Create();
 	void                 Recreate(bool surface_lost = false);
+	[[nodiscard]] bool   NeedsResize() const;
 	[[nodiscard]] Status AcquireNextImage();
 	[[nodiscard]] bool   PrepareSystemOverlay();
 	void                 RecordPresentCommands(CommandBuffer& command, VulkanImage& source,
@@ -298,6 +300,8 @@ private:
 	vk::SwapchainKHR            m_handle = nullptr;
 	vk::Format                  m_format = vk::Format::eUndefined;
 	vk::Extent2D                m_extent {};
+	// Drawable pixel size observed when this swapchain was created.
+	vk::Extent2D                m_window_extent {};
 	std::vector<vk::Image>      m_images;
 	std::vector<vk::ImageView>  m_image_views;
 	std::vector<vk::Semaphore>  m_image_acquired;
@@ -357,19 +361,25 @@ void Swapchain::Create() {
 	EXIT_IF(graphics.device == nullptr);
 	EXIT_IF(m_window.surface == nullptr);
 
-	Common::LockGuard lock(m_window.mutex);
-	EXIT_IF(graphics.screen_width == 0);
-	EXIT_IF(graphics.screen_height == 0);
+	// Capture the size before querying surface capabilities. If the window changes
+	// during creation, the next presentation will detect the newer size.
+	{
+		Common::LockGuard lock(m_window.mutex);
+		m_window_extent = {graphics.screen_width, graphics.screen_height};
+	}
+	EXIT_IF(m_window_extent.width == 0);
+	EXIT_IF(m_window_extent.height == 0);
+	m_window.RefreshSurfaceCapabilities();
 	const auto&       surface = m_window.surface_capabilities;
 	EXIT_NOT_IMPLEMENTED(surface.formats.empty());
 
 	m_extent = surface.capabilities.currentExtent;
 	if (m_extent.width == std::numeric_limits<uint32_t>::max()) {
 		m_extent.width =
-		    std::clamp(graphics.screen_width, surface.capabilities.minImageExtent.width,
+		    std::clamp(m_window_extent.width, surface.capabilities.minImageExtent.width,
 		               surface.capabilities.maxImageExtent.width);
 		m_extent.height =
-		    std::clamp(graphics.screen_height, surface.capabilities.minImageExtent.height,
+		    std::clamp(m_window_extent.height, surface.capabilities.minImageExtent.height,
 		               surface.capabilities.maxImageExtent.height);
 	}
 	uint32_t image_count = surface.capabilities.minImageCount + 1;
@@ -473,8 +483,8 @@ void Swapchain::Create() {
 		    graphics.device.createSemaphore(&semaphore_info, nullptr, &m_render_complete[i]),
 		    "create swapchain render-complete semaphore");
 	}
-	m_image_index = static_cast<uint32_t>(-1);
-	m_frame_index = 0;
+	m_image_index   = static_cast<uint32_t>(-1);
+	m_frame_index   = 0;
 }
 
 Swapchain::~Swapchain() {
@@ -515,11 +525,12 @@ void Swapchain::Destroy() {
 		graphics.device.destroySwapchainKHR(m_handle, nullptr);
 	}
 
-	m_handle      = nullptr;
-	m_format      = vk::Format::eUndefined;
-	m_extent      = {};
-	m_image_index = static_cast<uint32_t>(-1);
-	m_frame_index = 0;
+	m_handle        = nullptr;
+	m_format        = vk::Format::eUndefined;
+	m_extent        = {};
+	m_window_extent = {};
+	m_image_index   = static_cast<uint32_t>(-1);
+	m_frame_index   = 0;
 	m_images.clear();
 	m_image_views.clear();
 	m_image_acquired.clear();
@@ -532,13 +543,20 @@ void Swapchain::Recreate(bool surface_lost) {
 #if defined(__APPLE__)
 		// Surface recreation goes through SDL_Vulkan_CreateSurface, which touches the
 		// window's view/layer and must run on the main thread on macOS.
-		m_window.RunOnMainThread([this] { m_window.RecreateSurface(); });
+		EXIT_IF(!SDL_RunOnMainThread(
+		    [](void* window) { static_cast<WindowContext*>(window)->RecreateSurface(); },
+		    &m_window, true));
 #else
 		m_window.RecreateSurface();
 #endif
 	}
-	m_window.RefreshSurfaceCapabilities();
 	Create();
+}
+
+bool Swapchain::NeedsResize() const {
+	Common::LockGuard lock(m_window.mutex);
+	return m_window_extent.width != m_window.graphic_ctx.screen_width ||
+	       m_window_extent.height != m_window.graphic_ctx.screen_height;
 }
 
 Swapchain::Status Swapchain::AcquireNextImage() {
@@ -766,6 +784,10 @@ void Presenter::Present(Frame& frame, bool reuse) {
 
 	const auto overlay_visual = GetSystemOverlayVisualState();
 	auto&      swapchain  = m_impl->swapchain;
+	// Some window systems keep presenting an old swapchain after a resize.
+	if (swapchain.NeedsResize()) {
+		m_impl->RecoverSwapchain(Swapchain::Status::Recreate);
+	}
 	for (uint32_t attempt = 0; attempt < 2; attempt++) {
 		auto status = swapchain.AcquireNextImage();
 		if (status != Swapchain::Status::Success) {
