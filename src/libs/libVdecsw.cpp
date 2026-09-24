@@ -527,8 +527,13 @@ static int32_t KYTY_SYSV_ABI TrySyncDecodeInput(VdecswDecoder decoder, VdecswInp
 	}
 	sync->attached_data = 0;
 	sync->input_count   = 0;
-	return state->requests.empty() && !state->busy ? VDECSW_ERROR_INPUT_QUEUE_EMPTY
-	                                                : VDECSW_ERROR_DECODE_PENDING;
+	const auto code = state->requests.empty() && !state->busy ? VDECSW_ERROR_INPUT_QUEUE_EMPTY
+	                                                          : VDECSW_ERROR_DECODE_PENDING;
+	static std::atomic<uint32_t> end_log {0};
+	if (state->finalizing && end_log.fetch_add(1) < 40) {
+		LOGF("Vdecsw TrySyncDecodeInput at end: 0x%08x\n", static_cast<uint32_t>(code));
+	}
+	return code;
 }
 
 static int32_t KYTY_SYSV_ABI TrySyncDecodeOutput(VdecswDecoder decoder, VdecswOutputInfo* output) {
@@ -579,6 +584,12 @@ static int32_t KYTY_SYSV_ABI TrySyncDecodeOutput(VdecswDecoder decoder, VdecswOu
 	if (state->requests.empty() && !state->busy && state->finalizing) {
 		state->requests.push_back({RequestKind::Flush, {}});
 		state->wake.notify_all();
+	}
+	static std::atomic<uint32_t> end_log {0};
+	if (state->frames_out + 4 >= state->frames_in && state->frames_in > 100 &&
+	    end_log.fetch_add(1) < 40) {
+		LOGF("Vdecsw TrySyncDecodeOutput pending: in=%" PRIu64 " out=%" PRIu64 " finalizing=%d\n",
+		     state->frames_in, state->frames_out, state->finalizing ? 1 : 0);
 	}
 	return VDECSW_ERROR_DECODE_PENDING;
 }

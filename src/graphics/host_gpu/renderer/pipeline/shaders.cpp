@@ -18,6 +18,7 @@
 #include "graphics/shader/rectListShader.h"
 #include "graphics/shader/shader.h"
 
+#include <chrono>
 #include <cstdio>
 #include <cinttypes>
 #include <algorithm>
@@ -620,10 +621,13 @@ void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& p
 
 	LOGF("PipelineTrace: vkCreateComputePipelines begin layout=%p\n",
 	     static_cast<void*>(pipeline.pipeline_layout));
+	const auto compile_start = std::chrono::steady_clock::now();
 	result = graphics.device.createComputePipelines(driver_cache, 1, &info, nullptr,
 	                                                &pipeline.pipeline);
-	LOGF("PipelineTrace: vkCreateComputePipelines done result=%s pipeline=%p\n",
-	     vk::to_string(result).c_str(), static_cast<void*>(pipeline.pipeline));
+	LOGF("PipelineTrace: vkCreateComputePipelines done result=%s pipeline=%p ms=%.1f\n",
+	     vk::to_string(result).c_str(), static_cast<void*>(pipeline.pipeline),
+	     std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - compile_start)
+	         .count());
 	EXIT_NOT_IMPLEMENTED(result != vk::Result::eSuccess);
 
 	EXIT_NOT_IMPLEMENTED(pipeline.pipeline == nullptr);

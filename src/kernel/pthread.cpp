@@ -2845,9 +2845,9 @@ int KYTY_SYSV_ABI PthreadCondTimedwait(PthreadCond* cond, PthreadMutex* mutex,
                                        KernelUseconds usec) {
 	// PRINT_NAME();
 
-	LOGF("\t GWAIT: condtimedwait cond=0x%016" PRIx64 " usec=%" PRIu64 " thread=%d\n",
+	LOGF("\t GWAIT: condtimedwait cond=0x%016" PRIx64 " usec=%" PRIu64 " thread=%d caller=%p\n",
 	     reinterpret_cast<uint64_t>(cond), static_cast<uint64_t>(usec),
-	     Common::Thread::GetThreadIdUnique());
+	     Common::Thread::GetThreadIdUnique(), __builtin_return_address(0));
 	auto* pthread_static_objects = g_pthread_context->GetPthreadStaticObjects();
 
 	cond = static_cast<PthreadCond*>(
@@ -3013,8 +3013,9 @@ int KYTY_SYSV_ABI PthreadCondTimedwaitAbs(PthreadCond* cond, PthreadMutex* mutex
 int KYTY_SYSV_ABI PthreadCondWait(PthreadCond* cond, PthreadMutex* mutex) {
 	PRINT_NAME();
 
-	LOGF("\t GWAIT: condwait cond=0x%016" PRIx64 " thread=%d\n",
-	     reinterpret_cast<uint64_t>(cond), Common::Thread::GetThreadIdUnique());
+	LOGF("\t GWAIT: condwait cond=0x%016" PRIx64 " thread=%d caller=%p\n",
+	     reinterpret_cast<uint64_t>(cond), Common::Thread::GetThreadIdUnique(),
+	     __builtin_return_address(0));
 
 	Common::WaitTrace::Scope wait_scope(Common::WaitTrace::Kind::CondVar);
 

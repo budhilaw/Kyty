@@ -140,8 +140,25 @@ static LONG WINAPI ExceptionFilter(PEXCEPTION_POINTERS exception) noexcept {
 	info.r14 = exception->ContextRecord->R14;
 	info.r15 = exception->ContextRecord->R15;
 
-	const auto handler = g_handler.load(std::memory_order_acquire);
-	if (handler != nullptr && handler(info)) {
+	// A fault raised while this thread is already inside the handler would kill the process
+	// silently; report both addresses first.
+	static thread_local uint64_t outer_fault_pc = 0;
+	if (outer_fault_pc != 0) {
+		printf("Nested host fault code=0x%08lx pc=%p address=0x%llx while handling pc=0x%llx "
+		       "thread=%lu exe=%p\n",
+		       static_cast<unsigned long>(exception_record->ExceptionCode),
+		       exception_record->ExceptionAddress,
+		       static_cast<unsigned long long>(info.access_violation_vaddr),
+		       static_cast<unsigned long long>(outer_fault_pc), GetCurrentThreadId(),
+		       static_cast<void*>(GetModuleHandleA(nullptr)));
+		fflush(stdout);
+	}
+	const auto saved_outer = outer_fault_pc;
+	outer_fault_pc         = info.exception_address;
+	const auto handler     = g_handler.load(std::memory_order_acquire);
+	const bool handled     = handler != nullptr && handler(info);
+	outer_fault_pc         = saved_outer;
+	if (handled) {
 		return EXCEPTION_CONTINUE_EXECUTION;
 	}
 	// Unhandled faults otherwise end the process silently; name the code and its module offset.
