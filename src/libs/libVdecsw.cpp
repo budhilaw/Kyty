@@ -688,6 +688,20 @@ static int32_t KYTY_SYSV_ABI GetAvcPictureInfo(const VdecswOutputInfo* output, v
 	return second != nullptr ? fill(second, false) : OK;
 }
 
+void DumpDecoderState(FILE* out) {
+	std::scoped_lock lock(g_decoder_mutex);
+	for (const auto& [handle, state]: g_decoders) {
+		std::scoped_lock state_lock(state->mutex);
+		std::fprintf(out,
+		             "vdecsw %p in=%llu out=%llu requests=%zu ready=%zu consumed=%zu busy=%d "
+		             "has_frame_buffer=%d finalizing=%d\n",
+		             handle, static_cast<unsigned long long>(state->frames_in),
+		             static_cast<unsigned long long>(state->frames_out), state->requests.size(),
+		             state->ready.size(), state->consumed.size(), state->busy ? 1 : 0,
+		             state->has_frame_buffer ? 1 : 0, state->finalizing ? 1 : 0);
+	}
+}
+
 LIB_DEFINE(InitVdecsw_1) {
 	PRINT_NAME();
 

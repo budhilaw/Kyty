@@ -27,6 +27,7 @@
 #include "common/systemInfo.h"
 #include "common/threads.h"
 #include "common/timer.h"
+#include "kernel/memory.h"
 #include "common/stringUtils.h"
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/renderer/render.h"
@@ -59,6 +60,10 @@ std::atomic<uint64_t> g_kyty_flip_counter {0};
 // IWYU pragma: no_include <intrin.h>
 
 #define KYTY_DBG_INPUT
+
+namespace Libs::Vdecsw {
+void DumpDecoderState(FILE* out);
+} // namespace Libs::Vdecsw
 
 namespace Libs::Graphics {
 
@@ -204,6 +209,18 @@ static void GameEventQuit(WindowLoopState& game) {
 	// Closing a stuck game leaves a record of where every thread was waiting.
 	if (FILE* dump = std::fopen("_threaddump.txt", "w"); dump != nullptr) {
 		Common::WaitTrace::DumpThreads(dump);
+		::Libs::Vdecsw::DumpDecoderState(dump);
+		// Raw words of the game's movie decoder object, for diagnosing video playback stalls.
+		for (uint64_t base: {0x903289a00ull, 0x903289b00ull, 0x903289c00ull}) {
+			uint32_t words[64] {};
+			if (::Libs::LibKernel::Memory::TryReadBacking(base, words, sizeof(words))) {
+				std::fprintf(dump, "mem %llx:", static_cast<unsigned long long>(base));
+				for (uint32_t i = 0; i < 64; i++) {
+					std::fprintf(dump, "%s%08x", (i % 8) == 0 ? "\n  " : " ", words[i]);
+				}
+				std::fprintf(dump, "\n");
+			}
+		}
 		std::fclose(dump);
 	}
 
