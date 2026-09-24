@@ -878,12 +878,21 @@ private:
 			exec = emit(ValueOpcode::LogicalAnd, {exec, emit(ValueOpcode::IEqual32, {stride, Value(0x7fffffffu)})});
 		}
 		const auto address = emit(ValueOpcode::GetAddressResource, {dword0, base_high});
-		if (store && runtime_format && memory.idxen) {
-			// An element of an 8- or 16-bit format is narrower than the dword the copy moves;
-			// storing a whole dword would overwrite the following elements and, for the last
-			// one, memory past the buffer. Such elements store only their own bytes.
-			const auto is8   = emit(ValueOpcode::IEqual32, {stride, Value(1u)});
-			const auto is16  = emit(ValueOpcode::IEqual32, {stride, Value(2u)});
+		if (store && runtime_format) {
+			// STORE_FORMAT_X writes only the X component, whose width the descriptor's format
+			// gives. Storing a whole dword for an 8- or 16-bit component would overwrite the
+			// neighbouring fields of interleaved data and, at the end, memory past the buffer.
+			const auto format = emit(ValueOpcode::BitwiseAnd32,
+			                         {emit(ValueOpcode::ShiftRightLogical32, {handle->Arg(3), Value(12u)}),
+			                          Value(0x7fu)});
+			const auto in = [&](uint32_t first, uint32_t last) {
+				return emit(ValueOpcode::ULessThan32,
+				            {emit(ValueOpcode::ISub32, {format, Value(first)}), Value(last - first + 1u)});
+			};
+			const auto any = [&](Value a, Value b) { return emit(ValueOpcode::LogicalOr, {a, b}); };
+			// 8, 8_8 and 8_8_8_8 formats have a byte X; 16, 16_16 and 16_16_16_16 a halfword X.
+			const auto is8  = any(any(in(1u, 6u), in(14u, 19u)), in(56u, 61u));
+			const auto is16 = any(any(in(7u, 13u), in(23u, 29u)), in(65u, 71u));
 			// Each address access carries its own metadata, sized to its data width.
 			const auto narrow_flags = [&](uint32_t bits) {
 				auto info            = m_program.memory_info[flags.index];

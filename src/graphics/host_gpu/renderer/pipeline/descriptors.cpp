@@ -339,7 +339,7 @@ static bool IsSupportedStorageTextureEncoding(const ShaderRecompiler::IR::ImageR
 	       (descriptor.fields[5] & ~field5_max_mip_mask) == field5_expected;
 }
 
-void ValidateStorageTexture(const ShaderRecompiler::IR::ImageResource& resource,
+bool ValidateStorageTexture(const ShaderRecompiler::IR::ImageResource& resource,
                             const ShaderTextureResource& descriptor, uint64_t size) {
 	const auto format        = descriptor.Format();
 	const bool resource_ok   = IsSupportedStorageImageResource(resource);
@@ -356,9 +356,15 @@ void ValidateStorageTexture(const ShaderRecompiler::IR::ImageResource& resource,
 	     uint_resource == (numeric_class == Prospero::TextureNumericClass::Uint) &&
 	     (!resource.atomic || format == Prospero::BufferFormat::k32UInt));
 	if (resource_ok && descriptor_ok && encoding_ok && format_ok && size != 0) {
-		return;
+		return true;
 	}
-	EXIT("unsupported storage texture: resource=%d descriptor=%d encoding=%d format=%d "
+	// An unmodeled storage image (e.g. a multisampled one) binds as a null image; its writes are
+	// dropped instead of stopping the emulator.
+	static std::atomic<uint32_t> log_count {0};
+	if (log_count.fetch_add(1) >= 16) {
+		return false;
+	}
+	LOGF("unsupported storage texture bound as null: resource=%d descriptor=%d encoding=%d format=%d "
 	     "class=%u numeric=%u dimension=%u mip_mode=%u atomic=%d compare=%d "
 	     "base_level=%u last_level=%u max_mip=%u min_lod=%u base_array=%u bc=%u msaa=%d "
 	     "depth_tile_bpe=%u swizzle_ok=%d "
@@ -380,6 +386,7 @@ void ValidateStorageTexture(const ShaderRecompiler::IR::ImageResource& resource,
 	     descriptor.DstSelXYZW(), resource.read, resource.written, descriptor.fields[0],
 	     descriptor.fields[1], descriptor.fields[2], descriptor.fields[3], descriptor.fields[4],
 	     descriptor.fields[5], descriptor.fields[6], descriptor.fields[7]);
+	return false;
 }
 
 static TextureCache::ImageDesc NullTextureDesc(const ShaderRecompiler::IR::ImageResource& resource,
@@ -718,10 +725,19 @@ TextureBinding RenderExecutor::ResolveTexture(const ShaderRecompiler::IR::ImageR
 			return NullTextureBinding(resource, storage, texture_cache);
 		}
 	}
-	EXIT_NOT_IMPLEMENTED(size.size == 0 || size.align == 0 ||
-	                     (address & (static_cast<uint64_t>(size.align) - 1u)) != 0);
-	if (storage) {
-		ValidateStorageTexture(resource, descriptor, size.size);
+	if (size.size == 0 || size.align == 0 ||
+	    (address & (static_cast<uint64_t>(size.align) - 1u)) != 0) {
+		// An empty or misaligned surface cannot be a real texture; sample a null image.
+		static std::atomic<uint32_t> log_count {0};
+		if (log_count.fetch_add(1) < 16) {
+			LOGF("\t TEXDESC: empty or misaligned texture bound as null: addr=0x%016" PRIx64
+			     " size=0x%" PRIx64 " align=0x%x\n",
+			     address, static_cast<uint64_t>(size.size), static_cast<uint32_t>(size.align));
+		}
+		return NullTextureBinding(resource, storage, texture_cache);
+	}
+	if (storage && !ValidateStorageTexture(resource, descriptor, size.size)) {
+		return NullTextureBinding(resource, storage, texture_cache);
 	}
 
 	auto pixel_format = surface_format.vk_format;

@@ -2601,9 +2601,14 @@ KYTY_CP_OP_PARSER(CpOpSetUconfigReg) {
 		return KYTY_PM4_LEN(cmd_id) - 1u;
 	}
 	if (cmd_offset >= Pm4::UC_NUM) {
-		EXIT("unsupported UC register offset 0x%08" PRIx32 " (raw 0x%08" PRIx32
-		     "), cmd_id = 0x%08" PRIx32 "\n",
-		     cmd_offset, raw_cmd_offset, cmd_id);
+		// An out-of-range UC register comes from a damaged packet; skip the packet.
+		static std::atomic<uint32_t> log_count {0};
+		if (log_count.fetch_add(1) < 32) {
+			LOGF("skipped unsupported UC register offset 0x%08" PRIx32 " (raw 0x%08" PRIx32
+			     "), cmd_id = 0x%08" PRIx32 "\n",
+			     cmd_offset, raw_cmd_offset, cmd_id);
+		}
+		return KYTY_PM4_LEN(cmd_id) - 1u;
 	}
 
 	auto pfunc = g_hw_uc_func[cmd_offset & (Pm4::UC_NUM - 1)];

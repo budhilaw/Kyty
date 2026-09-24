@@ -100,12 +100,19 @@ void EmitReturn(ValueEmitContext& ctx) {
 
 // Experimental runaway-loop cap for compute shaders; off unless KYTY_LOOP_CAP=1. It can cut
 // legitimate long loops short, which corrupts game data.
+// KYTY_LOOP_CAP=1 caps loops in every shader; a list of hex hashes caps only those.
 static bool LoopCapEnabled(const EmitterState& state) {
-	static const bool enabled = [] {
+	static const std::string setting = [] {
 		const char* text = std::getenv("KYTY_LOOP_CAP");
-		return text != nullptr && std::strtoul(text, nullptr, 0) != 0;
+		// Without a setting, only shaders known to spin forever on unmodeled input are capped:
+		// 1d5918390613826e (Uncharted: Legacy of Thieves) hangs the GPU on the intro videos.
+		return std::string(text != nullptr ? text : "1d5918390613826e");
 	}();
-	return enabled && state.program.stage == ShaderType::Compute;
+	if (setting.empty() || setting == "0") {
+		return false;
+	}
+	return setting == "1" ||
+	       setting.find(fmt::format("{:016x}", state.program.shader_hash)) != std::string::npos;
 }
 
 uint32_t BranchCondition(ValueEmitContext& ctx, const IR::BlockInfo& info) {
