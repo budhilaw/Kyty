@@ -50,6 +50,23 @@ bool BackingCopies() {
 	return enabled;
 }
 
+// Reads guest memory for an upload without touching protected pages: a range that spans
+// two mappings fails the single backing read, so it is retried one page at a time.
+void ReadGuestForUpload(uint64_t address, uint8_t* target, uint64_t size) {
+	if (BackingCopies() && Libs::LibKernel::Memory::TryReadBacking(address, target, size)) {
+		return;
+	}
+	constexpr uint64_t Page = 0x1000;
+	for (uint64_t done = 0; done < size;) {
+		const auto chunk = std::min<uint64_t>(size - done, Page - ((address + done) & (Page - 1u)));
+		if (!BackingCopies() ||
+		    !Libs::LibKernel::Memory::TryReadBacking(address + done, target + done, chunk)) {
+			std::memcpy(target + done, reinterpret_cast<const void*>(address + done), chunk);
+		}
+		done += chunk;
+	}
+}
+
 } // namespace
 
 void BufferCache::WriteDataBuffer(Buffer& buffer, uint64_t address, const void* source,
@@ -766,11 +783,7 @@ vk::Buffer BufferCache::UploadCopies(Buffer& buffer, std::span<vk::BufferCopy> c
 	if (mapped != nullptr) {
 		for (auto& copy: copies) {
 			const auto address = buffer.CpuAddress() + copy.dstOffset;
-			if (!BackingCopies() || !Libs::LibKernel::Memory::TryReadBacking(address, mapped + copy.srcOffset,
-			                                              copy.size)) {
-				std::memcpy(mapped + copy.srcOffset, reinterpret_cast<const void*>(address),
-				            copy.size);
-			}
+			ReadGuestForUpload(address, mapped + copy.srcOffset, copy.size);
 			copy.srcOffset += base_offset;
 		}
 		m_staging_buffer.Commit();
@@ -782,9 +795,7 @@ vk::Buffer BufferCache::UploadCopies(Buffer& buffer, std::span<vk::BufferCopy> c
 	for (const auto& copy: copies) {
 		const auto address = buffer.CpuAddress() + copy.dstOffset;
 		auto*      target  = temporary->Mapped().data() + copy.srcOffset;
-		if (!BackingCopies() || !Libs::LibKernel::Memory::TryReadBacking(address, target, copy.size)) {
-			std::memcpy(target, reinterpret_cast<const void*>(address), copy.size);
-		}
+		ReadGuestForUpload(address, target, copy.size);
 	}
 	temporary->Flush(0, total_size);
 	const auto handle = temporary->Handle();

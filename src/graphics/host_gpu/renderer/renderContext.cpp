@@ -143,7 +143,27 @@ bool RenderContext::ClampIndirectArgs(vk::CommandBuffer command, const Buffer& s
 	return true;
 }
 
+static std::atomic<RenderContext*> g_debug_context {nullptr};
+
+void ReportSchedulerState() {
+	auto* context = g_debug_context.load();
+	if (context == nullptr) {
+		return;
+	}
+	auto&    scheduler   = context->GetCommandScheduler();
+	size_t   depth       = 0;
+	uint64_t head_tick   = 0;
+	bool     active      = false;
+	uint64_t active_tick = 0;
+	scheduler.ReportPriorityQueue(&depth, &head_tick, &active, &active_tick);
+	LOGF("\t SCHEDULER: current_tick=%" PRIu64 " gpu_tick=%" PRIu64 " priority_depth=%zu head=%" PRIu64
+	     " active=%d active_tick=%" PRIu64 " work_since_submit=%u\n",
+	     scheduler.CurrentTick(), scheduler.KnownGpuTick(), depth, head_tick, active ? 1 : 0,
+	     active_tick, scheduler.WorkSinceSubmit());
+}
+
 void RenderContext::InitializeGpu(VideoOut::VideoOutDriver* video_out) {
+	g_debug_context.store(this);
 	EXIT_IF(m_gpu != nullptr);
 	m_video_out = video_out;
 	m_gpu       = std::make_unique<GuestGpu>(*this);

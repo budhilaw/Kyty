@@ -31,6 +31,8 @@ namespace Libs::Graphics {
 class GuestGpu;
 
 void PrintRecentShaders();
+// Logs the command scheduler's submit and priority-operation state for hang reports.
+void ReportSchedulerState();
 
 class RenderContext {
 public:

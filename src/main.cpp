@@ -447,6 +447,7 @@ static void StartSpinWatchdog() {
 					     rip >= base ? rip - base : 0);
 					LOGF("\t GPU THREAD STACK:%s\n", stack.c_str());
 					Libs::Graphics::PrintRecentShaders();
+					Libs::Graphics::ReportSchedulerState();
 				}
 			}
 			auto snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);

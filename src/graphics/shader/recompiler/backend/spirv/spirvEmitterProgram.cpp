@@ -98,11 +98,11 @@ void EmitReturn(ValueEmitContext& ctx) {
 	ctx.state.builder.AddFunction(spv::OpReturn);
 }
 
-// The runaway-loop cap is limited to compute shaders; KYTY_LOOP_CAP=0 disables it.
+// Experimental runaway-loop cap for compute shaders; off unless KYTY_LOOP_CAP=1.
 static bool LoopCapEnabled(const EmitterState& state) {
 	static const bool enabled = [] {
 		const char* text = std::getenv("KYTY_LOOP_CAP");
-		return text == nullptr || std::strtoul(text, nullptr, 0) != 0;
+		return text != nullptr && std::strtoul(text, nullptr, 0) != 0;
 	}();
 	return enabled && state.program.stage == ShaderType::Compute;
 }
