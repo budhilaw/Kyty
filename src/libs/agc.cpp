@@ -274,9 +274,37 @@ struct CommandBuffer {
 		return available - reserved_dw;
 	}
 
+	// The last command writes on this thread, printed when a buffer overflows: the game treats
+	// overflow as fatal, so the writer that emits more than the native library must be found.
+	struct WriteRecord {
+		const void* writer;
+		uint32_t    size_dw;
+		uint64_t    cursor_up;
+		uint64_t    cursor_down;
+	};
+	static inline thread_local WriteRecord s_recent_writes[32] {};
+	static inline thread_local uint32_t    s_recent_write_index = 0;
+
+	void DumpRecentWrites(uint32_t num_dw, uint64_t remaining) const {
+		std::printf("COMMAND BUFFER FULL: requested=%" PRIu32 " remaining=%" PRIu64 " reserved=%" PRIu32
+		     " bottom=%p top=%p cursor_up=%p cursor_down=%p\n",
+		     num_dw, remaining, reserved_dw, static_cast<const void*>(bottom),
+		     static_cast<const void*>(top), static_cast<const void*>(cursor_up),
+		     static_cast<const void*>(cursor_down));
+		for (uint32_t i = 0; i < 32; i++) {
+			const auto& r = s_recent_writes[(s_recent_write_index + i) % 32];
+			if (r.writer != nullptr) {
+				std::printf("  write %p size=%" PRIu32 " cursor_up=0x%" PRIx64 " cursor_down=0x%" PRIx64 "\n",
+				     r.writer, r.size_dw, r.cursor_up, r.cursor_down);
+			}
+		}
+		std::fflush(stdout);
+	}
+
 	KYTY_SYSV_ABI bool ReserveDW(uint32_t num_dw) {
 		const uint64_t remaining = GetAvailableSizeDW();
 		if (num_dw > remaining) {
+			DumpRecentWrites(num_dw, remaining);
 			if (callback == nullptr) {
 				LOGF_COLOR(
 				    Log::Color::Red,
@@ -310,6 +338,10 @@ struct CommandBuffer {
 	}
 
 	KYTY_SYSV_ABI uint32_t* AllocateDW(uint32_t size_dw) {
+		s_recent_writes[s_recent_write_index % 32] = {
+		    __builtin_return_address(0), size_dw, reinterpret_cast<uint64_t>(cursor_up),
+		    reinterpret_cast<uint64_t>(cursor_down)};
+		s_recent_write_index++;
 		if (size_dw == 0 || !ReserveDW(size_dw)) {
 			LOGF_COLOR(Log::Color::Red,
 			           "\t command buffer AllocateDW failed: size_dw = %" PRIu32 "\n", size_dw);
