@@ -26,7 +26,7 @@ FaultManager::FaultManager(GraphicContext& graphics, CommandScheduler& scheduler
                            BufferCache& buffer_cache)
     : m_graphics(graphics), m_scheduler(scheduler), m_buffer_cache(buffer_cache),
       m_fault_buffer(graphics, scheduler, MemoryUsage::DeviceLocal, 0, AllFlags,
-                     BufferCache::CACHING_NUMPAGES / 8),
+                     BufferCache::CACHING_NUMPAGES / 8 * 2),
       m_download_buffer(graphics, scheduler, MemoryUsage::Download, 0, AllFlags,
                         MaxPendingFaults * PageFaultAreaSize) {
 	SetVulkanObjectNameF(m_graphics.device, m_fault_buffer.Handle(), "Fault Buffer");
@@ -121,7 +121,7 @@ void FaultManager::ProcessFaultBuffer() {
 	command.bindPipeline(vk::PipelineBindPoint::eCompute, m_fault_process_pipeline);
 	command.pushDescriptorSetKHR(vk::PipelineBindPoint::eCompute,
 	                             m_fault_process_pipeline_layout, 0, writes);
-	const auto num_threads    = BufferCache::CACHING_NUMPAGES / 32;
+	const auto num_threads    = BufferCache::CACHING_NUMPAGES / 32 * 2;
 	const auto num_workgroups = (num_threads + 63) / 64;
 	command.dispatch(static_cast<uint32_t>(num_workgroups), 1, 1);
 	dependency.pBufferMemoryBarriers = &post_barrier;
@@ -131,15 +131,24 @@ void FaultManager::ProcessFaultBuffer() {
 	m_scheduler.DeferOperation([this, mapped, offset, area] {
 		m_download_buffer.Invalidate(offset, PageFaultAreaSize);
 		RangeSet    fault_ranges;
+		RangeSet    written_ranges;
 		const auto* faults = std::bit_cast<const uint64_t*>(mapped);
 		const auto  count  = static_cast<uint32_t>(faults[0]);
 		for (uint32_t index = 1; index <= count; ++index) {
+			if ((faults[index] & 1u) != 0) {
+				written_ranges.Add(faults[index] & ~uint64_t {1}, BufferCache::CACHING_PAGESIZE);
+				continue;
+			}
 			fault_ranges.Add(faults[index], BufferCache::CACHING_PAGESIZE);
 			LOGF("Accessed non-GPU cached memory at 0x%016" PRIx64 "\n", faults[index]);
 		}
 		fault_ranges.ForEach([this](uint64_t start, uint64_t end) {
 			EXIT_IF(end - start > std::numeric_limits<uint32_t>::max());
 			(void)m_buffer_cache.FindBuffer(start, end - start);
+		});
+		// Pages a shader wrote through a device address are owned by the GPU from now on.
+		written_ranges.ForEach([this](uint64_t start, uint64_t end) {
+			(void)m_buffer_cache.ObtainBuffer(start, end - start, true);
 		});
 		m_fault_areas[area] = 0;
 	});

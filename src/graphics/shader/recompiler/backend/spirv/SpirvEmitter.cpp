@@ -202,8 +202,9 @@ Emitter::SpirvRequirements Emitter::AnalyzeProgramRequirements(const IR::Program
 						Fail(program, "scratch operation has no per-thread storage");
 					}
 					requirements.function_scratch = true;
-				} else if (address_access == IR::AddressAccess::Write) {
-					Fail(program, "writable FLAT/GLOBAL addresses require GPU ownership tracking");
+				} else if (address_access == IR::AddressAccess::Write &&
+				           IR::AddressOpcodeInfoOf(inst.GetOpcode()).data_bits != 32u) {
+					Fail(program, "writable FLAT/GLOBAL addresses narrower than 32 bits");
 				}
 			}
 			if (IR::BufferAccessOf(inst.GetOpcode()) != IR::BufferAccess::None) {

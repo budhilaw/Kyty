@@ -526,6 +526,91 @@ private:
 		}
 	}
 
+	// A raw buffer access whose descriptor the host cannot evaluate, because the shader picks
+	// it from a table by a value it computed itself, becomes a device-address access instead.
+	bool TryLowerBufferToAddress(Inst& inst, MemoryFlags flags) {
+		auto* handle = inst.Arg(0).Resolve().TryInstruction();
+		if (handle == nullptr || handle->GetOpcode() != ValueOpcode::GetBufferResource ||
+		    handle->NumArgs() != 4u) {
+			return false;
+		}
+		DescriptorSource descriptor;
+		MakeSource(*handle, 4u, false, false, descriptor, flags.pc);
+		uint32_t bad_dword = 0;
+		if (ValidateSource(descriptor, bad_dword)) {
+			return false;
+		}
+		const auto  op    = inst.GetOpcode();
+		ValueOpcode lowered;
+		bool        store = false;
+		switch (op) {
+			case ValueOpcode::LoadBufferU8: lowered = ValueOpcode::LoadAddressU8; break;
+			case ValueOpcode::LoadBufferU16: lowered = ValueOpcode::LoadAddressU16; break;
+			case ValueOpcode::LoadBufferU32: lowered = ValueOpcode::LoadAddressU32; break;
+			case ValueOpcode::StoreBufferU8:
+				lowered = ValueOpcode::StoreAddressU8;
+				store   = true;
+				break;
+			case ValueOpcode::StoreBufferU16:
+				lowered = ValueOpcode::StoreAddressU16;
+				store   = true;
+				break;
+			case ValueOpcode::StoreBufferU32:
+				lowered = ValueOpcode::StoreAddressU32;
+				store   = true;
+				break;
+			default:
+				Fail(flags.pc, fmt::format("{} dword {} is not a valid runtime value and the "
+				                           "operation has no address form",
+				                           ValueOpcodeName(op), bad_dword));
+		}
+		auto& memory = m_program.memory_info[flags.index];
+		if (memory.formatted || memory.typed) {
+			Fail(flags.pc, fmt::format("{} dword {} is not a valid runtime value on a formatted "
+			                           "access",
+			                           ValueOpcodeName(op), bad_dword));
+		}
+		auto* block = inst.Parent();
+		auto  it    = std::find_if(block->begin(), block->end(),
+		                           [&](const Inst& candidate) { return &candidate == &inst; });
+		if (block == nullptr || it == block->end()) {
+			return false;
+		}
+		const auto emit = [&](ValueOpcode opcode, std::initializer_list<Value> args) {
+			return Value(&*block->PrependNewInst(it, opcode, args));
+		};
+		const auto dword0    = handle->Arg(0);
+		const auto dword1    = handle->Arg(1);
+		const auto base_high = emit(ValueOpcode::BitwiseAnd32, {dword1, Value(0xffffu)});
+		const auto index     = inst.Arg(1);
+		const auto offset    = inst.Arg(2);
+		const auto soffset   = inst.Arg(3);
+		const auto data      = store ? inst.Arg(4) : Value {};
+		const auto exec      = inst.Arg(store ? 5u : 4u);
+		Value      low       = emit(ValueOpcode::IAdd32, {offset, soffset});
+		if (memory.idxen) {
+			const auto stride = emit(
+			    ValueOpcode::BitwiseAnd32,
+			    {emit(ValueOpcode::ShiftRightLogical32, {dword1, Value(16u)}), Value(0x3fffu)});
+			low = emit(ValueOpcode::IAdd32, {emit(ValueOpcode::IMul32, {index, stride}), low});
+		}
+		const auto address = emit(ValueOpcode::GetAddressResource, {dword0, base_high});
+		inst.Invalidate();
+		inst.ReplaceOpcode(lowered);
+		inst.SetArg(0, address);
+		inst.SetArg(1, low);
+		inst.SetArg(2, Value(0u));
+		if (store) {
+			inst.SetArg(3, data);
+			inst.SetArg(4, exec);
+		} else {
+			inst.SetArg(3, exec);
+		}
+		memory.kind            = ResourceKind::Global;
+		memory.address_is_full = false;
+		return true;
+	}
+
 	void GetHandle(Value value, ValueOpcode expected, uint32_t width, uint32_t pc, Inst*& handle,
 	               uint32_t& source, bool sampler = false, bool sample_adjust = false) {
 		handle = value.Resolve().TryInstruction();
@@ -720,6 +805,10 @@ private:
 		uint32_t resource = 0;
 
 		if (buffer != BufferAccess::None) {
+			if (TryLowerBufferToAddress(inst, flags)) {
+				m_info.uses_dma = true;
+				return;
+			}
 			GetHandle(inst.Arg(0), ValueOpcode::GetBufferResource, 4, flags.pc, handle, source);
 			resource = AddBuffer(source, memory, op, flags.pc);
 			if (resource == UINT32_MAX) {

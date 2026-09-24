@@ -21,7 +21,8 @@ void main() {
     const uint id = gl_GlobalInvocationID.x;
     uint word = fault_buffer[id];
     fault_buffer[id] = 0u;
-    const uint base_bit = id * 32u;
+    const bool written = id >= FAULT_WORDS;
+    const uint base_bit = (written ? id - FAULT_WORDS : id) * 32u;
     while (word != 0u) {
         const uint store_index = atomicAdd(download_buffer32[0], 1u) + 1u;
         if (store_index >= MAX_PAGE_FAULTS) {
@@ -30,6 +31,6 @@ void main() {
         const uint bit = findLSB(word);
         word &= word - 1;
         const uint page = base_bit + bit;
-        download_buffer[store_index] = uint64_t(page) << CACHING_PAGEBITS;
+        download_buffer[store_index] = (uint64_t(page) << CACHING_PAGEBITS) | (written ? 1ul : 0ul);
     }
 }

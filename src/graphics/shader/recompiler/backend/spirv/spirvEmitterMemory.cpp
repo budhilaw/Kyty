@@ -171,6 +171,22 @@ void RecordBdaFault(EmitterState& state, uint32_t page) {
 	                          Binary(state, spv::OpBitwiseOr, TypeU32(state), value, bit));
 }
 
+void RecordBdaWrite(EmitterState& state, uint32_t page) {
+	// The written half of the fault bitmap starts after the access half.
+	const auto word = Binary(state, spv::OpIAdd, TypeU32(state),
+	                         Binary(state, spv::OpShiftRightLogical, TypeU32(state), page,
+	                                ConstantU32(state, 5)),
+	                         ConstantU32(state, BufferCache::CACHING_NUMPAGES / 32));
+	const auto bit =
+	    Binary(state, spv::OpShiftLeftLogical, TypeU32(state), ConstantU32(state, 1),
+	           Binary(state, spv::OpBitwiseAnd, TypeU32(state), page, ConstantU32(state, 31)));
+	const auto pointer = FaultElementPointer(state, word);
+	const auto value   = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpLoad, TypeU32(state), value, pointer);
+	state.builder.AddFunction(spv::OpStore, pointer,
+	                          Binary(state, spv::OpBitwiseOr, TypeU32(state), value, bit));
+}
+
 uint32_t GetBdaPointer(ValueEmitContext& ctx, uint32_t address) {
 	auto&      state  = ctx.state;
 	const auto result = state.builder.AllocateId();
@@ -231,6 +247,30 @@ uint32_t LoadBda(ValueEmitContext& ctx, const IR::Inst& inst, const IR::MemoryIn
 		return bits == 32u ? merged
 		                   : Binary(state, spv::OpBitwiseAnd, TypeU32(state), merged,
 		                            ConstantU32(state, bits == 8u ? 0xffu : 0xffffu));
+	});
+}
+
+void StoreBda(ValueEmitContext& ctx, const IR::Inst& inst, const IR::MemoryInfo& mem) {
+	auto&      state   = ctx.state;
+	const auto address = GuestAddress(ctx, inst, mem);
+	const auto active  = ctx.Arg(inst, inst.NumArgs() - 1);
+	const auto data    = ctx.Arg(inst, inst.NumArgs() - 2);
+	EmitIfCondition(state, active, [&]() {
+		const auto aligned = Binary(state, spv::OpBitwiseAnd, TypeScalarU64(state), address,
+		                            ConstantDeviceAddress(state, ~uint64_t {3}));
+		const auto page64  = Binary(state, spv::OpShiftRightLogical, TypeScalarU64(state), aligned,
+		                            ConstantDeviceAddress(state, BufferCache::CACHING_PAGEBITS));
+		RecordBdaWrite(state, Unary(state, spv::OpUConvert, TypeU32(state), page64));
+		const auto bda     = GetBdaPointer(ctx, aligned);
+		const auto present = Binary(state, spv::OpINotEqual, TypeBool(state), bda,
+		                            ConstantDeviceAddress(state, 0));
+		EmitIfCondition(state, present, [&]() {
+			const auto pointer = state.builder.AllocateId();
+			state.builder.AddFunction(spv::OpConvertUToPtr, TypePhysicalU32Pointer(state), pointer,
+			                          bda);
+			state.builder.AddFunction(spv::OpStore, pointer, data, spv::MemoryAccessAlignedMask,
+			                          static_cast<uint32_t>(sizeof(uint32_t)));
+		});
 	});
 }
 
@@ -1110,6 +1150,9 @@ void EmitStoreMemory(ValueEmitContext& ctx, const IR::Inst& inst) {
 		StoreWideBuffer(ctx, inst, buffer_components);
 	else if (shared_components > 1u)
 		StoreWideShared(ctx, inst, shared_components);
+	else if (IR::AddressOpcodeInfoOf(op).access == IR::AddressAccess::Write &&
+	         mem.kind != IR::ResourceKind::Scratch)
+		StoreBda(ctx, inst, mem);
 	else if (op == IR::ValueOpcode::StoreBufferU32 && mem.formatted)
 		FormattedStore(ctx, inst, mem);
 	else if (type == IR::Type::U8)
