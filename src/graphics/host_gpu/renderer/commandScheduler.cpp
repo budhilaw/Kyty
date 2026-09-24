@@ -7,6 +7,16 @@
 
 #include <algorithm>
 #include <cstdio>
+#ifdef _WIN32
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#include <windows.h>
+#endif
+#include <cstdio>
 #include <cstdlib>
 #include <optional>
 
@@ -373,6 +383,23 @@ bool CommandScheduler::IsFree(uint64_t tick) {
 }
 
 void CommandScheduler::CheckActive() const {
+	if (!Active()) {
+#ifdef _WIN32
+		// Names the caller before the fatal exit, which prints no backtrace of its own.
+		void*      frames[24] {};
+		const auto captured = RtlCaptureStackBackTrace(0, 24, frames, nullptr);
+		const auto base     = reinterpret_cast<uint64_t>(GetModuleHandleA(nullptr));
+		std::printf("INACTIVE scheduler stack:");
+		for (unsigned f = 0; f < captured; f++) {
+			const auto address = reinterpret_cast<uint64_t>(frames[f]);
+			if (address >= base && address - base < 0x4000000ull) {
+				std::printf(" %llx", static_cast<unsigned long long>(address - base));
+			}
+		}
+		std::printf("\n");
+		std::fflush(stdout);
+#endif
+	}
 	EXIT_IF(!Active());
 }
 

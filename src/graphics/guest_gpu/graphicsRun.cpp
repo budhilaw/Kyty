@@ -969,6 +969,11 @@ void GuestGpu::ThreadRun(void* data) {
 
 		if (command) {
 			EXIT_IF(g_current_processor != nullptr);
+			// A readback may create buffers, which records commands; bind a context when idle.
+			auto& scheduler = gpu->m_renderer.GetCommandScheduler();
+			if (!scheduler.Active() && gpu->m_gfx_cp != nullptr) {
+				scheduler.Begin(gpu->m_gfx_cp->GetCtx(), gpu->m_gfx_cp->GetUcfg(), gpu->m_gfx_cp->GetShCtx());
+			}
 			command();
 
 			Common::LockGuard lock(gpu->m_queue_mutex);
