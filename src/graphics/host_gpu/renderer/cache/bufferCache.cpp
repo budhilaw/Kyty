@@ -23,6 +23,14 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#include <windows.h>
 #include <memory>
 #include <utility>
 #include <vector>
@@ -61,7 +69,14 @@ void ReadGuestForUpload(uint64_t address, uint8_t* target, uint64_t size) {
 		const auto chunk = std::min<uint64_t>(size - done, Page - ((address + done) & (Page - 1u)));
 		if (!BackingCopies() ||
 		    !Libs::LibKernel::Memory::TryReadBacking(address + done, target + done, chunk)) {
-			std::memcpy(target + done, reinterpret_cast<const void*>(address + done), chunk);
+			// The game may unmap a range a buffer still covers; its bytes upload as zeros.
+			MEMORY_BASIC_INFORMATION info {};
+			if (VirtualQuery(reinterpret_cast<const void*>(address + done), &info, sizeof(info)) == 0 ||
+			    info.State != MEM_COMMIT) {
+				std::memset(target + done, 0, chunk);
+			} else {
+				std::memcpy(target + done, reinterpret_cast<const void*>(address + done), chunk);
+			}
 		}
 		done += chunk;
 	}

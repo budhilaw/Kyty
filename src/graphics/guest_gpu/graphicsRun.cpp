@@ -678,6 +678,20 @@ bool LabelTraceEnabled() {
 	return enabled;
 }
 
+// Indirect arguments can come from a damaged packet; reading them must not fault the emulator.
+static bool GuestRangeCommitted(const void* address, size_t size) {
+	auto*       cursor = static_cast<const uint8_t*>(address);
+	const auto* end    = cursor + size;
+	while (cursor < end) {
+		MEMORY_BASIC_INFORMATION info {};
+		if (VirtualQuery(cursor, &info, sizeof(info)) == 0 || info.State != MEM_COMMIT) {
+			return false;
+		}
+		cursor = static_cast<const uint8_t*>(info.BaseAddress) + info.RegionSize;
+	}
+	return true;
+}
+
 template <typename T>
 void CommandProcessor::WaitRegMem(uint32_t func, const T* addr, T ref, T mask, uint32_t poll,
                                   uint32_t wait_op) {
@@ -1766,6 +1780,10 @@ void CommandProcessor::DrawIndirect(uint32_t data_offset, uint32_t draw_initiato
 		DrawIndirectArgs args {};
 		if (!Libs::LibKernel::Memory::TryReadGpuCleanBacking(reinterpret_cast<uint64_t>(args_addr),
 	                                                     &args, sizeof(args))) {
+		if (!GuestRangeCommitted(args_addr, sizeof(args))) {
+			LOGF("\t warning: indirect args at %p are not mapped, draw skipped\n", args_addr);
+			return;
+		}
 		std::memcpy(&args, args_addr, sizeof(args));
 	}
 		if (args.instance_count != 1u || args.start_vertex_location != 0u ||
@@ -1791,6 +1809,10 @@ void CommandProcessor::DrawIndirect(uint32_t data_offset, uint32_t draw_initiato
 	DrawIndexedIndirectArgs args {};
 	if (!Libs::LibKernel::Memory::TryReadGpuCleanBacking(reinterpret_cast<uint64_t>(args_addr),
 	                                                     &args, sizeof(args))) {
+		if (!GuestRangeCommitted(args_addr, sizeof(args))) {
+			LOGF("\t warning: indirect args at %p are not mapped, draw skipped\n", args_addr);
+			return;
+		}
 		std::memcpy(&args, args_addr, sizeof(args));
 	}
 	if (args.base_vertex_location != 0u || args.start_instance_location != 0u) {
@@ -1994,6 +2016,10 @@ void CommandProcessor::DispatchIndirect(uint64_t args_addr, uint32_t mode) {
 		return;
 	}
 
+	if (!GuestRangeCommitted(reinterpret_cast<const void*>(args_addr), sizeof(args))) {
+		LOGF("\t warning: dispatch indirect args at 0x%016" PRIx64 " are not mapped, dispatch skipped\n", args_addr);
+		return;
+	}
 	std::memcpy(&args, reinterpret_cast<const void*>(args_addr), sizeof(args));
 	DispatchDirect(args.thread_group_x, args.thread_group_y, args.thread_group_z, mode);
 }

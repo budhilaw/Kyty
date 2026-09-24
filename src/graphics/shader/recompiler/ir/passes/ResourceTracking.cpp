@@ -798,8 +798,16 @@ private:
 				                           ValueOpcodeName(op), bad_dword));
 		}
 		auto& memory = m_program.memory_info[flags.index];
-		if (memory.formatted && !memory.typed && memory.data_dwords == 1u &&
-		    (op == ValueOpcode::LoadBufferU32 || op == ValueOpcode::StoreBufferU32)) {
+		{
+			static std::atomic<uint32_t> lower_log_count {0};
+			if (lower_log_count.fetch_add(1) < 256) {
+				LOGF("LOWERED buffer to address: hash=0x%016" PRIx64 " pc=0x%08" PRIx32 " %s\n",
+				     m_program.shader_hash, flags.pc, ValueOpcodeName(op));
+			}
+		}
+		const bool runtime_format = memory.formatted && !memory.typed && memory.data_dwords == 1u &&
+		                            (op == ValueOpcode::LoadBufferU32 || op == ValueOpcode::StoreBufferU32);
+		if (runtime_format) {
 			// The format lives in a descriptor the shader reads at runtime. A one-component
 			// access is treated as a raw dword; games use this shape to copy elements between
 			// buffers of one format, where no conversion happens either way.
@@ -844,15 +852,51 @@ private:
 		const auto offset    = inst.Arg(2);
 		const auto soffset   = inst.Arg(3);
 		const auto data      = store ? inst.Arg(4) : Value {};
-		const auto exec      = inst.Arg(store ? 5u : 4u);
+		Value      exec      = inst.Arg(store ? 5u : 4u);
 		Value      low       = emit(ValueOpcode::IAdd32, {offset, soffset});
+		const auto stride    = emit(
+            ValueOpcode::BitwiseAnd32,
+            {emit(ValueOpcode::ShiftRightLogical32, {dword1, Value(16u)}), Value(0x3fffu)});
+		const auto num_records = handle->Arg(2);
+		Value      in_bounds;
 		if (memory.idxen) {
-			const auto stride = emit(
-			    ValueOpcode::BitwiseAnd32,
-			    {emit(ValueOpcode::ShiftRightLogical32, {dword1, Value(16u)}), Value(0x3fffu)});
-			low = emit(ValueOpcode::IAdd32, {emit(ValueOpcode::IMul32, {index, stride}), low});
+			low       = emit(ValueOpcode::IAdd32, {emit(ValueOpcode::IMul32, {index, stride}), low});
+			in_bounds = emit(ValueOpcode::ULessThan32, {index, num_records});
+		} else {
+			const auto limit =
+			    emit(ValueOpcode::SelectU32, {emit(ValueOpcode::IEqual32, {stride, Value(0u)}),
+			                                  num_records,
+			                                  emit(ValueOpcode::IMul32, {num_records, stride})});
+			in_bounds = emit(ValueOpcode::ULessThan32, {low, limit});
+		}
+		// The hardware checks buffer accesses against num_records: out-of-range stores are
+		// dropped and loads return zero. Games disable writes with a zero-sized descriptor.
+		exec = emit(ValueOpcode::LogicalAnd, {exec, in_bounds});
+		// Diagnostic: KYTY_NO_LOWERED_STORE=1 drops stores through runtime buffer descriptors.
+		static const bool no_lowered_store = std::getenv("KYTY_NO_LOWERED_STORE") != nullptr;
+		if (store && no_lowered_store) {
+			exec = emit(ValueOpcode::LogicalAnd, {exec, emit(ValueOpcode::IEqual32, {stride, Value(0x7fffffffu)})});
 		}
 		const auto address = emit(ValueOpcode::GetAddressResource, {dword0, base_high});
+		if (store && runtime_format && memory.idxen) {
+			// An element of an 8- or 16-bit format is narrower than the dword the copy moves;
+			// storing a whole dword would overwrite the following elements and, for the last
+			// one, memory past the buffer. Such elements store only their own bytes.
+			const auto is8   = emit(ValueOpcode::IEqual32, {stride, Value(1u)});
+			const auto is16  = emit(ValueOpcode::IEqual32, {stride, Value(2u)});
+			const auto flags_raw = inst.Flags<uint64_t>();
+			block->PrependNewInst(it, ValueOpcode::StoreAddressU8,
+			                      {address, low, Value(0u), emit(ValueOpcode::ConvertU8U32, {data}),
+			                       emit(ValueOpcode::LogicalAnd, {exec, is8})},
+			                      flags_raw);
+			block->PrependNewInst(it, ValueOpcode::StoreAddressU16,
+			                      {address, low, Value(0u), emit(ValueOpcode::ConvertU16U32, {data}),
+			                       emit(ValueOpcode::LogicalAnd, {exec, is16})},
+			                      flags_raw);
+			exec = emit(ValueOpcode::LogicalAnd,
+			            {exec, emit(ValueOpcode::LogicalNot,
+			                        {emit(ValueOpcode::LogicalOr, {is8, is16})})});
+		}
 		inst.Invalidate();
 		inst.ReplaceOpcode(lowered);
 		inst.SetArg(0, address);

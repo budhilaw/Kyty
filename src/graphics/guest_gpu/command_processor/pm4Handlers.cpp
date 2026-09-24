@@ -2105,9 +2105,14 @@ KYTY_CP_OP_PARSER(CpOpIndirectCxRegs) {
 				LogPs5OnlyRegister("CX", raw_cmd_offset, value);
 				continue;
 			}
-			EXIT("unknown cx reg at %05" PRIx32 ": 0x%" PRIx32 " (raw 0x%" PRIx32
-			     "), value = 0x%08" PRIx32 "\n",
-			     num_dw - dw, cmd_offset, raw_cmd_offset, value);
+			// An unmodeled context register is skipped; a stray write must not stop the emulator.
+			static std::atomic<uint32_t> cx_log_count {0};
+			if (cx_log_count.fetch_add(1) < 64) {
+				LOGF("skipped unknown cx reg at %05" PRIx32 ": 0x%" PRIx32 " (raw 0x%" PRIx32
+				     "), value = 0x%08" PRIx32 "\n",
+				     num_dw - dw, cmd_offset, raw_cmd_offset, value);
+			}
+			continue;
 		}
 
 		pfunc(cp, cmd_offset, value);
@@ -2175,7 +2180,7 @@ KYTY_CP_OP_PARSER(CpOpIndirectShRegs) {
 				LOGF("\t sh_indirect[%" PRIu32 "] offset=0x%08" PRIx32 ", value=0x%08" PRIx32 "\n",
 				     j, dump_regs[j * 2], dump_regs[j * 2 + 1]);
 			}
-			EXIT("unknown sh reg at %05" PRIx32 ": 0x%" PRIx32 "\n", num_dw - dw, cmd_offset);
+			continue;
 		}
 
 		pfunc(cp, cmd_offset, value);

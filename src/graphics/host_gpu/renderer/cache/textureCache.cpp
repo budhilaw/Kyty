@@ -1287,7 +1287,10 @@ void TextureCache::MaterializeDccClear(ImageId id, const ImageDesc& desc,
 	constexpr uint64_t MetadataBlockSize = 0x1000;
 	if (!range.Valid() || range.address % MetadataBlockSize != 0 || layers == 0 ||
 	    range.size % layers != 0 || (range.size / layers) % MetadataBlockSize != 0) {
-		EXIT("TextureCache: DCC slices must contain aligned 4 KiB blocks\n");
+		// Metadata this shape is not a native one-mip DCC layout; the clear stays unmaterialized.
+		LOGF("TextureCache: DCC clear skipped, metadata 0x%016" PRIx64 "+0x%" PRIx64 " over %u layers is not 4 KiB blocks\n",
+		     range.address, range.size, layers);
+		return;
 	}
 	const auto& view           = desc.view_info;
 	const bool  volume_texture = desc.info.IsVolume() && view.type == vk::ImageViewType::e3D;
@@ -1295,7 +1298,8 @@ void TextureCache::MaterializeDccClear(ImageId id, const ImageDesc& desc,
 	const auto  image_first    = volume_texture ? 0u : view.base_layer;
 	const auto  count          = volume_texture ? desc.info.extent.depth : view.layer_count;
 	if (first >= layers || count > layers - first) {
-		EXIT("TextureCache: DCC view exceeds its native metadata slices\n");
+		LOGF("TextureCache: DCC clear skipped, view exceeds its native metadata slices\n");
+		return;
 	}
 	// Finish native metadata writes before reading backing bytes. This can submit the scheduler,
 	// so discovery runs before final draw uploads and never holds the texture lock across it.

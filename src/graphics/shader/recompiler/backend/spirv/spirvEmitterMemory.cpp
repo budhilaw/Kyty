@@ -1,3 +1,5 @@
+#include <set>
+#include <mutex>
 #include "graphics/shader/recompiler/backend/spirv/spirvEmitterInstructions.h"
 
 #include "graphics/host_gpu/renderer/cache/bufferCache.h"
@@ -258,31 +260,110 @@ uint32_t LoadBda(ValueEmitContext& ctx, uint32_t address, uint32_t active, uint3
 	});
 }
 
+// Replaces the bits of mask in the dword at aligned with value; lanes storing other bytes of
+// the same dword run concurrently, so the update is two atomics rather than a plain store.
+void StoreBdaDwordBits(ValueEmitContext& ctx, uint32_t aligned, uint32_t value, uint32_t mask) {
+	auto& state = ctx.state;
+	const auto page64 = Binary(state, spv::OpShiftRightLogical, TypeScalarU64(state), aligned,
+	                           ConstantDeviceAddress(state, BufferCache::CACHING_PAGEBITS));
+	RecordBdaWrite(state, Unary(state, spv::OpUConvert, TypeU32(state), page64));
+	const auto bda     = GetBdaPointer(ctx, aligned);
+	const auto present =
+	    Binary(state, spv::OpINotEqual, TypeBool(state), bda, ConstantDeviceAddress(state, 0));
+	EmitIfCondition(state, present, [&]() {
+		const auto pointer = state.builder.AllocateId();
+		state.builder.AddFunction(spv::OpConvertUToPtr, TypePhysicalU32Pointer(state), pointer, bda);
+		const auto keep = Unary(state, spv::OpNot, TypeU32(state), mask);
+		const auto cleared = state.builder.AllocateId();
+		state.builder.AddFunction(spv::OpAtomicAnd, TypeU32(state), cleared, pointer,
+		                          ConstantU32(state, spv::ScopeDevice),
+		                          ConstantU32(state, spv::MemorySemanticsMaskNone), keep);
+		const auto merged = state.builder.AllocateId();
+		state.builder.AddFunction(spv::OpAtomicOr, TypeU32(state), merged, pointer,
+		                          ConstantU32(state, spv::ScopeDevice),
+		                          ConstantU32(state, spv::MemorySemanticsMaskNone), value);
+	});
+}
+
 void StoreBda(ValueEmitContext& ctx, const IR::Inst& inst, const IR::MemoryInfo& mem) {
-	// Diagnostic: KYTY_NO_BDA_STORE=1 drops raw-pointer stores.
-	static const bool no_store = std::getenv("KYTY_NO_BDA_STORE") != nullptr;
-	if (no_store) {
-		return;
+	// Diagnostic: KYTY_NO_BDA_STORE=1 drops raw-pointer stores; a list of hex hashes drops
+	// them in those shaders only, and a list starting with '~' in every other shader.
+	static const std::string no_store = [] {
+		const char* text = std::getenv("KYTY_NO_BDA_STORE");
+		return std::string(text != nullptr ? text : "");
+	}();
+	auto&      state = ctx.state;
+	{
+		const auto hash   = fmt::format("{:016x}", state.program.shader_hash);
+		const bool listed = no_store.find(hash) != std::string::npos;
+		static std::mutex              seen_mutex;
+		static std::set<uint64_t>      seen;
+		{
+			std::lock_guard lock(seen_mutex);
+			if (seen.insert(state.program.shader_hash).second) {
+				LOGF("BDASTORE shader=%s\n", hash.c_str());
+			}
+		}
+		if (no_store == "1" || (!no_store.empty() && (no_store[0] == '~' ? !listed : listed))) {
+			return;
+		}
 	}
-	auto&      state   = ctx.state;
 	const auto address = GuestAddress(ctx, inst, mem);
 	const auto active  = ctx.Arg(inst, inst.NumArgs() - 1);
 	const auto data    = ctx.Arg(inst, inst.NumArgs() - 2);
+	auto       bits    = IR::AddressOpcodeInfoOf(inst.GetOpcode()).data_bits;
+	if (bits == 0u || bits > 32u) {
+		bits = 32u;
+	}
 	EmitIfCondition(state, active, [&]() {
 		const auto aligned = Binary(state, spv::OpBitwiseAnd, TypeScalarU64(state), address,
 		                            ConstantDeviceAddress(state, ~uint64_t {3}));
-		const auto page64  = Binary(state, spv::OpShiftRightLogical, TypeScalarU64(state), aligned,
-		                            ConstantDeviceAddress(state, BufferCache::CACHING_PAGEBITS));
-		RecordBdaWrite(state, Unary(state, spv::OpUConvert, TypeU32(state), page64));
-		const auto bda     = GetBdaPointer(ctx, aligned);
-		const auto present = Binary(state, spv::OpINotEqual, TypeBool(state), bda,
-		                            ConstantDeviceAddress(state, 0));
-		EmitIfCondition(state, present, [&]() {
-			const auto pointer = state.builder.AllocateId();
-			state.builder.AddFunction(spv::OpConvertUToPtr, TypePhysicalU32Pointer(state), pointer,
-			                          bda);
-			state.builder.AddFunction(spv::OpStore, pointer, data, spv::MemoryAccessAlignedMask,
-			                          static_cast<uint32_t>(sizeof(uint32_t)));
+		const auto byte =
+		    Binary(state, spv::OpBitwiseAnd, TypeU32(state),
+		           Unary(state, spv::OpUConvert, TypeU32(state), address), ConstantU32(state, 3));
+		const auto whole = bits == 32u ? Binary(state, spv::OpIEqual, TypeBool(state), byte,
+		                                        ConstantU32(state, 0))
+		                               : ConstantBool(state, false);
+		EmitIfCondition(state, whole, [&]() {
+			const auto page64 =
+			    Binary(state, spv::OpShiftRightLogical, TypeScalarU64(state), aligned,
+			           ConstantDeviceAddress(state, BufferCache::CACHING_PAGEBITS));
+			RecordBdaWrite(state, Unary(state, spv::OpUConvert, TypeU32(state), page64));
+			const auto bda     = GetBdaPointer(ctx, aligned);
+			const auto present = Binary(state, spv::OpINotEqual, TypeBool(state), bda,
+			                            ConstantDeviceAddress(state, 0));
+			EmitIfCondition(state, present, [&]() {
+				const auto pointer = state.builder.AllocateId();
+				state.builder.AddFunction(spv::OpConvertUToPtr, TypePhysicalU32Pointer(state),
+				                          pointer, bda);
+				state.builder.AddFunction(spv::OpStore, pointer, data, spv::MemoryAccessAlignedMask,
+				                          static_cast<uint32_t>(sizeof(uint32_t)));
+			});
+		});
+		// Subword and unaligned stores touch only their own bytes, which may span two dwords.
+		const auto partial = Unary(state, spv::OpLogicalNot, TypeBool(state), whole);
+		EmitIfCondition(state, partial, [&]() {
+			const auto full_mask = ConstantU32(state, bits == 32u ? 0xffffffffu : (1u << bits) - 1u);
+			const auto value = Binary(state, spv::OpBitwiseAnd, TypeU32(state), data, full_mask);
+			const auto shift =
+			    Binary(state, spv::OpShiftLeftLogical, TypeU32(state), byte, ConstantU32(state, 3));
+			StoreBdaDwordBits(ctx, aligned,
+			                  Binary(state, spv::OpShiftLeftLogical, TypeU32(state), value, shift),
+			                  Binary(state, spv::OpShiftLeftLogical, TypeU32(state), full_mask, shift));
+			const auto crosses =
+			    Binary(state, spv::OpUGreaterThan, TypeBool(state),
+			           Binary(state, spv::OpIAdd, TypeU32(state), shift, ConstantU32(state, bits)),
+			           ConstantU32(state, 32));
+			EmitIfCondition(state, crosses, [&]() {
+				const auto upper =
+				    Binary(state, spv::OpISub, TypeU32(state), ConstantU32(state, 32), shift);
+				StoreBdaDwordBits(
+				    ctx,
+				    Binary(state, spv::OpIAdd, TypeScalarU64(state), aligned,
+				           ConstantDeviceAddress(state, sizeof(uint32_t))),
+				    Binary(state, spv::OpShiftRightLogical, TypeU32(state), value, upper),
+				    Binary(state, spv::OpShiftRightLogical, TypeU32(state), full_mask, upper));
+			});
 		});
 	});
 }
@@ -424,8 +505,8 @@ FormattedSource ResolveFormattedSource(ValueEmitContext& ctx, const IR::MemoryIn
 	                                output_component);
 	const auto source = Format::ResolveFormattedSource(info, selector);
 	if (source.kind == FormattedSourceKind::Invalid) {
-		ExitDescriptorBindingFailure(ctx.state, IR::DescriptorBindingKind::Buffers, mem.resource,
-		                             "buffer descriptor has reserved dst_sel");
+		// A reserved selector reads as zero, like the hardware's unused components.
+		return FormattedSource {};
 	}
 	return source;
 }
