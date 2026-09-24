@@ -15,6 +15,7 @@
 #include "graphics/host_gpu/renderer/pipeline/pipelineCache.h"
 #include "kernel/eventQueue.h"
 
+#include <array>
 #include <chrono>
 #include <unordered_map>
 #include <memory>
@@ -64,7 +65,15 @@ public:
 	// KYTY_GPU_TIMING=1: a timestamp after every draw and dispatch, aggregated per shader and
 	// printed once a second, so GPU time can be attributed to passes.
 	void GpuTimerBegin(vk::CommandBuffer command);
-	void GpuTimerMark(vk::CommandBuffer command, uint64_t label, uint8_t kind);
+	void GpuTimerMark(vk::CommandBuffer command, uint64_t label, uint8_t kind, uint64_t detail = 0);
+	// Copies an indirect dispatch's argument triple to host memory so the report can show it.
+	void GpuTimerCaptureArgs(vk::CommandBuffer command, vk::Buffer args, uint64_t offset,
+	                         uint64_t vaddr);
+	bool GpuTimerActive() const { return m_timer_enabled && m_timer_current >= 0; }
+	// Rewrites an indirect dispatch's argument triple into a scratch buffer with each count
+	// clamped to the device limit. Returns false when the source has no device address.
+	bool ClampIndirectArgs(vk::CommandBuffer command, const Buffer& source, uint64_t offset,
+	                       vk::Buffer& out_buffer, uint64_t& out_offset);
 	void GpuTimerReport();
 
 	void AddInterruptEq(LibKernel::EventQueue::KernelEqueue eq, int event_id);
@@ -98,8 +107,10 @@ private:
 
 	struct GpuTimerEntry {
 		uint32_t query = 0;
-		uint64_t label = 0;
-		uint8_t  kind  = 0;
+		uint64_t label  = 0;
+		uint64_t detail = 0;
+		uint64_t vaddr  = 0;
+		uint8_t  kind   = 0;
 	};
 	struct GpuTimerBlock {
 		uint32_t                   first  = 0;
@@ -111,7 +122,12 @@ private:
 	struct GpuTimerStat {
 		double   ms    = 0.0;
 		uint64_t count = 0;
-		uint8_t  kind  = 0;
+		uint64_t detail = 0; // groups of the slowest dispatch (x | y << 20 | z << 40)
+		uint32_t raw_x  = 0; // unmasked x group count of an indirect dispatch
+		uint64_t args_vaddr = 0;
+		std::array<uint32_t, 8> around {}; // GPU memory from args-8 to args+24
+		double   max_ms = 0.0;
+		uint8_t  kind   = 0;
 	};
 	static constexpr uint32_t GpuTimerBlockQueries = 512;
 	static constexpr uint32_t GpuTimerBlockCount   = 64;
@@ -119,6 +135,13 @@ private:
 	bool                      m_timer_initialized  = false;
 	vk::QueryPool             m_timer_pool         = nullptr;
 	std::vector<GpuTimerBlock> m_timer_blocks;
+	std::unique_ptr<Buffer>    m_timer_args;
+	vk::PipelineLayout         m_clamp_layout   = nullptr;
+	vk::Pipeline               m_clamp_pipeline = nullptr;
+	std::unique_ptr<Buffer>    m_clamp_scratch;
+	uint32_t                   m_clamp_slot        = 0;
+	bool                       m_clamp_initialized = false;
+	uint64_t                   m_timer_pending_vaddr = 0;
 	int                        m_timer_current = -1;
 	std::unordered_map<uint64_t, GpuTimerStat> m_timer_stats;
 	double                                     m_timer_kind_ms[3] {};

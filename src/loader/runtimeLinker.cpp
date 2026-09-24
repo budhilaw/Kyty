@@ -797,9 +797,28 @@ static bool KytyExceptionHandler(const Common::HostException::ExceptionInfo& exc
 			case CoreAccess::Execute: access = GpuAccess::Execute; break;
 			case CoreAccess::Unknown: return false;
 		}
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+		{
+			// A page the host never reserved cannot be brought back by the GPU tracker; retrying
+			// would spin forever. Report it as the guest fault it is.
+			MEMORY_BASIC_INFORMATION mbi {};
+			if (VirtualQuery(reinterpret_cast<void*>(info->access_violation_vaddr), &mbi,
+			                 sizeof(mbi)) != 0 &&
+			    mbi.State == MEM_FREE) {
+				std::printf("guest access to unreserved host page: addr=0x%016" PRIx64
+				            " access=%d rip=0x%016" PRIx64 "\n",
+				            info->access_violation_vaddr, static_cast<int>(access), info->exception_address);
+				std::fflush(stdout);
+			} else if (Libs::LibKernel::Memory::HandleGpuFault(access,
+			                                                    info->access_violation_vaddr)) {
+				return true;
+			}
+		}
+#else
 		if (Libs::LibKernel::Memory::HandleGpuFault(access, info->access_violation_vaddr)) {
 			return true;
 		}
+#endif
 	}
 	// Report whatever guest context can be read safely before terminating: which guest thread
 	// faulted, the register file, the faulting code bytes and the top of its stack.

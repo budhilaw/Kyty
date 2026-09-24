@@ -1,4 +1,5 @@
 #include "graphics/presentation/window.h"
+#include "graphics/guest_gpu/graphicsRun.h"
 
 #include "SDL.h"
 #include "SDL_error.h"
@@ -1051,6 +1052,16 @@ void WindowContext::UpdateTitle() {
 		// a silent log direction.
 		if (std::getenv("KYTY_REPORT_FPS") != nullptr) {
 			std::printf("FPS: %.1f frame=%" PRIu64 "\n", current_fps, frame_num);
+			static uint64_t last_beat   = 0;
+			static uint32_t stuck_count = 0;
+			const auto      beat        = GpuHeartbeat();
+			stuck_count                 = beat == last_beat ? stuck_count + 1 : 0;
+			last_beat                   = beat;
+			if (stuck_count != 0) {
+				std::printf("GPU THREAD: no progress for %" PRIu32 " reports, phase=%s detail=0x%016" PRIx64
+				            "\n",
+				            stuck_count, GpuPhase(), GpuPhaseDetail());
+			}
 			std::fflush(stdout);
 		}
 		Common::WaitTrace::Report(current_fps, frame_num);

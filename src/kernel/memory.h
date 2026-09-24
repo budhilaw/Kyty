@@ -148,6 +148,8 @@ int KYTY_SYSV_ABI KernelSetPrtAperture(int index, void* addr, size_t len);
 int KYTY_SYSV_ABI KernelGetPrtAperture(int index, void** addr, size_t* len);
 int KYTY_SYSV_ABI KernelIsAddressSanitizerEnabled();
 int KYTY_SYSV_ABI KernelQueryMemoryProtection(void* addr, void** start, void** end, int* prot);
+// Silent form of the protection query for the renderer; returns false for unmapped addresses.
+bool QueryMappingProtection(uint64_t vaddr, uint64_t* start, uint64_t* end, int* prot);
 int KYTY_SYSV_ABI KernelDirectMemoryQuery(int64_t offset, int flags, void* info, size_t info_size);
 int KYTY_SYSV_ABI KernelVirtualQuery(const void* addr, int flags, VirtualQueryInfo* info,
                                      uint64_t info_size);

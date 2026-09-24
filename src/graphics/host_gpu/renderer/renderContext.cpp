@@ -4,7 +4,9 @@
 #include "common/threads.h"
 #include "common/timer.h"
 #include "common/logging/log.h"
+#include "gpu_tiler_shaders/indirect_args_clamp_spv.h"
 #include "graphics/guest_gpu/graphicsRun.h"
+#include "graphics/host_gpu/vulkanCommon.h"
 #include "graphics/presentation/videoOut.h"
 #include "libs/errno.h"
 
@@ -42,6 +44,103 @@ RenderContext::RenderContext(GraphicContext& graphics)
 RenderContext::~RenderContext() {
 	ShutdownGpu();
 	m_command_scheduler.Shutdown();
+	if (m_clamp_pipeline != nullptr) {
+		m_graphics.device.destroyPipeline(m_clamp_pipeline, nullptr);
+	}
+	if (m_clamp_layout != nullptr) {
+		m_graphics.device.destroyPipelineLayout(m_clamp_layout, nullptr);
+	}
+}
+
+namespace {
+struct ClampPush {
+	uint64_t src;
+	uint64_t dst;
+	uint32_t limit_x;
+	uint32_t limit_y;
+	uint32_t limit_z;
+};
+constexpr uint32_t ClampSlots = 4096;
+} // namespace
+
+bool RenderContext::ClampIndirectArgs(vk::CommandBuffer command, const Buffer& source,
+                                      uint64_t offset, vk::Buffer& out_buffer,
+                                      uint64_t& out_offset) {
+	if (!source.HasDeviceAddress()) {
+		return false;
+	}
+	if (!m_clamp_initialized) {
+		m_clamp_initialized = true;
+		const vk::PushConstantRange  push_range {vk::ShaderStageFlagBits::eCompute, 0,
+		                                        sizeof(ClampPush)};
+		vk::PipelineLayoutCreateInfo layout_info {};
+		layout_info.pushConstantRangeCount = 1;
+		layout_info.pPushConstantRanges    = &push_range;
+		if (m_graphics.device.createPipelineLayout(&layout_info, nullptr, &m_clamp_layout) !=
+		    vk::Result::eSuccess) {
+			return false;
+		}
+		const auto module = CompileSPV(INDIRECT_ARGS_CLAMP_SPV, m_graphics.device);
+		vk::PipelineShaderStageCreateInfo stage {};
+		stage.stage  = vk::ShaderStageFlagBits::eCompute;
+		stage.module = module;
+		stage.pName  = "main";
+		vk::ComputePipelineCreateInfo pipeline_info {};
+		pipeline_info.stage  = stage;
+		pipeline_info.layout = m_clamp_layout;
+		const auto result    = m_graphics.device.createComputePipelines(
+            nullptr, 1, &pipeline_info, nullptr, &m_clamp_pipeline);
+		m_graphics.device.destroyShaderModule(module, nullptr);
+		if (result != vk::Result::eSuccess) {
+			m_clamp_pipeline = nullptr;
+			return false;
+		}
+		m_clamp_scratch = std::make_unique<Buffer>(
+		    m_graphics, m_command_scheduler, MemoryUsage::DeviceLocal, 0,
+		    vk::BufferUsageFlagBits::eIndirectBuffer | vk::BufferUsageFlagBits::eStorageBuffer |
+		        vk::BufferUsageFlagBits::eShaderDeviceAddress,
+		    uint64_t {ClampSlots} * 16u);
+		SetVulkanObjectNameF(m_graphics.device, m_clamp_scratch->Handle(),
+		                     "Kyty.IndirectArgsClamp");
+	}
+	if (m_clamp_pipeline == nullptr) {
+		return false;
+	}
+	const auto  slot  = (m_clamp_slot++) % ClampSlots;
+	const auto  dst   = uint64_t {slot} * 16u;
+	const auto& limit = m_graphics.physical_device_properties.limits.maxComputeWorkGroupCount;
+	const ClampPush push {source.BufferDeviceAddress() + offset,
+	                      m_clamp_scratch->BufferDeviceAddress() + dst, limit[0], limit[1],
+	                      limit[2]};
+
+	// The counts may come from a shader or a copy recorded just before this dispatch.
+	vk::MemoryBarrier2 before {};
+	before.srcStageMask = vk::PipelineStageFlagBits2::eComputeShader |
+	                      vk::PipelineStageFlagBits2::eAllTransfer;
+	before.srcAccessMask = vk::AccessFlagBits2::eShaderWrite | vk::AccessFlagBits2::eTransferWrite;
+	before.dstStageMask  = vk::PipelineStageFlagBits2::eComputeShader;
+	before.dstAccessMask = vk::AccessFlagBits2::eShaderRead | vk::AccessFlagBits2::eShaderWrite;
+	vk::DependencyInfo dependency {};
+	dependency.memoryBarrierCount = 1;
+	dependency.pMemoryBarriers    = &before;
+	command.pipelineBarrier2(dependency);
+
+	command.bindPipeline(vk::PipelineBindPoint::eCompute, m_clamp_pipeline);
+	command.pushConstants(m_clamp_layout, vk::ShaderStageFlagBits::eCompute, 0, sizeof(push),
+	                      &push);
+	command.dispatch(1, 1, 1);
+
+	vk::MemoryBarrier2 after {};
+	after.srcStageMask  = vk::PipelineStageFlagBits2::eComputeShader;
+	after.srcAccessMask = vk::AccessFlagBits2::eShaderWrite;
+	after.dstStageMask  = vk::PipelineStageFlagBits2::eDrawIndirect;
+	after.dstAccessMask = vk::AccessFlagBits2::eIndirectCommandRead;
+	dependency.pMemoryBarriers = &after;
+	command.pipelineBarrier2(dependency);
+
+	out_buffer = m_clamp_scratch->Handle();
+	out_offset = dst;
+	return true;
 }
 
 void RenderContext::InitializeGpu(VideoOut::VideoOutDriver* video_out) {
@@ -83,6 +182,16 @@ bool RenderContext::HandleFault(PageFaultAccess access, uint64_t fault_vaddr) no
 		return false;
 	}
 	if (access == PageFaultAccess::Write) {
+		if (uint64_t hit = 0; CoversRecentIndirectArgs(fault_vaddr & ~uint64_t {0xfff}, 0x1000, hit)) {
+			static std::atomic<uint32_t> log_count {0};
+			if (log_count.fetch_add(1) < 4096) {
+				LOGF("SHADERDUMP cpu write fault near args=0x%016" PRIx64 " at=0x%016" PRIx64
+				     " gpu_thread=%d cpu_dirty=%d gpu_dirty=%d\n",
+				     hit, fault_vaddr, GuestGpu::IsGpuThread() ? 1 : 0,
+				     m_buffer_cache.IsRegionCpuModified(fault_vaddr, 1) ? 1 : 0,
+				     m_buffer_cache.IsRegionGpuModified(fault_vaddr, 1) ? 1 : 0);
+			}
+		}
 		m_buffer_cache.InvalidateMemory(fault_vaddr, fault_size);
 		m_texture_cache.InvalidateMemory(fault_vaddr, fault_size);
 	} else {
@@ -211,7 +320,11 @@ void RenderContext::UnmapMemory(uint64_t vaddr, uint64_t size) {
 		     vaddr, size);
 	}
 	const auto unmap = [this, vaddr, size] {
-		if (m_command_scheduler.Active()) {
+		// Only a range that GPU resources still reference needs the pipe drained; thread
+		// stacks and other CPU-only memory come and go many times a second.
+		const bool referenced = m_buffer_cache.IsRegionRegistered(vaddr, size) ||
+		                        static_cast<bool>(m_texture_cache.FindImageFromRange(vaddr, size, false));
+		if (referenced && m_command_scheduler.Active()) {
 			const auto tick = m_command_scheduler.CurrentTick();
 			m_command_scheduler.Finish();
 			m_command_scheduler.WaitPriorityOperations(tick);
@@ -226,6 +339,13 @@ void RenderContext::UnmapMemory(uint64_t vaddr, uint64_t size) {
 	if (m_gpu == nullptr || m_gpu->IsStopping()) {
 		unmap();
 		return;
+	}
+	{
+		static std::atomic<uint32_t> log_count {0};
+		if (log_count.fetch_add(1) < 64) {
+			LOGF("UNMAP: addr=0x%016" PRIx64 " size=0x%" PRIx64 " (drains the GPU)\n", vaddr, size);
+			Common::WaitTrace::PrintHostStack("unmap");
+		}
 	}
 	m_gpu->SendCommandSync(unmap);
 }
@@ -258,6 +378,10 @@ void RenderContext::GpuTimerBegin(vk::CommandBuffer command) {
 				for (uint32_t i = 0; i < GpuTimerBlockCount; i++) {
 					m_timer_blocks[i].first = i * GpuTimerBlockQueries;
 				}
+				m_timer_args = std::make_unique<Buffer>(
+				    m_graphics, m_command_scheduler, MemoryUsage::Download, 0,
+				    vk::BufferUsageFlagBits::eTransferDst,
+				    uint64_t {GpuTimerBlockQueries} * GpuTimerBlockCount * 32u);
 			}
 		}
 	}
@@ -297,7 +421,8 @@ void PrintRecentShaders() {
 	std::fflush(stdout);
 }
 
-void RenderContext::GpuTimerMark(vk::CommandBuffer command, uint64_t label, uint8_t kind) {
+void RenderContext::GpuTimerMark(vk::CommandBuffer command, uint64_t label, uint8_t kind,
+                                 uint64_t detail) {
 	if (label != 0) {
 		g_recent_shaders[g_recent_shader_index.fetch_add(1) % 64].store(label | (uint64_t {kind} << 60u));
 	}
@@ -310,8 +435,35 @@ void RenderContext::GpuTimerMark(vk::CommandBuffer command, uint64_t label, uint
 	}
 	command.writeTimestamp(vk::PipelineStageFlagBits::eBottomOfPipe, m_timer_pool,
 	                       block.first + block.used);
-	block.entries.push_back({block.first + block.used, label, kind});
+	block.entries.push_back({block.first + block.used, label, detail, m_timer_pending_vaddr, kind});
+	m_timer_pending_vaddr = 0;
 	block.used++;
+}
+
+void RenderContext::GpuTimerCaptureArgs(vk::CommandBuffer command, vk::Buffer args,
+                                        uint64_t offset, uint64_t vaddr) {
+	if (m_timer_current < 0 || m_timer_args == nullptr) {
+		return;
+	}
+	auto& block = m_timer_blocks[static_cast<size_t>(m_timer_current)];
+	if (block.used >= GpuTimerBlockQueries) {
+		return;
+	}
+	m_timer_pending_vaddr = vaddr;
+	vk::MemoryBarrier2 barrier {};
+	barrier.srcStageMask  = vk::PipelineStageFlagBits2::eComputeShader |
+	                       vk::PipelineStageFlagBits2::eAllTransfer;
+	barrier.srcAccessMask = vk::AccessFlagBits2::eShaderWrite | vk::AccessFlagBits2::eTransferWrite;
+	barrier.dstStageMask  = vk::PipelineStageFlagBits2::eCopy;
+	barrier.dstAccessMask = vk::AccessFlagBits2::eTransferRead;
+	vk::DependencyInfo dependency {};
+	dependency.memoryBarrierCount = 1;
+	dependency.pMemoryBarriers    = &barrier;
+	command.pipelineBarrier2(dependency);
+	// The slot matches the timestamp the following GpuTimerMark records.
+	const auto     lead = std::min<uint64_t>(offset, 8u);
+	vk::BufferCopy copy {offset - lead, uint64_t {block.first + block.used} * 32u, 24u + lead};
+	command.copyBuffer(args, m_timer_args->Handle(), 1, &copy);
 }
 
 void RenderContext::GpuTimerCollect(GpuTimerBlock& block) {
@@ -334,9 +486,24 @@ void RenderContext::GpuTimerCollect(GpuTimerBlock& block) {
 		const auto  delta = results[i * 2] - results[(i - 1) * 2];
 		const auto& entry = block.entries[i];
 		auto&       stat  = m_timer_stats[entry.label];
-		stat.ms += static_cast<double>(delta) * period_ms;
+		const auto ms = static_cast<double>(delta) * period_ms;
+		stat.ms += ms;
 		stat.count++;
 		stat.kind = entry.kind;
+		if (ms > stat.max_ms) {
+			stat.max_ms = ms;
+			stat.detail = entry.detail;
+			if ((entry.detail >> 63u) != 0 && m_timer_args != nullptr) {
+				const auto* words = reinterpret_cast<const uint32_t*>(
+				    m_timer_args->Mapped().data() + uint64_t {entry.query} * 32u + 8u);
+				stat.detail = (uint64_t {1} << 63u) | (uint64_t {words[0]} & 0xfffffu) |
+				              ((uint64_t {words[1]} & 0xfffffu) << 20u) |
+				              ((uint64_t {words[2]} & 0xfffffu) << 40u);
+				stat.raw_x = words[0];
+				stat.args_vaddr = entry.vaddr;
+				std::copy_n(words - 2, 8, stat.around.begin());
+			}
+		}
 		m_timer_kind_ms[entry.kind == 2 ? 2 : (entry.kind == 0 ? 0 : 1)] += static_cast<double>(delta) * period_ms;
 	}
 }
@@ -368,9 +535,17 @@ void RenderContext::GpuTimerReport() {
 	            m_timer_kind_ms[1], m_timer_kind_ms[2]);
 	for (size_t i = 0; i < rows.size() && i < 18; i++) {
 		const auto& [label, stat] = rows[i];
-		std::printf("  %s %016" PRIx64 " %7.1fms /%" PRIu64 "\n",
+		std::printf("  %s %016" PRIx64 " %7.1fms /%" PRIu64 " max=%.1fms groups=%" PRIu64 "x%" PRIu64
+		            "x%" PRIu64 "%s\n",
 		            stat.kind == 1 ? "cs " : (stat.kind == 2 ? "ps " : (stat.kind == 3 ? "csD" : "-- ")), label, stat.ms,
-		            stat.count);
+		            stat.count, stat.max_ms, stat.detail & 0xfffffu, (stat.detail >> 20u) & 0xfffffu,
+		            (stat.detail >> 40u) & 0xfffffu, (stat.detail >> 63u) != 0 ? " indirect" : "");
+		if ((stat.detail >> 63u) != 0) {
+			std::printf("      indirect x=0x%08" PRIx32 " args=0x%010" PRIx64
+			            " around(-8..+24)=%08x %08x | %08x %08x %08x | %08x %08x %08x\n",
+			            stat.raw_x, stat.args_vaddr, stat.around[0], stat.around[1], stat.around[2], stat.around[3],
+			            stat.around[4], stat.around[5], stat.around[6], stat.around[7]);
+		}
 	}
 	std::fflush(stdout);
 	m_timer_stats.clear();

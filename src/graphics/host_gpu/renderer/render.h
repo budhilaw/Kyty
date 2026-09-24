@@ -172,6 +172,9 @@ public:
 
 	[[nodiscard]] PreparedBindings PrepareBindings(const ShaderStageRuntime& runtime);
 	void                           FindBuffers(PreparedBindings& bindings);
+	// Gives the device-address page table entries for the memory the shader's user-data
+	// pointers reach, so raw-pointer loads see guest data instead of a first-touch fault.
+	void                           MapUserDataPointers(const PreparedBindings& bindings);
 	void                           RebindBuffers(PreparedBindings& bindings);
 	void                           RebindImages(PreparedBindings& bindings);
 	void CommitBindings(CommandBuffer& buffer, vk::PipelineBindPoint pipeline_bind_point,

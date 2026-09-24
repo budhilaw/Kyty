@@ -99,12 +99,14 @@ static void RecordEndOfPipeWrite(uint64_t submit_id, CommandBuffer& buffer, uint
 	auto& scheduler = buffer.GetContext().GetCommandScheduler();
 	EXIT_IF(!scheduler.Active() || &buffer != &scheduler.Current());
 	CheckGuestWatch(destination, static_cast<uint64_t>(size), "end_of_pipe");
-	scheduler.DeferPriorityOperation([destination, value, size] {
+	const auto pending = NotePendingGuestGpuWrite(destination, value, width);
+	scheduler.DeferPriorityOperation([destination, value, size, pending] {
 		if (size == EndOfPipeWriteSize::Qword) {
 			*reinterpret_cast<uint64_t*>(destination) = value;
 		} else {
 			*reinterpret_cast<uint32_t*>(destination) = static_cast<uint32_t>(value);
 		}
+		ResolvePendingGuestGpuWrite(pending);
 		NoteGuestGpuWrite(destination);
 	});
 

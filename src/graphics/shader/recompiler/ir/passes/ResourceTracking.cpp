@@ -1,10 +1,13 @@
 #include "graphics/shader/recompiler/ir/passes/ResourceTracking.h"
 
 #include "common/assert.h"
+#include "common/logging/log.h"
 #include "graphics/shader/recompiler/ir/ShaderIR.h"
 #include "graphics/shader/recompiler/ir/passes/SrtWalker.h"
 
 #include <algorithm>
+#include <atomic>
+#include <cinttypes>
 #include <fmt/format.h>
 #include <span>
 #include <utility>
@@ -795,6 +798,19 @@ private:
 				                           ValueOpcodeName(op), bad_dword));
 		}
 		auto& memory = m_program.memory_info[flags.index];
+		if (memory.formatted && !memory.typed && memory.data_dwords == 1u &&
+		    (op == ValueOpcode::LoadBufferU32 || op == ValueOpcode::StoreBufferU32)) {
+			// The format lives in a descriptor the shader reads at runtime. A one-component
+			// access is treated as a raw dword; games use this shape to copy elements between
+			// buffers of one format, where no conversion happens either way.
+			static std::atomic<uint32_t> log_count {0};
+			if (log_count.fetch_add(1) < 16) {
+				LOGF("shader resource tracking: hash=0x%016" PRIx64 " pc=0x%08" PRIx32
+				     " formatted %s with a runtime descriptor lowered to a raw dword access\n",
+				     m_program.shader_hash, flags.pc, ValueOpcodeName(op));
+			}
+			memory.formatted = false;
+		}
 		if (memory.formatted || memory.typed) {
 			std::string words;
 			for (uint32_t i = 0; i < 4u; i++) {

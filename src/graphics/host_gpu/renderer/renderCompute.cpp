@@ -13,6 +13,7 @@
 #include "graphics/host_gpu/renderer/image/imageInfo.h"
 #include "graphics/host_gpu/renderer/pipeline/descriptors.h"
 #include "graphics/host_gpu/renderer/pipeline/pipelineCache.h"
+#include "kernel/memory.h"
 #include "graphics/host_gpu/renderer/pipeline/shaderResourceBarrier.h"
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
@@ -214,6 +215,7 @@ void RenderExecutor::Dispatch(uint64_t submit_id, CommandBuffer& buffer, uint32_
                               uint64_t indirect_args_vaddr) {
 	Common::WaitTrace::Scope dispatch_scope(Common::WaitTrace::Kind::GpuDispatch);
 	EXIT_IF(buffer.IsInvalid());
+	SetGpuPhase("dispatch", buffer.GetShaders().GetCs().cs_regs.data_addr);
 	m_context.GetCommandScheduler().PopPendingOperations();
 	auto&      ctx      = buffer.GetRegisters();
 	auto&      sh_ctx   = buffer.GetShaders();
@@ -252,6 +254,26 @@ void RenderExecutor::Dispatch(uint64_t submit_id, CommandBuffer& buffer, uint32_
 	constexpr uint32_t DISPATCH_INITIATOR_KNOWN_MASK =
 	    DISPATCH_INITIATOR_BASE_BITS | DISPATCH_INITIATOR_MODIFIER_BITS;
 
+	{
+		// Group counts come from guest memory; corrupt words would exceed the device limit or
+		// run for minutes. Hardware would fault on such a dispatch, so it is dropped instead.
+		const auto& limit = m_context.GetGraphics().physical_device_properties.limits
+		                        .maxComputeWorkGroupCount;
+		constexpr uint64_t MaxGroups = uint64_t {1} << 26u;
+		const uint64_t     total =
+		    uint64_t {thread_group_x} * thread_group_y * thread_group_z;
+		if (!indirect && (thread_group_x > limit[0] || thread_group_y > limit[1] ||
+		                  thread_group_z > limit[2] || total > MaxGroups)) {
+			static std::atomic<uint32_t> log_count {0};
+			if (log_count.fetch_add(1, std::memory_order_relaxed) < 32) {
+				LOGF("GraphicsRenderDispatchDirect: dropping oversized dispatch groups=%ux%ux%u "
+				     "shader=0x%016" PRIx64 "\n",
+				     thread_group_x, thread_group_y, thread_group_z,
+				     sh_ctx.GetCs().cs_regs.data_addr);
+			}
+			return;
+		}
+	}
 	const uint32_t unknown_mode_bits = mode & ~DISPATCH_INITIATOR_KNOWN_MASK;
 	if (unknown_mode_bits != 0) {
 		static std::atomic<uint32_t> log_count {0};
@@ -389,6 +411,7 @@ void RenderExecutor::Dispatch(uint64_t submit_id, CommandBuffer& buffer, uint32_
 	auto bindings = PrepareBindings(input_info.stage);
 	FindBuffers(bindings);
 	if (program.info.uses_dma) {
+		MapUserDataPointers(bindings);
 		m_context.PrepareBda();
 	}
 	RebindImages(bindings);
@@ -400,6 +423,22 @@ void RenderExecutor::Dispatch(uint64_t submit_id, CommandBuffer& buffer, uint32_
 	if (indirect) {
 		std::tie(args_buffer, args_offset) = m_context.GetBufferCache().ObtainBuffer(
 		    indirect_args_vaddr, 3 * sizeof(uint32_t), false, false);
+		static std::atomic<uint32_t> dump_count {0};
+		NoteIndirectArgsAddress(indirect_args_vaddr);
+		if (ShaderDumpRequested(program.shader_hash) && dump_count.fetch_add(1) < (1u << 20u)) {
+			uint32_t args[3] = {0, 0, 0};
+			const bool ok = Libs::LibKernel::Memory::ReadGpuBackingOrDownload(indirect_args_vaddr,
+			                                                                  args, sizeof(args));
+			auto& cache = m_context.GetBufferCache();
+			LOGF("SHADERDUMP indirect dispatch hash=0x%016" PRIx64 " args=0x%016" PRIx64
+			     " groups=%ux%ux%u read=%d threads=%ux%ux%u cpu_dirty=%d gpu_dirty=%d buffer=0x%016" PRIx64
+			     "+0x%" PRIx64 "\n",
+			     program.shader_hash, indirect_args_vaddr, args[0], args[1], args[2], ok ? 1 : 0,
+			     cs_regs.cs_regs.num_thread_x, cs_regs.cs_regs.num_thread_y,
+			     cs_regs.cs_regs.num_thread_z, cache.IsRegionCpuModified(indirect_args_vaddr, 12) ? 1 : 0,
+			     cache.IsRegionGpuModified(indirect_args_vaddr, 12) ? 1 : 0, args_buffer->CpuAddress(),
+			     args_offset);
+		}
 	}
 
 	auto              vk_buffer        = buffer.Handle();
@@ -438,7 +477,20 @@ void RenderExecutor::Dispatch(uint64_t submit_id, CommandBuffer& buffer, uint32_
 		dependency.memoryBarrierCount = 1;
 		dependency.pMemoryBarriers    = &args_barrier;
 		vk_buffer.pipelineBarrier2(dependency);
-		vk_buffer.dispatchIndirect(args_buffer->Handle(), args_offset);
+		// The clamp pass binds its own pipeline, so the dispatch pipeline is bound again.
+		vk::Buffer clamped_buffer;
+		uint64_t   clamped_offset = 0;
+		if (m_context.ClampIndirectArgs(vk_buffer, *args_buffer, args_offset, clamped_buffer,
+		                                clamped_offset)) {
+			vk_buffer.bindPipeline(vk::PipelineBindPoint::eCompute, pipeline.pipeline);
+			vk_buffer.dispatchIndirect(clamped_buffer, clamped_offset);
+		} else {
+			vk_buffer.dispatchIndirect(args_buffer->Handle(), args_offset);
+		}
+		if (m_context.GpuTimerActive()) {
+			m_context.GpuTimerCaptureArgs(vk_buffer, args_buffer->Handle(), args_offset,
+			                              indirect_args_vaddr);
+		}
 	} else {
 		vk_buffer.dispatch(thread_group_x, thread_group_y, thread_group_z);
 	}
@@ -448,7 +500,11 @@ void RenderExecutor::Dispatch(uint64_t submit_id, CommandBuffer& buffer, uint32_
 	if (!light_barriers) {
 		ShaderAccessBarrier(vk_buffer, vk::PipelineStageFlagBits::eComputeShader);
 	}
-	m_context.GpuTimerMark(vk_buffer, program.shader_hash, program.info.uses_dma ? 3 : 1);
+	m_context.GpuTimerMark(vk_buffer, program.shader_hash, program.info.uses_dma ? 3 : 1,
+	                       (uint64_t {thread_group_x} & 0xfffffu) |
+	                           ((uint64_t {thread_group_y} & 0xfffffu) << 20u) |
+	                           ((uint64_t {thread_group_z} & 0xfffffu) << 40u) |
+	                           (indirect ? (uint64_t {1} << 63u) : 0));
 	ResetBindings();
 }
 

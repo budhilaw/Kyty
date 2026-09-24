@@ -102,6 +102,10 @@ struct EmitterState {
 	uint32_t                                         shader_data_storage_variable = 0;
 	uint32_t                                         flattened_srt_variable  = 0;
 	uint32_t                                         lds_variable            = 0;
+	// Function-scope array of per-loop iteration counters for the runaway-loop safety cap.
+	uint32_t                                         loop_counters_variable  = 0;
+	uint32_t                                         loop_counter_count      = 0;
+	std::vector<uint32_t>                            loop_merge_blocks;
 	std::array<uint32_t, 2>                          scratch_variable {};
 	std::array<uint32_t, IR::ImageBindingCount>      image_variables {};
 	uint32_t                   sampler_variable                      = 0;

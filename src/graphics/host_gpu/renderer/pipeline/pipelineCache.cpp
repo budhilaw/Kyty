@@ -20,6 +20,8 @@
 #include "loader/systemContent.h"
 
 #include <algorithm>
+#include <cstdlib>
+#include <string>
 #include <array>
 #include <atomic>
 #include <cctype>
@@ -36,6 +38,39 @@
 #include <xxhash.h>
 
 namespace Libs::Graphics {
+
+// KYTY_SHADER_DUMP_HASH lists hex hashes (comma separated) to dump without the full debug dump.
+bool ShaderDumpRequested(uint64_t shader_hash) {
+	if (Config::GraphicsDebugDumpEnabled()) {
+		return true;
+	}
+	static const std::string list = [] {
+		const char* env = std::getenv("KYTY_SHADER_DUMP_HASH");
+		return std::string(env != nullptr ? env : "");
+	}();
+	if (list.empty()) {
+		return false;
+	}
+	return list.find(fmt::format("{:016x}", shader_hash)) != std::string::npos;
+}
+
+static std::array<std::atomic<uint64_t>, 64> g_recent_args {};
+static std::atomic<uint32_t>                 g_recent_args_index {0};
+
+void NoteIndirectArgsAddress(uint64_t vaddr) {
+	g_recent_args[g_recent_args_index.fetch_add(1) % g_recent_args.size()].store(vaddr);
+}
+
+bool CoversRecentIndirectArgs(uint64_t address, uint64_t size, uint64_t& hit) {
+	for (const auto& entry: g_recent_args) {
+		const auto vaddr = entry.load();
+		if (vaddr != 0 && vaddr >= address && vaddr + 12u <= address + size) {
+			hit = vaddr;
+			return true;
+		}
+	}
+	return false;
+}
 
 namespace {
 
@@ -101,7 +136,7 @@ bool ReadShaderGuestMemory(void*, uint64_t address, uint32_t* value) {
 
 void DumpShaderSpirv(const char* stage_name, uint64_t shader_hash,
                      const std::vector<uint32_t>& spirv) {
-	if (!Config::GraphicsDebugDumpEnabled()) {
+	if (!ShaderDumpRequested(shader_hash)) {
 		return;
 	}
 	static std::atomic_int id = 0;
@@ -119,7 +154,7 @@ void DumpShaderSpirv(const char* stage_name, uint64_t shader_hash,
 
 void DumpShaderOriginal(const char* stage_name, uint64_t shader_hash,
                         std::span<const uint32_t> code, const std::string& decoded_dump) {
-	if (!Config::GraphicsDebugDumpEnabled()) {
+	if (!ShaderDumpRequested(shader_hash)) {
 		return;
 	}
 	EXIT_IF(code.empty());
@@ -335,7 +370,8 @@ struct PipelineCache::ProgramCache {
 		options.shader_hash = params.hash;
 		options.user_data   = params.user_data;
 		options.back_code      = params.back_code;
-		options.dump_ir     = Config::GetShaderLogDirection() != Config::LogDirection::Silent;
+		options.dump_ir     = Config::GetShaderLogDirection() != Config::LogDirection::Silent ||
+		                  ShaderDumpRequested(params.hash);
 		options.early_dump  = options.dump_ir;
 		options.dump_label  = label;
 		options.input_info  = stage_input;

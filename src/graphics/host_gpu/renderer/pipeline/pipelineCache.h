@@ -18,6 +18,12 @@
 
 namespace Libs::Graphics {
 
+// True when the shader is in the debug dump set (full dump or KYTY_SHADER_DUMP_HASH).
+bool ShaderDumpRequested(uint64_t shader_hash);
+// Diagnostic: remembers indirect argument addresses so writers of them can be identified.
+void NoteIndirectArgsAddress(uint64_t vaddr);
+bool CoversRecentIndirectArgs(uint64_t address, uint64_t size, uint64_t& hit);
+
 struct GraphicContext;
 struct RenderColorInfo;
 struct RenderDepthInfo;

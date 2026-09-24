@@ -295,6 +295,21 @@ add_custom_command(
 	VERBATIM
 )
 list(APPEND kyty_emulator_src "${fault_buffer_shader_header}")
+
+set(indirect_clamp_shader_source "${gpu_tiler_shader_dir}/indirect_args_clamp.comp")
+set(indirect_clamp_shader_spv "${gpu_tiler_generated_dir}/indirect_args_clamp.spv")
+set(indirect_clamp_shader_header "${gpu_tiler_generated_dir}/indirect_args_clamp_spv.h")
+add_custom_command(
+	OUTPUT "${indirect_clamp_shader_header}"
+	COMMAND ${CMAKE_COMMAND} -E make_directory "${gpu_tiler_generated_dir}"
+	COMMAND "${KYTY_GLSLANG_VALIDATOR}" -V --target-env vulkan1.3 -Os
+	        -o "${indirect_clamp_shader_spv}" "${indirect_clamp_shader_source}"
+	COMMAND ${CMAKE_COMMAND} -DINPUT=${indirect_clamp_shader_spv} -DOUTPUT=${indirect_clamp_shader_header}
+	        -DSYMBOL=INDIRECT_ARGS_CLAMP_SPV -P "${KYTY_SOURCE_DIR}/embed_spirv.cmake"
+	DEPENDS "${indirect_clamp_shader_source}"
+	VERBATIM
+)
+list(APPEND kyty_emulator_src "${indirect_clamp_shader_header}")
 list(APPEND kyty_emulator_src ${gpu_tiler_shader_headers})
 
 set(gpu_blit_generated_dir "${PROJECT_BINARY_DIR}/gpu_blit_shaders")

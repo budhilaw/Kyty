@@ -3183,6 +3183,28 @@ int KYTY_SYSV_ABI KernelIsAddressSanitizerEnabled() {
 	return 0;
 }
 
+bool QueryMappingProtection(uint64_t vaddr, uint64_t* start, uint64_t* end, int* prot) {
+	// The GPU thread calls this; a mapping change in progress may itself be waiting for the
+	// GPU, so the query gives up instead of blocking.
+	std::unique_lock<std::recursive_mutex> memory_operation_lock(g_memory_operation_mutex,
+	                                                             std::try_to_lock);
+	VirtualRanges::Range                   range {};
+	if (!memory_operation_lock.owns_lock() || g_virtual_ranges == nullptr ||
+	    !g_virtual_ranges->Query(vaddr, 0, &range)) {
+		return false;
+	}
+	if (start != nullptr) {
+		*start = range.start;
+	}
+	if (end != nullptr) {
+		*end = range.start + range.size;
+	}
+	if (prot != nullptr) {
+		*prot = range.protection;
+	}
+	return true;
+}
+
 int KYTY_SYSV_ABI KernelQueryMemoryProtection(void* addr, void** start, void** end, int* prot) {
 	PRINT_NAME();
 

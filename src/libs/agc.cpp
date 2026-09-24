@@ -4323,6 +4323,19 @@ static void submit_dcb(uint32_t* dcb, uint32_t size_in_dwords) {
 				break;
 			}
 		}
+		if (offset < size_in_dwords) {
+			// The walk stopped inside the declared stream: the memory no longer holds packets.
+			static std::atomic<uint32_t> corrupt_log_count {0};
+			if (corrupt_log_count.fetch_add(1) < 32) {
+				std::string words;
+				for (uint32_t i = offset > 8 ? offset - 8 : 0;
+				     i < std::min(size_in_dwords, offset + 8); i++) {
+					words += fmt::format("{}{:08x}", i == offset ? " |" : " ", dcb[i]);
+				}
+				LOGF("DCB CORRUPT addr=0x%010" PRIx64 " dw=%" PRIu32 " stop=0x%05" PRIx32 ":%s\n",
+				     reinterpret_cast<uint64_t>(dcb), size_in_dwords, offset, words.c_str());
+			}
+		}
 		static std::atomic<uint32_t> walk_log_count {0};
 		if (walk_log_count.fetch_add(1) < 64) {
 			LOGF("\t DCBWALK: declared=%" PRIu32 " walked_end=%" PRIu32 " extra=%" PRId64
@@ -4387,6 +4400,24 @@ static void submit_dcb(uint32_t* dcb, uint32_t size_in_dwords) {
 	if (Libs::Graphics::LabelTraceEnabled()) {
 		LOGF("LABEL submit dcb addr=0x%010" PRIx64 " dw=%" PRIu32 "\n",
 		     reinterpret_cast<uint64_t>(dcb), size_in_dwords);
+		// Small end-of-frame streams carry the fences; list their packets for the trace.
+		if (size_in_dwords <= 128) {
+			std::string text;
+			for (uint32_t offset = 0; offset < size_in_dwords;) {
+				const auto header = dcb[offset];
+				const auto type   = header >> 30u;
+				const auto len    = type == 3u ? ((header >> 16u) & 0x3fffu) + 2u : 1u;
+				text += fmt::format(" [{:03x}]", offset);
+				for (uint32_t i = 0; i < len && offset + i < size_in_dwords && i < 8; i++) {
+					text += fmt::format(" {:08x}", dcb[offset + i]);
+				}
+				if (type != 3u && type != 2u) {
+					break;
+				}
+				offset += len;
+			}
+			LOGF("LABEL   packets:%s\n", text.c_str());
+		}
 	}
 	auto                            owned = snapshot_command_stream(dcb, size_in_dwords, "dcb");
 	const std::span<const uint32_t> commands {owned.data(), size_in_dwords};

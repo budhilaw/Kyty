@@ -3,6 +3,7 @@
 #include "common/assert.h"
 
 #include <algorithm>
+#include <cstdlib>
 #include <bit>
 #include <functional>
 #include <optional>
@@ -97,6 +98,15 @@ void EmitReturn(ValueEmitContext& ctx) {
 	ctx.state.builder.AddFunction(spv::OpReturn);
 }
 
+// The runaway-loop cap is limited to compute shaders; KYTY_LOOP_CAP=0 disables it.
+static bool LoopCapEnabled(const EmitterState& state) {
+	static const bool enabled = [] {
+		const char* text = std::getenv("KYTY_LOOP_CAP");
+		return text == nullptr || std::strtoul(text, nullptr, 0) != 0;
+	}();
+	return enabled && state.program.stage == ShaderType::Compute;
+}
+
 uint32_t BranchCondition(ValueEmitContext& ctx, const IR::BlockInfo& info) {
 	// Scalar-instruction conditions already test the full wave's raw register values.
 	if (ctx.other_half == nullptr ||
@@ -160,7 +170,41 @@ void EmitStructuredTerminator(ValueEmitContext& ctx, const IR::Block* block,
 				EmitReturn(ctx);
 				return;
 			}
-			const auto condition = BranchCondition(ctx, info);
+			auto condition = BranchCondition(ctx, info);
+			const auto& merges = ctx.state.loop_merge_blocks;
+			const bool  exits_loop =
+			    std::find(merges.begin(), merges.end(), term.true_block) != merges.end() ||
+			    std::find(merges.begin(), merges.end(), term.false_block) != merges.end();
+			const bool true_exits =
+			    std::find(merges.begin(), merges.end(), term.true_block) != merges.end();
+			if (exits_loop && LoopCapEnabled(ctx.state)) {
+				// Safety cap: a loop whose trip count comes from corrupt guest data would run
+				// the GPU forever. Real workloads stay far below this bound.
+				auto&      state   = ctx.state;
+				const auto counter = state.builder.AllocateId();
+				state.builder.AddFunction(
+				    spv::OpAccessChain, TypePointer(state, spv::StorageClassFunction, TypeU32(state)),
+				    counter, state.loop_counters_variable,
+				    ConstantU32(state, std::min<uint32_t>(state.loop_counter_count++, 63u)));
+				const auto loaded = state.builder.AllocateId();
+				state.builder.AddFunction(spv::OpLoad, TypeU32(state), loaded, counter);
+				const auto next = EmitBinaryU32(state, spv::OpIAdd, loaded, ConstantU32(state, 1));
+				state.builder.AddFunction(spv::OpStore, counter, next);
+				const auto exceeded = state.builder.AllocateId();
+				state.builder.AddFunction(spv::OpUGreaterThan, TypeBool(state), exceeded, next,
+				                          ConstantU32(state, 1u << 18u));
+				const auto capped = state.builder.AllocateId();
+				if (true_exits) {
+					state.builder.AddFunction(spv::OpLogicalOr, TypeBool(state), capped, condition,
+					                          exceeded);
+				} else {
+					const auto within = state.builder.AllocateId();
+					state.builder.AddFunction(spv::OpLogicalNot, TypeBool(state), within, exceeded);
+					state.builder.AddFunction(spv::OpLogicalAnd, TypeBool(state), capped, condition,
+					                          within);
+				}
+				condition = capped;
+			}
 			emit_merge();
 			ctx.state.builder.AddFunction(spv::OpBranchConditional, condition,
 			                              ctx.Label(true_block), ctx.Label(false_block));
@@ -684,6 +728,13 @@ void EmitProgram(EmitterState& state) {
 		high.half       = 1;
 	}
 	std::optional<DispatcherFunctionState> dispatcher;
+	state.loop_counters_variable = state.builder.AllocateId();
+	state.loop_merge_blocks.clear();
+	for (const auto& info: program.block_info) {
+		if (info.terminator.loop_header && info.terminator.merge_block != UINT32_MAX) {
+			state.loop_merge_blocks.push_back(info.terminator.merge_block);
+		}
+	}
 	if (state.program.stage == ShaderType::Pixel && state.requirements.pixel_valid_mask) {
 		state.pixel_valid_mask_variable = state.builder.AllocateId();
 		state.builder.AddName(state.pixel_valid_mask_variable, "pixel_valid_mask_active");
@@ -778,6 +829,14 @@ void EmitProgram(EmitterState& state) {
 			    TypeU32ArrayPointer(state, spv::StorageClassFunction, state.program.scratch_dwords),
 			    state.scratch_variable[half], spv::StorageClassFunction);
 		}
+	}
+	{
+		const auto array_type =
+		    state.builder.Type(spv::OpTypeArray, TypeU32(state), ConstantU32(state, 64));
+		const auto zero = state.builder.Constant(spv::OpConstantNull, array_type);
+		state.builder.AddFunction(spv::OpVariable,
+		                          TypePointer(state, spv::StorageClassFunction, array_type),
+		                          state.loop_counters_variable, spv::StorageClassFunction, zero);
 	}
 	if (state.pixel_valid_mask_variable != 0) {
 		state.builder.AddFunction(spv::OpVariable,

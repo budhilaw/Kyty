@@ -1,4 +1,5 @@
 #include "graphics/host_gpu/renderer/cache/textureCache.h"
+#include "graphics/guest_gpu/command_processor/commandProcessor.h"
 
 #include "common/alignment.h"
 #include "common/assert.h"
@@ -32,6 +33,9 @@ namespace Libs::Graphics {
 
 // A readback may complete after the game released the pages; the data is then unwanted.
 static void WriteBackingIfMapped(uint64_t vaddr, const void* data, uint64_t size) {
+	if (Libs::Graphics::LabelTraceEnabled()) {
+		LOGF("DOWNLOAD image range=0x%010" PRIx64 "+0x%" PRIx64 "\n", vaddr, size);
+	}
 	if (!Libs::LibKernel::Memory::TryWriteBacking(vaddr, data, size)) {
 		LOGF("Memory: skipped readback into unmapped range addr=0x%016" PRIx64 " size=0x%016" PRIx64 "\n", vaddr, size);
 	}

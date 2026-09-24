@@ -133,7 +133,8 @@ bool     TileGetRenderTargetMipLayout(uint32_t width, uint32_t height, uint32_t 
 void     TileGetTextureSize(Prospero::BufferFormat format, uint32_t width, uint32_t height,
                             uint32_t levels, Prospero::TileMode tile, TileSizeAlign* total_size,
                             TileSizeOffset* level_sizes, TilePaddedSize* padded_size);
-void     TileGetTextureTotalSize(Prospero::BufferFormat format, uint32_t width, uint32_t height,
+// Returns false when the layout does not fit a 32-bit size (a corrupt descriptor).
+bool     TileGetTextureTotalSize(Prospero::BufferFormat format, uint32_t width, uint32_t height,
                                  uint32_t depth, uint32_t levels, Prospero::TileMode tile,
                                  bool volume_texture, TileSizeAlign& total_size);
 uint32_t TileGetTexturePitch(Prospero::BufferFormat format, uint32_t width,

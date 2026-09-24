@@ -210,6 +210,10 @@ constexpr uint32_t DB_STENCIL_READ_BASE  = 0x13;
 constexpr uint32_t DB_Z_WRITE_BASE       = 0x14;
 constexpr uint32_t DB_STENCIL_WRITE_BASE = 0x15;
 
+constexpr uint32_t DB_RESERVED_REG_1 = 0x16;
+constexpr uint32_t DB_RESERVED_REG_3 = 0x17;
+constexpr uint32_t DB_RESERVED_REG_2 = 0x18;
+
 constexpr uint32_t DB_VRS_OVERRIDE_CNTL = 0x19;
 
 constexpr uint32_t DB_Z_READ_BASE_HI                  = 0x1A;

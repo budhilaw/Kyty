@@ -62,6 +62,9 @@ private:
 
 	std::vector<BufferCursor> m_buffer_stack;
 	std::span<const uint32_t> m_next_buffer;
+	// Checksum of the unparsed remainder at suspend time; a change means the guest reused it.
+	uint64_t                  m_suspend_checksum = 0;
+	uint64_t                  m_suspend_words    = 0;
 	const char*               m_suspend_reason  = nullptr;
 	uint64_t                  m_awaited_address = 0;
 	uint64_t                  m_wait_seq        = 0;
@@ -138,6 +141,7 @@ public:
 	void DispatchDirect(uint32_t thread_group_x, uint32_t thread_group_y, uint32_t thread_group_z,
 	                    uint32_t mode);
 	void DispatchIndirect(uint32_t data_offset, uint32_t mode);
+	void DispatchIndirectAt(uint64_t args_addr, uint32_t mode);
 	void WaitFlipDone(uint32_t video_out_handle, uint32_t display_buffer_index);
 	void TriggerEvent(uint32_t event_type, uint32_t event_index, uint64_t event_address = 0);
 
@@ -188,6 +192,7 @@ public:
 	[[nodiscard]] bool     IsAsyncComputeQueue() const { return m_interrupt_event_id >= 0x20; }
 
 private:
+	static uint64_t RemainderChecksum(const Pm4Execution& execution, uint64_t& words);
 	template <typename T>
 	void WriteAtEndOfPipe(uint32_t cache_policy, uint32_t event_write_dest, uint32_t eop_event_type,
 	                      uint32_t cache_action, uint32_t event_index, uint32_t event_write_source,

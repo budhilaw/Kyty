@@ -113,7 +113,15 @@ void MasterSemaphore::Wait(uint64_t tick) {
 	wait_info.pSemaphores    = &m_semaphore;
 	wait_info.pValues        = &tick;
 
-	const auto result = m_graphics.device.waitSemaphores(&wait_info, UINT64_MAX);
+	// A runaway shader never signals when the driver's timeout detection is off; report the
+	// last shaders instead of hanging the emulator forever.
+	auto result = m_graphics.device.waitSemaphores(&wait_info, 30'000'000'000ull);
+	if (result == vk::Result::eTimeout) {
+		PrintRecentShaders();
+		PrintDeviceFault(m_graphics);
+		EXIT("GPU did not finish within 30 s (tick %" PRIu64 "); a shader is probably looping forever\n",
+		     tick);
+	}
 	if (result != vk::Result::eSuccess) {
 		PrintRecentShaders();
 		PrintDeviceFault(m_graphics);

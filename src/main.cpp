@@ -7,9 +7,13 @@
 #include "common/threads.h"
 #include "common/virtualMemory.h"
 #include "emulator.h"
+#include "graphics/guest_gpu/graphicsRun.h"
+#include "graphics/host_gpu/renderer/renderContext.h"
 #include "kytyGitVersion.h"
 
 #include <atomic>
+#include <cstring>
+#include <string>
 #include <chrono>
 #include <thread>
 #include <unordered_map>
@@ -378,8 +382,73 @@ static void StartSpinWatchdog() {
 		std::unordered_map<DWORD, uint64_t> previous;
 		const auto                          process = GetCurrentProcessId();
 		const auto                          self    = GetCurrentThreadId();
+		uint64_t last_beat  = 0;
+		uint32_t stuck_hits = 0;
 		for (;;) {
 			std::this_thread::sleep_for(std::chrono::seconds(10));
+			// The GPU thread reports its phase; when the heartbeat stops, print where it sits.
+			{
+				const auto beat = Libs::Graphics::GpuHeartbeat();
+				stuck_hits      = beat == last_beat && beat != 0 ? stuck_hits + 1 : 0;
+				last_beat       = beat;
+				if (stuck_hits != 0) {
+					uint64_t    rip = 0;
+					std::string stack;
+					const auto  tid = Libs::Graphics::GpuOsThreadId();
+					auto*      gpu  = tid != 0 ? OpenThread(THREAD_QUERY_INFORMATION | THREAD_GET_CONTEXT |
+                                                          THREAD_SUSPEND_RESUME,
+                                                      FALSE, tid)
+					                            : nullptr;
+					if (gpu != nullptr) {
+						CONTEXT context {};
+						context.ContextFlags = CONTEXT_CONTROL;
+						context.ContextFlags = CONTEXT_FULL;
+						if (SuspendThread(gpu) != static_cast<DWORD>(-1)) {
+							if (GetThreadContext(gpu, &context) != 0) {
+								rip = context.Rip;
+								// Unwind the suspended thread with the x64 function tables.
+								for (int frame = 0; frame < 40 && context.Rip != 0; frame++) {
+									HMODULE module = nullptr;
+									char    name[MAX_PATH] {};
+									if (GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+									                           GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+									                       reinterpret_cast<LPCSTR>(context.Rip), &module) != 0) {
+										GetModuleFileNameA(module, name, sizeof(name));
+										const char* slash = std::strrchr(name, '\\');
+										stack += fmt::format(" {}+{:x}", slash != nullptr ? slash + 1 : name,
+										                     context.Rip - reinterpret_cast<uint64_t>(module));
+									} else {
+										stack += fmt::format(" {:x}", context.Rip);
+									}
+									DWORD64 image_base = 0;
+									auto*   function   = RtlLookupFunctionEntry(context.Rip, &image_base, nullptr);
+									if (function == nullptr) {
+										if (context.Rsp == 0 || IsBadReadPtr(reinterpret_cast<void*>(context.Rsp), 8)) {
+											break;
+										}
+										context.Rip = *reinterpret_cast<const DWORD64*>(context.Rsp);
+										context.Rsp += 8;
+									} else {
+										void*   handler_data = nullptr;
+										DWORD64 establisher  = 0;
+										RtlVirtualUnwind(UNW_FLAG_NHANDLER, image_base, context.Rip, function,
+										                 &context, &handler_data, &establisher, nullptr);
+									}
+								}
+							}
+							ResumeThread(gpu);
+						}
+						CloseHandle(gpu);
+					}
+					const auto base = reinterpret_cast<uint64_t>(GetModuleHandleA(nullptr));
+					LOGF("\t GPU THREAD STUCK: %" PRIu32 "0s phase=%s detail=0x%016" PRIx64
+					     " rip=0x%016" PRIx64 " rva=0x%" PRIx64 "\n",
+					     stuck_hits, Libs::Graphics::GpuPhase(), Libs::Graphics::GpuPhaseDetail(), rip,
+					     rip >= base ? rip - base : 0);
+					LOGF("\t GPU THREAD STACK:%s\n", stack.c_str());
+					Libs::Graphics::PrintRecentShaders();
+				}
+			}
 			auto snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
 			if (snapshot == INVALID_HANDLE_VALUE) {
 				continue;

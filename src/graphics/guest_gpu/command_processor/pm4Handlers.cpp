@@ -334,6 +334,16 @@ static void HwCtxIgnoreVrsOverrideControl([[maybe_unused]] uint32_t value) {}
 
 static void HwCtxIgnoreDrawPayloadControl([[maybe_unused]] uint32_t value) {}
 
+// Undocumented depth-block registers (0xA016..0xA018); the PS5 firmware writes them but no
+// RDNA 2 driver programs them, so they carry no behavior the host could mirror.
+static void HwCtxIgnoreDbReservedRegister(uint32_t offset, uint32_t value) {
+	static std::atomic<uint32_t> log_count {0};
+	if (log_count.fetch_add(1, std::memory_order_relaxed) < 8) {
+		LOGF("\t diagnostic: ignoring DB reserved register 0x%" PRIx32 ", value = 0x%08" PRIx32 "\n",
+		     offset, value);
+	}
+}
+
 static void HwCtxIgnoreObjprimIdControl([[maybe_unused]] uint32_t value) {}
 
 static void HwCtxIgnorePrimitiveIdReset([[maybe_unused]] uint32_t value) {}
@@ -1373,12 +1383,12 @@ KYTY_CP_OP_PARSER(CpOpDispatchIndirect) {
 			uint32_t thread_group_z;
 		};
 
-		auto* args = reinterpret_cast<const DispatchIndirectArgs*>(
-		    buffer[0] | (static_cast<uint64_t>(buffer[1]) << 32u));
-		uint32_t mode = buffer[2];
+		const auto args_addr = buffer[0] | (static_cast<uint64_t>(buffer[1]) << 32u);
+		uint32_t   mode      = buffer[2];
 
-		EXIT_NOT_IMPLEMENTED(args == nullptr);
-		cp.DispatchDirect(args->thread_group_x, args->thread_group_y, args->thread_group_z, mode);
+		EXIT_NOT_IMPLEMENTED(args_addr == 0);
+		// The GPU may still be writing the counts; read them on the GPU like the offset form.
+		cp.DispatchIndirectAt(args_addr, mode);
 
 		return 3;
 	}
@@ -1491,7 +1501,15 @@ KYTY_CP_OP_PARSER(CpOpCondExec) {
 	EXIT_NOT_IMPLEMENTED(addr == 0);
 	EXIT_NOT_IMPLEMENTED(payload_dw + exec_count >= dw);
 
-	if (*reinterpret_cast<const volatile uint32_t*>(addr) == 0) {
+	const auto value = *reinterpret_cast<const volatile uint32_t*>(addr);
+	if (LabelTraceEnabled()) {
+		uint32_t clean = 0;
+		LOGF("LABEL cond_exec q=%d addr=0x%010" PRIx64 " value=0x%08" PRIx32 " skip=%" PRIu32
+		     " remaining=%" PRIu32 " gpu_dirty=%d\n",
+		     cp.QueueTag(), addr, value, exec_count, dw,
+		     Libs::LibKernel::Memory::TryReadGpuCleanBacking(addr, &clean, 4) ? 0 : 1);
+	}
+	if (value == 0) {
 		return payload_dw + exec_count;
 	}
 
@@ -1999,6 +2017,32 @@ KYTY_CP_OP_PARSER(CpOpIndirectBuffer) {
 	}
 
 	GraphicsDbgDumpDcb("ci", indirect_num_dw, indirect_buffer);
+
+	if (LabelTraceEnabled()) {
+		// Walk the packets so a chain buffer the guest already reused is reported by address.
+		uint32_t offset = 0;
+		while (offset < indirect_num_dw) {
+			const auto header = indirect_buffer[offset];
+			const auto type   = header >> 30u;
+			if (type == 3u) {
+				const auto len = ((header >> 16u) & 0x3fffu) + 2u;
+				if (len > 0x4000u) {
+					break;
+				}
+				offset += len;
+			} else if (type == 2u) {
+				offset += 1;
+			} else {
+				break;
+			}
+		}
+		LOGF("LABEL ib q=%d addr=0x%010" PRIx64 " dw=%" PRIu32 " chain=%d first=%08x %08x %08x %08x%s\n",
+		     cp.QueueTag(), reinterpret_cast<uint64_t>(indirect_buffer), indirect_num_dw,
+		     (control & (1u << 20u)) != 0 ? 1 : 0, indirect_buffer[0],
+		     indirect_num_dw > 1 ? indirect_buffer[1] : 0, indirect_num_dw > 2 ? indirect_buffer[2] : 0,
+		     indirect_num_dw > 3 ? indirect_buffer[3] : 0,
+		     offset < indirect_num_dw ? " CORRUPT" : "");
+	}
 
 	cp.ProcessIndirectBuffer({indirect_buffer, indirect_num_dw}, (control & (1u << 20u)) != 0);
 
@@ -3207,6 +3251,12 @@ void GraphicsInitJmpTablesCxIndirect() {
 	g_hw_ctx_indirect_func[Pm4::DB_VRS_OVERRIDE_CNTL] = [](KYTY_HW_CTX_INDIRECT_ARGS) {
 		HwCtxIgnoreVrsOverrideControl(value);
 	};
+	for (auto cmd_offset = Pm4::DB_RESERVED_REG_1; cmd_offset <= Pm4::DB_RESERVED_REG_2;
+	     cmd_offset++) {
+		g_hw_ctx_indirect_func[cmd_offset] = [](KYTY_HW_CTX_INDIRECT_ARGS) {
+			HwCtxIgnoreDbReservedRegister(cmd_offset, value);
+		};
+	}
 	for (auto cmd_offset = Pm4::COHER_DEST_BASE_HI_0; cmd_offset <= Pm4::COHER_DEST_BASE_3;
 	     cmd_offset++) {
 		g_hw_ctx_indirect_func[cmd_offset] = [](KYTY_HW_CTX_INDIRECT_ARGS) {

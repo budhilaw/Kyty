@@ -23,8 +23,24 @@ namespace Libs::Graphics {
 // value that was overwritten before its queue ran again.
 void NoteGuestGpuWrite(uint64_t address);
 
+// Heartbeat of the GPU thread: the phase it entered last and a counter bumped on each
+// change, so a reporter on another thread can tell where it hangs.
+void        SetGpuPhase(const char* phase, uint64_t detail = 0);
+const char* GpuPhase();
+uint64_t    GpuPhaseDetail();
+uint64_t    GpuHeartbeat();
+uint32_t    GpuOsThreadId();
+
 // Records that a submitted command stream contains a packet writing this address.
 void NotePromisedFenceWrite(uint64_t address, const char* origin, const char* packet);
+
+// A label write already recorded into the GPU stream but not yet executed. A wait parsed
+// after it lands behind it in the stream, so the value is guaranteed by the time the wait's
+// own work runs; treating the wait as satisfied keeps a queue from falling a frame behind.
+uint64_t NotePendingGuestGpuWrite(uint64_t address, uint64_t value, uint32_t width);
+void     ResolvePendingGuestGpuWrite(uint64_t id);
+bool     PendingGuestGpuWriteSatisfies(uint64_t address, uint64_t ref, uint64_t mask,
+                                       uint32_t func, uint64_t& value);
 
 // Logs when a GPU write covers the address in KYTY_WATCH_ADDR.
 void CheckGuestWatch(uint64_t address, uint64_t size, const char* who);

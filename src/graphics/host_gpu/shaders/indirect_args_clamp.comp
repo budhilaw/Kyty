@@ -1,0 +1,29 @@
+// Copies an indirect dispatch argument triple, clamping each count to the device limit.
+// Guest memory can hold stale words next to the count the GPU wrote; an unbounded
+// dispatch from them stalls or loses the device.
+#version 450
+#extension GL_EXT_buffer_reference : require
+#extension GL_EXT_buffer_reference2 : require
+#extension GL_ARB_gpu_shader_int64 : require
+
+layout(local_size_x = 1, local_size_y = 1, local_size_z = 1) in;
+
+layout(buffer_reference, std430, buffer_reference_align = 4) buffer ArgsRef {
+    uint words[3];
+};
+
+layout(push_constant) uniform Push {
+    uint64_t src;
+    uint64_t dst;
+    uint     limit_x;
+    uint     limit_y;
+    uint     limit_z;
+} push;
+
+void main() {
+    ArgsRef src = ArgsRef(push.src);
+    ArgsRef dst = ArgsRef(push.dst);
+    dst.words[0] = min(src.words[0], push.limit_x);
+    dst.words[1] = min(src.words[1], push.limit_y);
+    dst.words[2] = min(src.words[2], push.limit_z);
+}

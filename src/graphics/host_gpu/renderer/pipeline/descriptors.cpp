@@ -453,13 +453,19 @@ static ImageViewInfo TextureViewInfo(const ShaderRecompiler::IR::ImageResource& 
 	view.aspect      = vk::ImageAspectFlagBits::eColor;
 	view.base_level  = descriptor.BaseLevel();
 	view.level_count = view_levels;
-	if (descriptor.MinLod() > descriptor.LastLevel() * 256u) {
-		EXIT("texture minimum LOD exceeds last mip level: min_lod=%u last_level=%u\n",
-		     descriptor.MinLod(), descriptor.LastLevel());
+	auto min_lod = descriptor.MinLod();
+	if (min_lod > descriptor.LastLevel() * 256u) {
+		// Hardware clamps the minimum LOD to the last level; a larger value is corrupt data.
+		static std::atomic<uint32_t> log_count {0};
+		if (log_count.fetch_add(1) < 8) {
+			LOGF("texture minimum LOD %u exceeds last mip level %u; clamped\n", min_lod,
+			     descriptor.LastLevel());
+		}
+		min_lod = descriptor.LastLevel() * 256u;
 	}
 	const auto base_lod = view.base_level * 256u;
-	if (descriptor.MinLod() > base_lod) {
-		view.min_lod = descriptor.MinLod() - base_lod;
+	if (min_lod > base_lod) {
+		view.min_lod = min_lod - base_lod;
 	}
 	view.usage = storage ? vk::ImageUsageFlagBits::eStorage : vk::ImageUsageFlagBits::eSampled;
 	view.mapping =
@@ -471,7 +477,8 @@ static ImageViewInfo TextureViewInfo(const ShaderRecompiler::IR::ImageResource& 
 			view.type       = vk::ImageViewType::e1D;
 			view.base_layer = descriptor.BaseArray5();
 			if (view.base_layer >= image_layers) {
-				EXIT("texture base layer is out of bounds\n");
+				// Corrupt descriptor data; hardware clamps the layer index.
+				view.base_layer = image_layers - 1u;
 			}
 			view.layer_count = 1;
 			break;
@@ -479,7 +486,8 @@ static ImageViewInfo TextureViewInfo(const ShaderRecompiler::IR::ImageResource& 
 			view.type       = vk::ImageViewType::e1DArray;
 			view.base_layer = descriptor.BaseArray5();
 			if (view.base_layer >= image_layers) {
-				EXIT("texture array base layer is out of bounds\n");
+				// Corrupt descriptor data; hardware clamps the layer index.
+				view.base_layer = image_layers - 1u;
 			}
 			view.layer_count = image_layers - view.base_layer;
 			break;
@@ -562,7 +570,8 @@ TextureBinding RenderExecutor::ResolveTexture(const ShaderRecompiler::IR::ImageR
 	     (base_level != 0 || last_level == 0 || last_level > 3 || max_mip != last_level ||
 	      !msaa_tile || (descriptor.MsaaDepth() && !depth_tile) ||
 	      (!msaa_array && (descriptor.Depth() != 0 || descriptor.BaseArray5() != 0))))) {
-		EXIT("unsupported texture mip view: base=%u last=%u levels=%u max=%u type=%u tile=%u "
+		// Nonsense mip ranges come from corrupt descriptors; sample a null image instead.
+		LOGF("\t TEXDESC: unsupported texture mip view bound as null: base=%u last=%u levels=%u max=%u type=%u tile=%u "
 		     "class=%u numeric=%u dimension=%u mip_mode=%u read=%d written=%d "
 		     "dwords=%08x,%08x,%08x,%08x,%08x,%08x,%08x,%08x\n",
 		     base_level, last_level, levels, descriptor.MaxMip(),
@@ -573,6 +582,10 @@ TextureBinding RenderExecutor::ResolveTexture(const ShaderRecompiler::IR::ImageR
 		     resource.read, resource.written, descriptor.fields[0], descriptor.fields[1],
 		     descriptor.fields[2], descriptor.fields[3], descriptor.fields[4], descriptor.fields[5],
 		     descriptor.fields[6], descriptor.fields[7]);
+		auto       desc = NullTextureDesc(resource, storage ? TextureCache::BindingType::Storage
+		                                                    : TextureCache::BindingType::Texture);
+		const auto id   = texture_cache.FindImage(desc);
+		return {id, nullptr, std::move(desc)};
 	}
 	const auto samples = multisampled ? 1u << last_level : 1u;
 	auto view_levels = multisampled ? 1u : static_cast<uint32_t>(last_level - base_level) + 1u;
@@ -630,8 +643,25 @@ TextureBinding RenderExecutor::ResolveTexture(const ShaderRecompiler::IR::ImageR
 		size.size *= image_layers;
 	} else {
 		pitch = TileGetTexturePitch(format, width, tile);
-		TileGetTextureTotalSize(format, width, height, volume ? depth : image_layers,
-		                        physical_levels, tile, volume, size);
+		if (!TileGetTextureTotalSize(format, width, height, volume ? depth : image_layers,
+		                             physical_levels, tile, volume, size)) {
+			// The descriptor describes more than 4 GiB: corrupt data, not a texture. Sample a
+			// null image so the frame survives; the shader cannot have meant this.
+			static std::atomic<uint32_t> log_count {0};
+			if (log_count.fetch_add(1) < 32) {
+				LOGF("\t TEXDESC: oversized texture bound as null: addr=0x%016" PRIx64
+				     " format=%u extent=%ux%ux%u levels=%u tile=%u dwords=%08x,%08x,%08x,%08x,%08x,"
+				     "%08x,%08x,%08x\n",
+				     address, static_cast<uint32_t>(format), width, height, depth, physical_levels,
+				     static_cast<uint32_t>(tile), descriptor.fields[0], descriptor.fields[1],
+				     descriptor.fields[2], descriptor.fields[3], descriptor.fields[4],
+				     descriptor.fields[5], descriptor.fields[6], descriptor.fields[7]);
+			}
+			auto       desc = NullTextureDesc(resource, storage ? TextureCache::BindingType::Storage
+			                                                    : TextureCache::BindingType::Texture);
+			const auto id   = texture_cache.FindImage(desc);
+			return {id, nullptr, std::move(desc)};
+		}
 	}
 	EXIT_NOT_IMPLEMENTED(size.size == 0 || size.align == 0 ||
 	                     (address & (static_cast<uint64_t>(size.align) - 1u)) != 0);
@@ -831,6 +861,20 @@ void RenderExecutor::FindBuffers(PreparedBindings& prepared) {
 			prepared.buffer_sources.push_back({});
 			continue;
 		}
+		if (!GuestRange {address, requested_size}.Valid()) {
+			// A base beyond the guest address space is a corrupt descriptor; read it as null.
+			static std::atomic<uint32_t> log_count {0};
+			if (log_count.fetch_add(1) < 32) {
+				LOGF("\t BUFDESC: descriptor %" PRIu32 " of shader 0x%016" PRIx64
+				     " lies outside guest memory: addr=0x%016" PRIx64 " size=0x%016" PRIx64
+				     " raw= %08" PRIx32 " %08" PRIx32 " %08" PRIx32 " %08" PRIx32 "\n",
+				     i, program.shader_hash, address, requested_size, snapshot.buffers[i].dwords[0],
+				     snapshot.buffers[i].dwords[1], snapshot.buffers[i].dwords[2],
+				     snapshot.buffers[i].dwords[3]);
+			}
+			prepared.buffer_sources.push_back({});
+			continue;
+		}
 		{
 			// The game leaves placeholder descriptors bound with bases outside the address
 			// space; they read as zero on hardware, and clamping their range would abort. This
@@ -852,6 +896,16 @@ void RenderExecutor::FindBuffers(PreparedBindings& prepared) {
 		}
 		const auto size = Libs::LibKernel::Memory::ClampRangeSize(address, requested_size);
 		prepared.buffer_sources.push_back({address, size, cache.FindBuffer(address, size)});
+		if (uint64_t hit = 0; program.info.buffers[i].written && CoversRecentIndirectArgs(address, size, hit)) {
+			static std::atomic<uint32_t> log_count {0};
+			if (log_count.fetch_add(1) < 512) {
+				LOGF("SHADERDUMP args writer hash=0x%016" PRIx64 " buffer=%u addr=0x%016" PRIx64
+				     " size=0x%" PRIx64 " args=0x%016" PRIx64 " offset=0x%" PRIx64 " stride=%u raw=%08x %08x %08x %08x\n",
+				     program.shader_hash, i, address, size, hit, hit - address,
+				     static_cast<uint32_t>(descriptor.Stride()), snapshot.buffers[i].dwords[0], snapshot.buffers[i].dwords[1],
+				     snapshot.buffers[i].dwords[2], snapshot.buffers[i].dwords[3]);
+			}
+		}
 	}
 }
 
@@ -883,6 +937,16 @@ void RenderExecutor::RebindBuffers(PreparedBindings& prepared) {
 	if (ShaderRecompiler::IR::FindBinding(
 	        layout, ShaderRecompiler::IR::DescriptorBindingKind::FlattenedSrt) != nullptr) {
 		prepared.flattened_srt = NativeUpload(m_context, snapshot.flattened_srt);
+		static std::atomic<uint32_t> dump_count {0};
+		if (ShaderDumpRequested(program.shader_hash) && dump_count.fetch_add(1) < 4096) {
+			std::string text;
+			for (size_t i = 0; i < snapshot.flattened_srt.size(); i++) {
+				text += (i % 8) == 0 ? fmt::format("\n  [{:3}] {:08x}", i, snapshot.flattened_srt[i])
+				                     : fmt::format(" {:08x}", snapshot.flattened_srt[i]);
+			}
+			LOGF("SHADERDUMP flattened srt hash=0x%016" PRIx64 " dwords=%zu%s\n",
+			     program.shader_hash, snapshot.flattened_srt.size(), text.c_str());
+		}
 	}
 	if (ShaderRecompiler::IR::FindBinding(
 	        program.bindings, ShaderRecompiler::IR::DescriptorBindingKind::ShaderData) != nullptr) {
@@ -939,11 +1003,42 @@ void RenderExecutor::RebindImages(PreparedBindings& prepared) {
 	}
 }
 
+void RenderExecutor::MapUserDataPointers(const PreparedBindings& bindings) {
+	constexpr uint64_t Window = 256u * 1024u;
+	const auto&        user_data = bindings.runtime->resources.user_data;
+	auto&              cache     = m_context.GetBufferCache();
+	for (size_t i = 0; i + 1 < user_data.size(); i++) {
+		const auto pointer = uint64_t {user_data[i]} | (uint64_t {user_data[i + 1]} << 32u);
+		// Only GPU-visible memory qualifies: a stack or heap pointer must not gain a GPU copy,
+		// since a later readback of that copy would overwrite what the CPU wrote there.
+		if (pointer < 0x10000u || pointer >= (uint64_t {1} << 40u) ||
+		    !m_context.IsMapped(pointer, sizeof(uint32_t))) {
+			continue;
+		}
+		uint64_t map_begin = 0;
+		uint64_t map_limit = 0;
+		int      prot      = 0;
+		if (!Libs::LibKernel::Memory::QueryMappingProtection(pointer, &map_begin, &map_limit, &prot) ||
+		    (prot & 0x10) == 0) {
+			continue;
+		}
+		const auto base      = std::max(pointer & ~uint64_t {0xffff}, map_begin);
+		const auto size      = std::min<uint64_t>(Window, map_limit > base ? map_limit - base : 0);
+		if (size == 0 || !m_context.IsMapped(base, size)) {
+			continue;
+		}
+		(void)cache.ObtainBuffer(base, size, false, false);
+	}
+}
+
 void RenderExecutor::PrepareGraphicsBindings(std::span<PreparedBindings* const> stages,
                                              std::span<RenderColorInfo> colors) {
 	bool uses_dma = false;
 	for (auto* stage: stages) {
 		FindBuffers(*stage);
+		if (stage->runtime->program->info.uses_dma) {
+			MapUserDataPointers(*stage);
+		}
 		uses_dma |= stage->runtime->program->info.uses_dma;
 	}
 	if (uses_dma) {

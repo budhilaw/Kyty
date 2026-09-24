@@ -5,6 +5,7 @@
 #include "common/logging/log.h"
 #include "common/threads.h"
 #include "common/profiler.h"
+#include "graphics/guest_gpu/command_processor/commandProcessor.h"
 #include "graphics/guest_gpu/graphicsRun.h"
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/renderer/cache/textureCache.h"
@@ -12,6 +13,7 @@
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
 #include "graphics/host_gpu/vulkanCommon.h"
+#include "graphics/host_gpu/renderer/pipeline/pipelineCache.h"
 #include "kernel/memory.h"
 
 #include "common/timer.h"
@@ -29,6 +31,9 @@ namespace Libs::Graphics {
 
 // A readback may complete after the game released the pages; the data is then unwanted.
 static void WriteBackingIfMapped(uint64_t vaddr, const void* data, uint64_t size) {
+	if (Libs::Graphics::LabelTraceEnabled()) {
+		LOGF("DOWNLOAD buffer range=0x%010" PRIx64 "+0x%" PRIx64 "\n", vaddr, size);
+	}
 	if (!Libs::LibKernel::Memory::TryWriteBacking(vaddr, data, size)) {
 		LOGF("Memory: skipped readback into unmapped range addr=0x%016" PRIx64 " size=0x%016" PRIx64 "\n", vaddr, size);
 	}
@@ -58,6 +63,20 @@ void BufferCache::WriteDataBuffer(Buffer& buffer, uint64_t address, const void* 
 		bytes += chunk;
 		address += chunk;
 		size -= chunk;
+	}
+}
+
+// Diagnostic trace of every cache operation touching a page that holds indirect dispatch
+// arguments; enabled by the label trace.
+static void TraceArgs(const char* what, uint64_t vaddr, uint64_t size, const std::string& extra) {
+	if (!Libs::Graphics::LabelTraceEnabled() || size == 0) {
+		return;
+	}
+	const auto begin = vaddr & ~uint64_t {0xfff};
+	const auto end   = (vaddr + size + 0xfffu) & ~uint64_t {0xfff};
+	if (uint64_t hit = 0; CoversRecentIndirectArgs(begin, end - begin, hit)) {
+		LOGF("ARGSTRACE %s args=0x%010" PRIx64 " range=0x%010" PRIx64 "+0x%" PRIx64 " %s\n", what,
+		     hit, vaddr, size, extra.c_str());
 	}
 }
 
@@ -135,6 +154,7 @@ bool BufferCache::DownloadBufferMemory(Buffer& buffer, uint64_t vaddr, uint64_t 
 		    m_memory_tracker.ValidateGpuDirtyPages(m_gpu_modified_ranges, address, bytes,
 		                                           "buffer download");
 		    m_gpu_modified_ranges.ForEachInRange(address, bytes, [&](uint64_t start, uint64_t end) {
+			    TraceArgs("download", start, end - start, "");
 			    copies.emplace_back(start - buffer_address, total_size, end - start);
 			    // Keep packed ranges on separate cache lines, as in shadPS4.
 			    total_size += Common::AlignUp(end - start, 64);
@@ -425,12 +445,16 @@ void BufferCache::InvalidateMemory(uint64_t vaddr, uint64_t size) {
 	if (!GuestRange {vaddr, size}.Valid()) {
 		EXIT("BufferCache: invalid memory-invalidation range\n");
 	}
+	TraceArgs("invalidate", vaddr, size, "");
 	m_memory_tracker.InvalidateRegion(vaddr, size,
 	                                  [this, vaddr, size] { ReadMemory(vaddr, size, true); });
 }
 
 void BufferCache::ReadMemory(uint64_t vaddr, uint64_t size, bool is_write) {
 	Common::WaitTrace::Scope readback_scope(Common::WaitTrace::Kind::GpuReadback);
+	if (GuestGpu::IsGpuThread()) {
+		SetGpuPhase("readback", vaddr);
+	}
 	if (!GuestGpu::IsGpuThread() && CommandScheduler::InDeferredOperation()) {
 		Common::WaitTrace::PrintHostStack("deferred readback");
 		EXIT("unsupported buffer readback from an asynchronous GPU completion, "
@@ -655,6 +679,8 @@ void BufferCache::JoinOverlap(BufferId new_id, BufferId overlap_id, bool accumul
 	if (accumulate_stream_score) {
 		new_buffer.IncreaseStreamScore(overlap.StreamScore() + 1);
 	}
+	TraceArgs("join", overlap.CpuAddress(), overlap.Size(),
+	          fmt::format("into buffer=0x{:x}+0x{:x}", new_buffer.CpuAddress(), new_buffer.Size()));
 	new_buffer.CopyFrom(m_scheduler.Current(), overlap, 0,
 	                    overlap.CpuAddress() - new_buffer.CpuAddress(), overlap.Size());
 	DeleteBuffer(overlap_id);
@@ -667,6 +693,7 @@ BufferId BufferCache::CreateBuffer(uint64_t vaddr, uint64_t size) {
 	size               = end - vaddr;
 	const auto overlap = ResolveOverlaps(vaddr, size);
 
+	TraceArgs("create", overlap.begin, overlap.end - overlap.begin, "");
 	const auto id = m_slot_buffers.insert(
 	    m_graphics, m_scheduler, MemoryUsage::DeviceLocal, overlap.begin,
 	    AllFlags | vk::BufferUsageFlagBits::eShaderDeviceAddress, overlap.end - overlap.begin);
@@ -690,6 +717,8 @@ bool BufferCache::SynchronizeBuffer(Buffer& buffer, uint64_t vaddr, uint64_t siz
 	m_memory_tracker.ForEachUploadRange(
 	    vaddr, size, is_written,
 	    [&](uint64_t address, uint64_t bytes) noexcept {
+		    TraceArgs("upload", address, bytes,
+		              fmt::format("into buffer=0x{:x}+0x{:x}", buffer.CpuAddress(), buffer.Size()));
 		    copies.emplace_back(total_size, buffer.Offset(address), bytes);
 		    total_size += bytes;
 	    },
@@ -721,6 +750,7 @@ bool BufferCache::SynchronizeBuffer(Buffer& buffer, uint64_t vaddr, uint64_t siz
 		                       vk::DependencyFlagBits::eByRegion, 0, nullptr, 1, &after, 0, nullptr);
 	}
 	if (is_texel_buffer && !is_written) {
+		TraceArgs("sync-from-image", vaddr, size, "");
 		return SynchronizeBufferFromImage(buffer, vaddr, size);
 	}
 	return false;
@@ -774,6 +804,10 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBuffer(uint64_t vaddr, uint64_t 
 		     vaddr, size);
 	}
 
+	TraceArgs("obtain", vaddr, size,
+	          fmt::format("written={} texel={} cpu_dirty={} gpu_dirty={}", is_written, is_texel_buffer,
+	                      m_memory_tracker.IsRegionCpuModified(vaddr, size),
+	                      m_memory_tracker.IsRegionGpuModified(vaddr, size)));
 	if (!is_written && size <= CACHING_PAGESIZE &&
 	    !m_memory_tracker.IsRegionGpuModified(vaddr, size) &&
 	    m_memory_tracker.IsRegionCpuModified(vaddr, size)) {
@@ -782,6 +816,7 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBuffer(uint64_t vaddr, uint64_t 
 		auto [mapped, offset] = m_stream_buffer.Map(size, alignment, false);
 		if (mapped != nullptr && Libs::LibKernel::Memory::TryReadBacking(vaddr, mapped, size)) {
 			m_stream_buffer.Commit();
+			TraceArgs("obtain-stream", vaddr, size, "");
 			return {&m_stream_buffer, offset};
 		}
 	}
@@ -791,6 +826,8 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBuffer(uint64_t vaddr, uint64_t 
 	}
 	auto& buffer = m_slot_buffers[id];
 	TouchBuffer(buffer);
+	TraceArgs("obtain-buffer", vaddr, size,
+	          fmt::format("buffer=0x{:x}+0x{:x}", buffer.CpuAddress(), buffer.Size()));
 	(void)SynchronizeBuffer(buffer, vaddr, size, is_written, is_texel_buffer);
 	if (is_written) {
 		m_gpu_modified_ranges.Add(vaddr, size);
@@ -886,6 +923,19 @@ void BufferCache::CopyBuffer(uint64_t dst_vaddr, uint64_t src_vaddr, uint64_t si
 	auto& command = m_scheduler.Current();
 	if (dst_memory) {
 		m_texture_cache.InvalidateMemoryFromGPU(dst_vaddr, size);
+		if (uint64_t hit = dst_vaddr; src_gds && size == 4u && Libs::Graphics::LabelTraceEnabled()) {
+			static std::atomic<uint32_t> log_count {0};
+			if (log_count.fetch_add(1) < (1u << 20u)) {
+				uint32_t    words[3] {};
+				const bool  ok = Libs::LibKernel::Memory::TryReadBacking(hit, words, sizeof(words));
+				LOGF("SHADERDUMP dma to args=0x%016" PRIx64 " dst=0x%016" PRIx64 " size=%" PRIu64
+				     " src_gds=%d src=0x%" PRIx64 " host=%08x %08x %08x read=%d cpu_dirty=%d gpu_dirty=%d"
+				     " gpu_bytes=%d\n",
+				     hit, dst_vaddr, size, src_gds ? 1 : 0, src_vaddr, words[0], words[1], words[2],
+				     ok ? 1 : 0, IsRegionCpuModified(hit, 12) ? 1 : 0, IsRegionGpuModified(hit, 12) ? 1 : 0,
+				     m_gpu_modified_ranges.Intersects(hit, 12) ? 1 : 0);
+			}
+		}
 	}
 	const auto src_id      = src_memory ? FindBuffer(src_vaddr, size) : BufferId {};
 	const auto dst_id      = dst_memory ? FindBuffer(dst_vaddr, size) : BufferId {};
@@ -953,6 +1003,7 @@ void BufferCache::RunGarbageCollector() {
 			EXIT_IF(!DownloadBufferMemory(buffer, buffer.CpuAddress(), buffer.Size()));
 			dirty_buffers.push_back(id);
 		} else {
+			TraceArgs("gc-delete", buffer.CpuAddress(), buffer.Size(), "");
 			m_memory_tracker.UntrackMemory(buffer.CpuAddress(), buffer.Size());
 			DeleteBuffer(id);
 		}

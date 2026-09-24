@@ -39,6 +39,8 @@ namespace ImageViewOps {
 		switch (GetDstSel(swizzle, channel)) {
 			case 0:
 			case 1:
+			case 2: // reserved selectors read as zero
+			case 3:
 			case 4:
 			case 5:
 			case 6:

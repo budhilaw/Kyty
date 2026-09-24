@@ -2,6 +2,7 @@
 
 #include "common/alignment.h"
 #include "common/assert.h"
+#include "common/logging/log.h"
 #include "graphics/guest_gpu/gpu_defs.h"
 #include "graphics/guest_gpu/gpu_format.h"
 #include "graphics/host_gpu/renderer/image/tiler.h"
@@ -9,6 +10,7 @@
 #include "graphics/shader/shader.h"
 
 #include <algorithm>
+#include <atomic>
 #include <array>
 #include <cinttypes>
 
@@ -155,7 +157,15 @@ vk::ComponentMapping TextureGetComponentMapping(uint32_t                        
 			case Prospero::CompSwizzle::kGreen: return storage_components[1];
 			case Prospero::CompSwizzle::kBlue: return storage_components[2];
 			case Prospero::CompSwizzle::kAlpha: return storage_components[3];
-			default: EXIT("unknown swizzle: %u\n", static_cast<uint32_t>(selector));
+			default: {
+				// Selectors 2 and 3 are reserved; hardware reads them as zero.
+				static std::atomic<uint32_t> log_count {0};
+				if (log_count.fetch_add(1) < 8) {
+					LOGF("texture swizzle selector %u is reserved; using zero\n",
+					     static_cast<uint32_t>(selector));
+				}
+				return vk::ComponentSwizzle::eZero;
+			}
 		}
 	};
 	return {resolve(0), resolve(1), resolve(2), resolve(3)};
