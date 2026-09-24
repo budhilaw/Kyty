@@ -556,6 +556,118 @@ private:
 		return true;
 	}
 
+	// An image descriptor loaded through a pointer at (key << 5) + offset, key from a buffer.
+	bool TryMakeAddressHeapImage(Inst& handle, uint32_t pc, IndirectImagePlan& plan) {
+		if (handle.GetOpcode() != ValueOpcode::GetImageResource || handle.NumArgs() != 8u) {
+			return false;
+		}
+		std::array<Inst*, 8> heap_reads {};
+		Inst*                heap_handle = nullptr;
+		Value                heap_offset;
+		for (uint32_t dword = 0; dword < heap_reads.size(); dword++) {
+			heap_reads[dword] = handle.Arg(dword).Resolve().TryInstruction();
+			if (heap_reads[dword] == nullptr ||
+			    heap_reads[dword]->GetOpcode() != ValueOpcode::LoadAddressU32) {
+				return false;
+			}
+			const auto memory_index = heap_reads[dword]->Flags<MemoryFlags>().index;
+			if (memory_index >= m_program.memory_info.size()) {
+				return false;
+			}
+			const auto& memory = m_program.memory_info[memory_index];
+			if (memory.kind != ResourceKind::ScalarAddress || memory.address_is_full ||
+			    memory.offset != dword * sizeof(uint32_t)) {
+				return false;
+			}
+			auto* current_handle = heap_reads[dword]->Arg(0).Resolve().TryInstruction();
+			if (current_handle == nullptr ||
+			    current_handle->GetOpcode() != ValueOpcode::GetAddressResource ||
+			    current_handle->NumArgs() != 2u ||
+			    (heap_handle != nullptr && current_handle != heap_handle)) {
+				return false;
+			}
+			heap_handle = current_handle;
+			if (dword == 0u) {
+				heap_offset = heap_reads[dword]->Arg(1).Resolve();
+			} else if (!EquivalentValue(m_program, heap_offset, heap_reads[dword]->Arg(1))) {
+				return false;
+			}
+			plan.memory[dword] = memory_index;
+			plan.reads[dword]  = heap_reads[dword];
+		}
+		for (const auto* read: heap_reads) {
+			for (const auto& use: read->Uses()) {
+				if (use.user == nullptr || use.user->GetOpcode() != ValueOpcode::GetImageResource) {
+					return false;
+				}
+			}
+		}
+		uint32_t base_offset = 0;
+		auto*    shift       = heap_offset.TryInstruction();
+		if (shift != nullptr && shift->GetOpcode() == ValueOpcode::IAdd32 && shift->NumArgs() == 2u) {
+			if (ImmediateU32(shift->Arg(1), base_offset)) {
+				shift = shift->Arg(0).Resolve().TryInstruction();
+			} else if (ImmediateU32(shift->Arg(0), base_offset)) {
+				shift = shift->Arg(1).Resolve().TryInstruction();
+			} else {
+				return false;
+			}
+		}
+		uint32_t shift_amount = 0;
+		if (shift == nullptr || shift->GetOpcode() != ValueOpcode::ShiftLeftLogical32 ||
+		    shift->NumArgs() != 2u || !ImmediateU32(shift->Arg(1), shift_amount) ||
+		    shift_amount != 5u) {
+			return false;
+		}
+		auto* material_read = shift->Arg(0).Resolve().TryInstruction();
+		if (material_read == nullptr) {
+			return false;
+		}
+		uint32_t    material_memory_index = 0;
+		const auto* material_memory       = ScalarReadMemory(*material_read, material_memory_index);
+		if (material_memory == nullptr) {
+			return false;
+		}
+		auto* material_handle = material_read->Arg(0).Resolve().TryInstruction();
+		if (material_handle == nullptr) {
+			return false;
+		}
+		DescriptorSource material_source;
+		uint32_t         material_source_index = 0;
+		if (!MakeRuntimeBufferSource(*material_handle, pc, material_source_index,
+		                             material_source)) {
+			return false;
+		}
+		DescriptorSource heap_source;
+		heap_source.dword_count = 4u;
+		heap_source.dwords[0]   = heap_handle->Arg(0);
+		heap_source.dwords[1]   = heap_handle->Arg(1);
+		heap_source.dwords[2]   = Value(0xffffffffu);
+		heap_source.dwords[3]   = Value(0u);
+		uint32_t bad_dword      = 0;
+		if (!ValidateSource(heap_source, bad_dword)) {
+			return false;
+		}
+		const auto heap_source_index = InternSource(heap_source);
+
+		DescriptorSource image_source;
+		image_source.dword_count = 8u;
+		std::copy(material_source.dwords.begin(), material_source.dwords.begin() + 4u,
+		          image_source.dwords.begin());
+		std::copy(heap_source.dwords.begin(), heap_source.dwords.begin() + 4u,
+		          image_source.dwords.begin() + 4u);
+		DescriptorSource::IndirectImage indirect {material_source_index, heap_source_index, 4u,
+		                                          material_memory->offset % 4u, 0u};
+		indirect.address_heap = true;
+		indirect.heap_offset  = base_offset;
+		image_source.indirect_image = indirect;
+		plan.handle = &handle;
+		plan.source = InternSource(image_source);
+		plan.key    = Value(material_read);
+		plan.roots  = image_source.dwords;
+		return true;
+	}
+
 	static bool MatchIndexedOffset(Value value, Value& selector, uint32_t& stride,
 	                               uint32_t& offset) {
 		value           = value.Resolve();
@@ -617,7 +729,8 @@ private:
 				}
 				IndirectImagePlan plan;
 				if (TryMakeIndirectImage(*handle, inst.Flags<MemoryFlags>().pc, plan) ||
-				    TryMakeDirectImageTable(*handle, inst.Flags<MemoryFlags>().pc, plan)) {
+				    TryMakeDirectImageTable(*handle, inst.Flags<MemoryFlags>().pc, plan) ||
+				    TryMakeAddressHeapImage(*handle, inst.Flags<MemoryFlags>().pc, plan)) {
 					m_indirect_images.push_back(std::move(plan));
 				}
 			}

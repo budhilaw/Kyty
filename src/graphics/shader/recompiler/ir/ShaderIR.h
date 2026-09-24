@@ -464,6 +464,10 @@ struct DescriptorSource {
 		uint32_t key_arg         = 0;
 		// The key indexes the heap directly: descriptor at key * stride + offset.
 		bool direct = false;
+		// Keys are read from any dword of the material buffer and the descriptor sits at
+		// (key << 5) + heap_offset in a raw address heap.
+		bool     address_heap = false;
+		uint32_t heap_offset  = 0;
 
 		bool operator==(const IndirectImage& other) const = default;
 	};

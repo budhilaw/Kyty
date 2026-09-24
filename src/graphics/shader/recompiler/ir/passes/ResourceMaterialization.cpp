@@ -257,7 +257,7 @@ bool MaterializeIndirectImage(const DescriptorSource::IndirectImage& indirect,
 		result = std::move(next);
 		return true;
 	}
-	if (material.Stride() != indirect.selector_stride) {
+	if (!indirect.address_heap && material.Stride() != indirect.selector_stride) {
 		return false;
 	}
 
@@ -298,12 +298,20 @@ bool MaterializeIndirectImage(const DescriptorSource::IndirectImage& indirect,
 	for (const auto key: next.keys) {
 		DescriptorValue candidate;
 		candidate.dword_count  = 8u;
-		const auto heap_offset = key << 5u;
+		const auto heap_offset = (key << 5u) + indirect.heap_offset;
+		bool       readable    = true;
 		for (uint32_t dword = 0; dword < candidate.dword_count; dword++) {
 			if (!ReadScalarBufferWord(heap, heap_offset, dword * sizeof(uint32_t), runtime,
 			                          candidate.dwords[dword])) {
-				return false;
+				if (!indirect.address_heap) {
+					return false;
+				}
+				readable = false;
+				break;
 			}
+		}
+		if (!readable) {
+			candidate.dwords.fill(0);
 		}
 		if (NullImageDescriptor(candidate) || !ValidImageDescriptor(candidate, r128)) {
 			candidate.dwords.fill(0);
