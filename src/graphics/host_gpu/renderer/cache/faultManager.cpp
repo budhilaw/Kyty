@@ -6,6 +6,7 @@
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/renderer/cache/bufferCache.h"
 #include "graphics/host_gpu/renderer/commandScheduler.h"
+#include "graphics/host_gpu/renderer/renderContext.h"
 #include "graphics/host_gpu/vulkanCommon.h"
 
 #include <bit>
@@ -76,7 +77,9 @@ FaultManager::~FaultManager() {
 
 void FaultManager::ProcessFaultBuffer() {
 	for (const auto& [start, size]: std::exchange(m_written_ranges, {})) {
-		(void)m_buffer_cache.ObtainBuffer(start, size, true);
+		if (m_scheduler.Context().IsMapped(start, size)) {
+			(void)m_buffer_cache.ObtainBuffer(start, size, true);
+		}
 	}
 	if (const auto wait_tick = m_fault_areas[m_current_area]; wait_tick != 0) {
 		m_scheduler.Wait(wait_tick);

@@ -224,7 +224,7 @@ bool MaterializeIndirectImage(const DescriptorSource::IndirectImage& indirect,
 		}
 		const auto count = std::min<uint64_t>(
 		    (heap.GetSize() - indirect.selector_offset - 32u) / indirect.selector_stride + 1u,
-		    MaxIndirectImageProbes);
+		    indirect.address_heap ? uint64_t {ShaderInfo::MaxImages} : MaxIndirectImageProbes);
 		IndirectImage next;
 		next.keys.reserve(static_cast<size_t>(count));
 		for (uint32_t key = 0; key < count; key++) {
@@ -234,7 +234,12 @@ bool MaterializeIndirectImage(const DescriptorSource::IndirectImage& indirect,
 			for (uint32_t dword = 0; dword < candidate.dword_count; dword++) {
 				if (!ReadScalarBufferWord(heap, base, dword * sizeof(uint32_t), runtime,
 				                          candidate.dwords[dword])) {
-					return SpecializationFail(fmt::format("direct image table read failed key={}", key));
+					if (!indirect.address_heap) {
+						return SpecializationFail(
+						    fmt::format("direct image table read failed key={}", key));
+					}
+					candidate.dwords.fill(0);
+					break;
 				}
 			}
 			if (NullImageDescriptor(candidate) || !ValidImageDescriptor(candidate, r128)) {

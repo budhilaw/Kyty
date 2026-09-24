@@ -757,8 +757,12 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBuffer(uint64_t vaddr, uint64_t 
                                                        bool is_written, bool is_texel_buffer,
                                                        BufferId id) {
 	auto& command = m_scheduler.Current();
-	if (command.IsInvalid() || !GuestRange {vaddr, size}.Valid()) {
+	if (command.IsInvalid()) {
 		EXIT("BufferCache: buffer request requires a recording command buffer\n");
+	}
+	if (!GuestRange {vaddr, size}.Valid()) {
+		EXIT("BufferCache: invalid buffer range addr=0x%016" PRIx64 " size=0x%016" PRIx64 "\n",
+		     vaddr, size);
 	}
 
 	if (!is_written && size <= CACHING_PAGESIZE &&

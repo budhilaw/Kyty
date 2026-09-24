@@ -619,6 +619,16 @@ private:
 		    shift_amount != 5u) {
 			return false;
 		}
+		DescriptorSource heap_source;
+		heap_source.dword_count = 4u;
+		heap_source.dwords[0]   = heap_handle->Arg(0);
+		heap_source.dwords[1]   = heap_handle->Arg(1);
+		heap_source.dwords[2]   = Value(0xffffffffu);
+		heap_source.dwords[3]   = Value(0u);
+		uint32_t heap_bad_dword = 0;
+		if (!ValidateSource(heap_source, heap_bad_dword)) {
+			return false;
+		}
 		auto* material_read = shift->Arg(0).Resolve().TryInstruction();
 		if (material_read == nullptr) {
 			return false;
@@ -626,7 +636,26 @@ private:
 		uint32_t    material_memory_index = 0;
 		const auto* material_memory       = ScalarReadMemory(*material_read, material_memory_index);
 		if (material_memory == nullptr) {
-			return false;
+			// A computed key with no key buffer: probe a bounded range of the table.
+			if (material_read->GetType() != Type::U32) {
+				return false;
+			}
+			const auto heap_index = InternSource(heap_source);
+			DescriptorSource image_source;
+			image_source.dword_count = 8u;
+			std::copy(heap_source.dwords.begin(), heap_source.dwords.begin() + 4u,
+			          image_source.dwords.begin());
+			std::copy(heap_source.dwords.begin(), heap_source.dwords.begin() + 4u,
+			          image_source.dwords.begin() + 4u);
+			DescriptorSource::IndirectImage direct {heap_index, heap_index, 32u, base_offset, 0u,
+			                                        true};
+			direct.address_heap         = true;
+			image_source.indirect_image = direct;
+			plan.handle = &handle;
+			plan.source = InternSource(image_source);
+			plan.key    = Value(material_read);
+			plan.roots  = image_source.dwords;
+			return true;
 		}
 		auto* material_handle = material_read->Arg(0).Resolve().TryInstruction();
 		if (material_handle == nullptr) {
@@ -636,16 +665,6 @@ private:
 		uint32_t         material_source_index = 0;
 		if (!MakeRuntimeBufferSource(*material_handle, pc, material_source_index,
 		                             material_source)) {
-			return false;
-		}
-		DescriptorSource heap_source;
-		heap_source.dword_count = 4u;
-		heap_source.dwords[0]   = heap_handle->Arg(0);
-		heap_source.dwords[1]   = heap_handle->Arg(1);
-		heap_source.dwords[2]   = Value(0xffffffffu);
-		heap_source.dwords[3]   = Value(0u);
-		uint32_t bad_dword      = 0;
-		if (!ValidateSource(heap_source, bad_dword)) {
 			return false;
 		}
 		const auto heap_source_index = InternSource(heap_source);
