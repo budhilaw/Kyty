@@ -81,6 +81,11 @@ struct SystemServiceHdrToneMapLuminance {
 	float min_tone_map_luminance;
 };
 
+static int KYTY_SYSV_ABI SystemServiceDisableMediaPlay() {
+	PRINT_NAME();
+	return OK;
+}
+
 static int KYTY_SYSV_ABI SystemServiceHideSplashScreen() {
 	PRINT_NAME();
 
@@ -537,6 +542,7 @@ LIB_DEFINE(InitSystemGesture_1) {
 LIB_DEFINE(InitSystemService_1) {
 	PRINT_NAME_ENABLE(true);
 	LIB_FUNC("Vo5V8KAwCmk", SystemService::SystemServiceHideSplashScreen);
+	LIB_FUNC("64nkF7LGk8w", SystemService::SystemServiceDisableMediaPlay);
 	LIB_FUNC("fZo48un7LK4", SystemService::SystemServiceParamGetInt);
 	LIB_FUNC("SsC-m-S9JTA", SystemService::SystemServiceParamGetString);
 	LIB_FUNC("656LMQSrg6U", SystemService::SystemServiceReceiveEvent);

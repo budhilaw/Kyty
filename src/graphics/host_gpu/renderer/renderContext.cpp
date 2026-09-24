@@ -78,7 +78,8 @@ bool RenderContext::HandleFault(PageFaultAccess access, uint64_t fault_vaddr) no
 	// The host reports the faulting byte, not the instruction's access width. Both caches
 	// resolve its page; guessing a width can cross the end of a valid guest mapping.
 	constexpr uint64_t fault_size = 1;
-	if (!IsMapped(fault_vaddr, fault_size)) {
+	// GPU tracking never removes execute rights, so retrying an execute fault would spin forever.
+	if (!IsMapped(fault_vaddr, fault_size) || access == PageFaultAccess::Execute) {
 		return false;
 	}
 	if (access == PageFaultAccess::Write) {
@@ -161,6 +162,22 @@ bool RenderContext::HandleFault(PageFaultAccess access, uint64_t fault_vaddr) no
 			}
 		}
 		m_buffer_cache.ReadMemory(fault_vaddr, fault_size);
+#ifdef _WIN32
+		// A page that stays unreadable after the readback will fault forever; say who holds it.
+		MEMORY_BASIC_INFORMATION mbi {};
+		if (VirtualQuery(reinterpret_cast<void*>(fault_vaddr), &mbi, sizeof(mbi)) != 0 &&
+		    (mbi.Protect & (PAGE_NOACCESS | PAGE_GUARD)) != 0) {
+			static std::atomic<uint32_t> stuck_log {0};
+			if ((stuck_log.fetch_add(1) % 50000) == 0) {
+				LOGF("READFAULT stuck: addr=0x%010" PRIx64 " protect=0x%lx state=0x%lx type=0x%lx "
+				     "gpu_tracked=%d texture=%d\n",
+				     fault_vaddr, mbi.Protect, mbi.State, mbi.Type,
+				     m_buffer_cache.IsRegionGpuModified(fault_vaddr & ~uint64_t {0xfff}, 0x1000) ? 1 : 0,
+				     m_texture_cache.IsRegionGpuModified(fault_vaddr & ~uint64_t {0xfff}, 0x1000) ? 1
+				                                                                              : 0);
+			}
+		}
+#endif
 	}
 	return true;
 }

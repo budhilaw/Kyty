@@ -2,6 +2,7 @@
 #define EMULATOR_SRC_GRAPHICS_HOST_GPU_MEMORYTRACKER_H_
 
 #include "common/assert.h"
+#include "common/threads.h"
 #include "graphics/host_gpu/pageManager.h"
 #include "graphics/host_gpu/rangeSet.h"
 #include "graphics/host_gpu/regionManager.h"
@@ -110,6 +111,7 @@ private:
 
 	void CheckNotInUploadCallback() const noexcept {
 		if (s_upload_owner == this) {
+			Common::WaitTrace::PrintHostStack("memory tracker re-entry");
 			EXIT("memory tracker re-entered from upload callback\n");
 		}
 	}

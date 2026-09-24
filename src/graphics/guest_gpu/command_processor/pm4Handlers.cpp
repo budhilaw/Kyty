@@ -2203,7 +2203,9 @@ KYTY_CP_OP_PARSER(CpOpIndirectUcRegs) {
 				LOGF("\t uc_indirect[%" PRIu32 "] offset=0x%08" PRIx32 ", value=0x%08" PRIx32 "\n",
 				     j, dump_regs[j * 2], dump_regs[j * 2 + 1]);
 			}
-			EXIT("unknown uc reg at %05" PRIx32 ": 0x%" PRIx32 "\n", num_dw - dw, cmd_offset);
+			// Unknown entries come from stale tables; hardware would write an unused register.
+			LOGF("skipped unknown uc reg at %05" PRIx32 ": 0x%" PRIx32 "\n", num_dw - dw, cmd_offset);
+			continue;
 		}
 		pfunc(cp, cmd_offset, value);
 	}
