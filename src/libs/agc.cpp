@@ -25,6 +25,7 @@
 #include "libs/libs.h"
 
 #include <algorithm>
+#include <cstdio>
 #include <array>
 #include <atomic>
 #include <cmath>
@@ -644,6 +645,15 @@ int KYTY_SYSV_ABI AgcCreateShader(Shader** dst, void* header, const volatile voi
 
 	h->code = code;
 
+	if (h->file_header != 0x34333231 || h->version != 0x00000018) {
+		const auto* words = static_cast<const uint32_t*>(header);
+		std::printf("AGCSHADER caller=%p dst=%p\n", __builtin_return_address(0),
+		            static_cast<void*>(dst));
+		std::printf("AGCSHADER header=%p words: %08x %08x %08x %08x %08x %08x %08x %08x\n", header,
+		            words[0], words[1], words[2], words[3], words[4], words[5], words[6],
+		            words[7]);
+		std::fflush(stdout);
+	}
 	EXIT_NOT_IMPLEMENTED(h->file_header != 0x34333231);
 	EXIT_NOT_IMPLEMENTED(h->version != 0x00000018);
 

@@ -75,6 +75,9 @@ FaultManager::~FaultManager() {
 }
 
 void FaultManager::ProcessFaultBuffer() {
+	for (const auto& [start, size]: std::exchange(m_written_ranges, {})) {
+		(void)m_buffer_cache.ObtainBuffer(start, size, true);
+	}
 	if (const auto wait_tick = m_fault_areas[m_current_area]; wait_tick != 0) {
 		m_scheduler.Wait(wait_tick);
 		m_scheduler.PopPendingOperations();
@@ -148,7 +151,7 @@ void FaultManager::ProcessFaultBuffer() {
 		});
 		// Pages a shader wrote through a device address are owned by the GPU from now on.
 		written_ranges.ForEach([this](uint64_t start, uint64_t end) {
-			(void)m_buffer_cache.ObtainBuffer(start, end - start, true);
+			m_written_ranges.emplace_back(start, end - start);
 		});
 		m_fault_areas[area] = 0;
 	});

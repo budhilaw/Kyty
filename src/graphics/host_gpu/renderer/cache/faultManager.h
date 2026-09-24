@@ -5,6 +5,8 @@
 #include "graphics/host_gpu/renderer/cache/streamBuffer.h"
 
 #include <array>
+#include <vector>
+#include <utility>
 #include <cstdint>
 
 namespace Libs::Graphics {
@@ -30,6 +32,8 @@ private:
 	Buffer                                     m_download_buffer;
 	std::array<uint64_t, MaxPendingFaults>      m_fault_areas {};
 	uint32_t                                   m_current_area = 0;
+	// Shader-written page ranges found by a completed pass, claimed on the next pass.
+	std::vector<std::pair<uint64_t, uint64_t>> m_written_ranges;
 	vk::DescriptorSetLayout                    m_fault_process_desc_layout = nullptr;
 	vk::Pipeline                               m_fault_process_pipeline = nullptr;
 	vk::PipelineLayout                         m_fault_process_pipeline_layout = nullptr;

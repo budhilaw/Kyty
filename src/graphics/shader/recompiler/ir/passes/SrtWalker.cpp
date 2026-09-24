@@ -1,4 +1,5 @@
 #include "graphics/shader/recompiler/ir/passes/SrtWalker.h"
+#include "kernel/memory.h"
 
 #include "common/assert.h"
 #include "graphics/shader/recompiler/ir/ShaderIR.h"
@@ -624,8 +625,8 @@ private:
 			if (!m_runtime.read_memory(m_runtime.userdata, address, &word)) {
 				return false;
 			}
-		} else {
-			std::memcpy(&word, reinterpret_cast<const void*>(address), sizeof(word));
+		} else if (!LibKernel::Memory::TryReadBacking(address, &word, sizeof(word))) {
+			return false;
 		}
 		result = word;
 		return true;

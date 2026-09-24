@@ -209,8 +209,18 @@ bool MaterializeIndirectImage(const DescriptorSource::IndirectImage& indirect,
 		return false;
 	}
 	if (indirect.direct) {
-		if (indirect.selector_stride == 0u || heap.GetSize() < indirect.selector_offset + 32u) {
-			return false;
+		if (indirect.selector_stride == 0u) {
+			return SpecializationFail("direct image table has no record stride");
+		}
+		if (heap.GetSize() < indirect.selector_offset + 32u) {
+			// An empty record array selects nothing; one null candidate keeps the binding valid.
+			IndirectImage empty;
+			empty.keys = {0u};
+			empty.descriptors.emplace_back();
+			empty.descriptors.back().dword_count = 8u;
+			empty.candidates = {0u};
+			result           = std::move(empty);
+			return true;
 		}
 		const auto count = std::min<uint64_t>(
 		    (heap.GetSize() - indirect.selector_offset - 32u) / indirect.selector_stride + 1u,
@@ -224,7 +234,7 @@ bool MaterializeIndirectImage(const DescriptorSource::IndirectImage& indirect,
 			for (uint32_t dword = 0; dword < candidate.dword_count; dword++) {
 				if (!ReadScalarBufferWord(heap, base, dword * sizeof(uint32_t), runtime,
 				                          candidate.dwords[dword])) {
-					return false;
+					return SpecializationFail(fmt::format("direct image table read failed key={}", key));
 				}
 			}
 			if (NullImageDescriptor(candidate) || !ValidImageDescriptor(candidate, r128)) {
@@ -233,7 +243,9 @@ bool MaterializeIndirectImage(const DescriptorSource::IndirectImage& indirect,
 			const auto found = std::ranges::find(next.descriptors, candidate);
 			if (found == next.descriptors.end()) {
 				if (next.descriptors.size() >= ShaderInfo::MaxImages) {
-					return false;
+					return SpecializationFail(fmt::format(
+					    "direct image table has over {} textures at key {} of {}",
+					    ShaderInfo::MaxImages, key, count));
 				}
 				next.descriptors.push_back(candidate);
 				next.candidates.push_back(static_cast<uint32_t>(next.descriptors.size() - 1u));
