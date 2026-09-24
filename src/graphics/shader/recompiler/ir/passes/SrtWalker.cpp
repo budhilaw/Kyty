@@ -8,6 +8,7 @@
 #include <bit>
 #include <cmath>
 #include <cstring>
+#include <string>
 #include <fmt/format.h>
 #include <unordered_map>
 #include <unordered_set>
@@ -459,6 +460,8 @@ private:
 	std::vector<Patch> m_patches;
 };
 
+thread_local std::string t_srt_failure;
+
 class Evaluator {
 public:
 	Evaluator(const ResourcePlan& program, const SrtRuntime& runtime,
@@ -519,6 +522,10 @@ private:
 		const bool evaluated = EvaluateInst(*inst, out);
 		m_visiting.pop_back();
 		if (!evaluated) {
+			if (t_srt_failure.empty()) {
+				t_srt_failure = fmt::format("{} ({} args)", ValueOpcodeName(inst->GetOpcode()),
+				                            inst->NumArgs());
+			}
 			return false;
 		}
 		m_cache.emplace(inst, out);
@@ -621,11 +628,14 @@ private:
 			}
 		}
 		uint32_t word = 0;
-		if (m_runtime.read_memory != nullptr) {
-			if (!m_runtime.read_memory(m_runtime.userdata, address, &word)) {
-				return false;
+		const bool read = m_runtime.read_memory != nullptr
+		                      ? m_runtime.read_memory(m_runtime.userdata, address, &word)
+		                      : LibKernel::Memory::TryReadBacking(address, &word, sizeof(word));
+		if (!read) {
+			if (t_srt_failure.empty()) {
+				t_srt_failure = fmt::format("{} read at 0x{:x} failed",
+				                            ValueOpcodeName(inst.GetOpcode()), address);
 			}
-		} else if (!LibKernel::Memory::TryReadBacking(address, &word, sizeof(word))) {
 			return false;
 		}
 		result = word;
@@ -995,6 +1005,7 @@ bool EvaluateRuntimeSourcesImpl(const ResourcePlan& program, std::span<const uin
                                 std::vector<uint32_t>& flat, bool evaluate_flat,
                                 std::span<const uint8_t> clean_flat_slots,
                                 std::vector<uint8_t>&    active_sources) {
+	t_srt_failure.clear();
 	if (!program.srt_plan_complete) {
 		return false;
 	}
@@ -1078,6 +1089,10 @@ bool EvaluateRuntimeSourcesImpl(const ResourcePlan& program, std::span<const uin
 }
 
 } // namespace
+
+std::string_view SrtLastFailure() {
+	return t_srt_failure;
+}
 
 bool ValidateRuntimeValue(const ResourcePlan& program, Value value, RuntimeValueType type) {
 	return RuntimeValidator(program, type).Run(value);

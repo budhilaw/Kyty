@@ -4,6 +4,7 @@
 #include "graphics/shader/recompiler/ir/ShaderIR.h"
 
 #include <span>
+#include <string_view>
 
 namespace Libs::Graphics::ShaderRecompiler::IR {
 
@@ -39,6 +40,7 @@ bool EvaluateDescriptorSources(const ResourcePlan& program, std::span<const uint
 
 // Evaluates potentially reachable descriptor sources and the flattened immediate SRT with one
 // memoized scalar walk. Inactive descriptors are zero; on failure no destination is changed.
+std::string_view SrtLastFailure();
 bool EvaluateRuntimeSources(const ResourcePlan& program, std::span<const uint32_t> sources,
                             const SrtRuntime& runtime, std::vector<DescriptorValue>& results,
                             std::vector<uint32_t>& flat, std::span<const uint8_t> clean_flat_slots,

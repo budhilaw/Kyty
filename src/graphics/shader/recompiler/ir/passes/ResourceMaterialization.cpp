@@ -4,6 +4,7 @@
 #include "graphics/guest_gpu/gpu_format.h"
 #include "graphics/shader/recompiler/ir/ShaderIR.h"
 #include "graphics/shader/shaderBindings.h"
+#include "kernel/memory.h"
 
 #include <algorithm>
 #include <array>
@@ -13,6 +14,7 @@
 #include <fmt/format.h>
 #include <functional>
 #include <numeric>
+#include <optional>
 #include <unordered_set>
 
 namespace Libs::Graphics::ShaderRecompiler::IR {
@@ -77,7 +79,14 @@ bool ValidImageDescriptor(const DescriptorValue& descriptor, bool r128 = false) 
 	const auto type   = static_cast<Prospero::ImageType>((descriptor.dwords[3] >> 28u) & 0xfu);
 	const auto format = static_cast<Prospero::BufferFormat>((descriptor.dwords[1] >> 20u) & 0x1ffu);
 	if (type < Prospero::ImageType::kColor1D || format == Prospero::BufferFormat::kInvalid ||
-	    format > Prospero::BufferFormat::kBc7Srgb) {
+	    format > Prospero::BufferFormat::kBc7Srgb ||
+	    Prospero::SampledTextureNumericClass(format) == Prospero::TextureNumericClass::Unsupported) {
+		return false;
+	}
+	// Probed table entries may be arbitrary data; a real image has a mapped base address.
+	const auto base = (uint64_t {descriptor.dwords[0]} | (uint64_t {descriptor.dwords[1] & 0xffu} << 32u)) << 8u;
+	uint8_t    probe = 0;
+	if (!LibKernel::Memory::TryReadBacking(base, &probe, sizeof(probe))) {
 		return false;
 	}
 	if (r128 && type != Prospero::ImageType::kColor1D && type != Prospero::ImageType::kColor2D &&
@@ -227,6 +236,7 @@ bool MaterializeIndirectImage(const DescriptorSource::IndirectImage& indirect,
 		    indirect.address_heap ? uint64_t {ShaderInfo::MaxImages} : MaxIndirectImageProbes);
 		IndirectImage next;
 		next.keys.reserve(static_cast<size_t>(count));
+		std::optional<std::pair<uint32_t, Prospero::TextureNumericClass>> probe_shape;
 		for (uint32_t key = 0; key < count; key++) {
 			DescriptorValue candidate;
 			candidate.dword_count = 8u;
@@ -244,6 +254,18 @@ bool MaterializeIndirectImage(const DescriptorSource::IndirectImage& indirect,
 			}
 			if (NullImageDescriptor(candidate) || !ValidImageDescriptor(candidate, r128)) {
 				candidate.dwords.fill(0);
+			}
+			// A bounded probe may cross into unrelated entries; keep only the first entry's shape.
+			if (!NullImageDescriptor(candidate)) {
+				const auto shape = std::pair {candidate.dwords[3] >> 28u,
+				                              Prospero::SampledTextureNumericClass(
+				                                  static_cast<Prospero::BufferFormat>(
+				                                      (candidate.dwords[1] >> 20u) & 0x1ffu))};
+				if (!probe_shape.has_value()) {
+					probe_shape = shape;
+				} else if (*probe_shape != shape) {
+					candidate.dwords.fill(0);
+				}
 			}
 			const auto found = std::ranges::find(next.descriptors, candidate);
 			if (found == next.descriptors.end()) {
@@ -352,7 +374,8 @@ static bool MaterializeSnapshot(const ResourcePlan& program, const SrtRuntime& r
 	std::vector<uint8_t>         active_sources;
 	if (!EvaluateRuntimeSources(program, program.materialization_sources, runtime, values,
 	                            flattened_srt, program.clean_flat_slots, active_sources)) {
-		return SpecializationFail("resource materialization line 355");
+		return SpecializationFail(
+		    fmt::format("runtime source evaluation failed: {}", SrtLastFailure()));
 	}
 
 	auto&                   next  = snapshot.resources;
@@ -656,9 +679,14 @@ static bool BuildResourceSpecialization(const ResourcePlan& program, Materialize
 			    image.conversion_format != image_class.conversion_format ||
 			    image.shader_swizzle != image_class.shader_swizzle ||
 			    image.cube != image_class.cube) {
-				return SpecializationFail(
-				    fmt::format("indirect image table at pc 0x{:08x} has incompatible candidates",
-				                program.info.images[root_index].first_use_pc));
+				// A table entry of another kind cannot share the binding type; bind it as null.
+				next_snapshot.images[candidate].dwords.fill(0);
+				image.numeric_class     = image_class.numeric_class;
+				image.dimension         = image_class.dimension;
+				image.mip_count         = image_class.mip_count;
+				image.conversion_format = image_class.conversion_format;
+				image.shader_swizzle    = image_class.shader_swizzle;
+				image.cube              = image_class.cube;
 			}
 		}
 	}
