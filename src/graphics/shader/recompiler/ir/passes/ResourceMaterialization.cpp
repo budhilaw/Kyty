@@ -208,6 +208,43 @@ bool MaterializeIndirectImage(const DescriptorSource::IndirectImage& indirect,
 	    !DecodeBufferDescriptor(heap_value, heap)) {
 		return false;
 	}
+	if (indirect.direct) {
+		if (indirect.selector_stride == 0u || heap.GetSize() < indirect.selector_offset + 32u) {
+			return false;
+		}
+		const auto count = std::min<uint64_t>(
+		    (heap.GetSize() - indirect.selector_offset - 32u) / indirect.selector_stride + 1u,
+		    MaxIndirectImageProbes);
+		IndirectImage next;
+		next.keys.reserve(static_cast<size_t>(count));
+		for (uint32_t key = 0; key < count; key++) {
+			DescriptorValue candidate;
+			candidate.dword_count = 8u;
+			const auto base       = key * indirect.selector_stride + indirect.selector_offset;
+			for (uint32_t dword = 0; dword < candidate.dword_count; dword++) {
+				if (!ReadScalarBufferWord(heap, base, dword * sizeof(uint32_t), runtime,
+				                          candidate.dwords[dword])) {
+					return false;
+				}
+			}
+			if (NullImageDescriptor(candidate) || !ValidImageDescriptor(candidate, r128)) {
+				candidate.dwords.fill(0);
+			}
+			const auto found = std::ranges::find(next.descriptors, candidate);
+			if (found == next.descriptors.end()) {
+				if (next.descriptors.size() >= ShaderInfo::MaxImages) {
+					return false;
+				}
+				next.descriptors.push_back(candidate);
+				next.candidates.push_back(static_cast<uint32_t>(next.descriptors.size() - 1u));
+			} else {
+				next.candidates.push_back(static_cast<uint32_t>(found - next.descriptors.begin()));
+			}
+			next.keys.push_back(key);
+		}
+		result = std::move(next);
+		return true;
+	}
 	if (material.Stride() != indirect.selector_stride) {
 		return false;
 	}

@@ -462,6 +462,8 @@ struct DescriptorSource {
 		uint32_t selector_stride = 0;
 		uint32_t selector_offset = 0;
 		uint32_t key_arg         = 0;
+		// The key indexes the heap directly: descriptor at key * stride + offset.
+		bool direct = false;
 
 		bool operator==(const IndirectImage& other) const = default;
 	};

@@ -491,6 +491,103 @@ private:
 		return true;
 	}
 
+	// An image descriptor read from a record array at a computed index, as in light lists.
+	bool TryMakeDirectImageTable(Inst& handle, uint32_t pc, IndirectImagePlan& plan) {
+		if (handle.GetOpcode() != ValueOpcode::GetImageResource || handle.NumArgs() != 8u) {
+			return false;
+		}
+		std::array<Inst*, 8> heap_reads {};
+		Inst*                heap_handle = nullptr;
+		Value                heap_offset;
+		for (uint32_t dword = 0; dword < heap_reads.size(); dword++) {
+			heap_reads[dword] = handle.Arg(dword).Resolve().TryInstruction();
+			if (heap_reads[dword] == nullptr) {
+				return false;
+			}
+			uint32_t    memory_index = 0;
+			const auto* memory       = ScalarReadMemory(*heap_reads[dword], memory_index);
+			if (memory == nullptr || memory->offset != dword * sizeof(uint32_t)) {
+				return false;
+			}
+			auto* current_handle = heap_reads[dword]->Arg(0).Resolve().TryInstruction();
+			if (current_handle == nullptr ||
+			    (heap_handle != nullptr && current_handle != heap_handle)) {
+				return false;
+			}
+			heap_handle = current_handle;
+			if (dword == 0u) {
+				heap_offset = heap_reads[dword]->Arg(1).Resolve();
+			} else if (!EquivalentValue(m_program, heap_offset, heap_reads[dword]->Arg(1))) {
+				return false;
+			}
+			plan.memory[dword] = memory_index;
+			plan.reads[dword]  = heap_reads[dword];
+		}
+		for (const auto* read: heap_reads) {
+			for (const auto& use: read->Uses()) {
+				if (use.user == nullptr || use.user->GetOpcode() != ValueOpcode::GetImageResource) {
+					return false;
+				}
+			}
+		}
+		Value    selector;
+		uint32_t stride = 0;
+		uint32_t offset = 0;
+		if (!MatchIndexedOffset(heap_offset, selector, stride, offset) || stride < 32u) {
+			return false;
+		}
+		DescriptorSource heap_source;
+		uint32_t         heap_source_index = 0;
+		if (!MakeRuntimeBufferSource(*heap_handle, pc, heap_source_index, heap_source)) {
+			return false;
+		}
+		DescriptorSource image_source;
+		image_source.dword_count = 8u;
+		std::copy(heap_source.dwords.begin(), heap_source.dwords.begin() + 4u,
+		          image_source.dwords.begin());
+		std::copy(heap_source.dwords.begin(), heap_source.dwords.begin() + 4u,
+		          image_source.dwords.begin() + 4u);
+		image_source.indirect_image = DescriptorSource::IndirectImage {
+		    heap_source_index, heap_source_index, stride, offset, 0u, true};
+		plan.handle = &handle;
+		plan.source = InternSource(image_source);
+		plan.key    = selector;
+		plan.roots  = image_source.dwords;
+		return true;
+	}
+
+	static bool MatchIndexedOffset(Value value, Value& selector, uint32_t& stride,
+	                               uint32_t& offset) {
+		value           = value.Resolve();
+		offset          = 0;
+		auto* candidate = value.TryInstruction();
+		if (candidate != nullptr && candidate->GetOpcode() == ValueOpcode::IAdd32 &&
+		    candidate->NumArgs() == 2u) {
+			uint32_t immediate = 0;
+			if (ImmediateU32(candidate->Arg(0), immediate)) {
+				value = candidate->Arg(1).Resolve();
+			} else if (ImmediateU32(candidate->Arg(1), immediate)) {
+				value = candidate->Arg(0).Resolve();
+			} else {
+				return false;
+			}
+			offset = immediate;
+		}
+		const auto* multiply = value.TryInstruction();
+		if (multiply == nullptr || multiply->GetOpcode() != ValueOpcode::IMul32 ||
+		    multiply->NumArgs() != 2u) {
+			return false;
+		}
+		if (ImmediateU32(multiply->Arg(0), stride)) {
+			selector = multiply->Arg(1).Resolve();
+		} else if (ImmediateU32(multiply->Arg(1), stride)) {
+			selector = multiply->Arg(0).Resolve();
+		} else {
+			return false;
+		}
+		return stride != 0u && selector.GetType() == Type::U32 && !selector.IsImmediate();
+	}
+
 	const IndirectImagePlan* FindIndirectImage(const Inst& handle) const {
 		const auto found =
 		    std::find_if(m_indirect_images.begin(), m_indirect_images.end(),
@@ -519,7 +616,8 @@ private:
 					continue;
 				}
 				IndirectImagePlan plan;
-				if (TryMakeIndirectImage(*handle, inst.Flags<MemoryFlags>().pc, plan)) {
+				if (TryMakeIndirectImage(*handle, inst.Flags<MemoryFlags>().pc, plan) ||
+				    TryMakeDirectImageTable(*handle, inst.Flags<MemoryFlags>().pc, plan)) {
 					m_indirect_images.push_back(std::move(plan));
 				}
 			}
