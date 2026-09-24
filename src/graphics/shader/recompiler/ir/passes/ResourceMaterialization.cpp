@@ -244,10 +244,7 @@ bool MaterializeIndirectImage(const DescriptorSource::IndirectImage& indirect,
 			for (uint32_t dword = 0; dword < candidate.dword_count; dword++) {
 				if (!ReadScalarBufferWord(heap, base, dword * sizeof(uint32_t), runtime,
 				                          candidate.dwords[dword])) {
-					if (!indirect.address_heap) {
-						return SpecializationFail(
-						    fmt::format("direct image table read failed key={}", key));
-					}
+					// An unreadable entry selects nothing rather than blocking the whole table.
 					candidate.dwords.fill(0);
 					break;
 				}

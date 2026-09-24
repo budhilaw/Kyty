@@ -49,6 +49,7 @@ void               Report(double fps, uint64_t frame);
 [[nodiscard]] uint32_t HottestOsThread(Kind kind);
 // Records the in-module return addresses of the caller so the report can say who triggers a kind.
 void NoteCaller(Kind kind);
+void PrintHostStack(const char* label);
 
 // Accumulates one blocked region; does nothing at all when the trace is off.
 class Scope {

@@ -2,6 +2,9 @@
 
 #include "common/alignment.h"
 #include "common/assert.h"
+#include "common/threads.h"
+
+#include <cinttypes>
 
 namespace Libs::Graphics {
 
@@ -47,7 +50,9 @@ void MemoryTracker::ValidateGpuDirtyOwnership(const RangeSet& dirty, uint64_t va
 
 void MemoryTracker::ValidateRange(uint64_t vaddr, uint64_t size) {
 	if (!GuestRange {vaddr, size}.Valid()) {
-		EXIT("invalid memory tracker range\n");
+		Common::WaitTrace::PrintHostStack("invalid memory tracker range");
+		EXIT("invalid memory tracker range addr=0x%016" PRIx64 " size=0x%016" PRIx64 "\n", vaddr,
+		     size);
 	}
 }
 

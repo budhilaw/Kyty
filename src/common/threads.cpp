@@ -504,6 +504,25 @@ uint32_t HottestOsThread(Kind kind) {
 
 // A thread that is blocked all second is idle and uninteresting. What matters is the thread that
 // is awake, so rows are ordered by how much of the second each one spent NOT waiting.
+void PrintHostStack(const char* label) {
+#ifdef _WIN32
+	void*      raw[24] {};
+	const auto captured = RtlCaptureStackBackTrace(1, 24, raw, nullptr);
+	const auto base     = reinterpret_cast<uint64_t>(GetModuleHandleA(nullptr));
+	std::printf("%s stack:", label);
+	for (unsigned f = 0; f < captured; f++) {
+		const auto address = reinterpret_cast<uint64_t>(raw[f]);
+		if (address >= base && address - base < 0x4000000ull) {
+			std::printf(" %llx", static_cast<unsigned long long>(address - base));
+		}
+	}
+	std::printf("\n");
+	std::fflush(stdout);
+#else
+	std::printf("%s\n", label);
+#endif
+}
+
 void NoteCaller(Kind kind) {
 	if (!g_enabled) {
 		return;
