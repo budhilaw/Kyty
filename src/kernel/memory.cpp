@@ -383,6 +383,28 @@ public:
 		return true;
 	}
 
+	// Collects the executable parts of [start, start + size) in address order.
+	void ExecutableParts(uint64_t start, uint64_t size,
+	                     std::vector<std::pair<uint64_t, uint64_t>>* out) {
+		Common::LockGuard lock(m_mutex);
+		const auto        end = End(start, size);
+		auto              it  = LowerBound(start);
+		if (it != m_ranges.begin()) {
+			--it;
+		}
+		for (; it != m_ranges.end() && it->start < end; ++it) {
+			const auto range_end = End(it->start, it->size);
+			if (range_end <= start || (it->protection & PROT_CPU_EXEC) == 0) {
+				continue;
+			}
+			const auto part_begin = std::max(start, it->start);
+			const auto part_end   = std::min(end, range_end);
+			if (part_begin < part_end) {
+				out->emplace_back(part_begin, part_end);
+			}
+		}
+	}
+
 	bool QuerySpan(uint64_t start, uint64_t size, std::vector<Range>* out) {
 		EXIT_IF(out == nullptr);
 
@@ -3735,8 +3757,32 @@ bool ProtectGuestMemory(uint64_t vaddr, uint64_t size, VirtualMemory::Mode mode,
 }
 
 bool ProtectGuestHostMemory(uint64_t vaddr, uint64_t size, VirtualMemory::Mode mode) {
-	return g_guest_address_space != nullptr &&
-	       g_guest_address_space->ProtectTransient(vaddr, size, mode);
+	if (g_guest_address_space == nullptr) {
+		return false;
+	}
+	// Access tracking must never remove execute rights from code that shares a tracked range.
+	std::vector<std::pair<uint64_t, uint64_t>> code;
+	if (g_virtual_ranges != nullptr && !VirtualMemory::IsExecute(mode)) {
+		g_virtual_ranges->ExecutableParts(vaddr, size, &code);
+	}
+	if (code.empty()) {
+		return g_guest_address_space->ProtectTransient(vaddr, size, mode);
+	}
+	const auto with_execute = static_cast<VirtualMemory::Mode>(
+	    static_cast<uint32_t>(mode) | static_cast<uint32_t>(VirtualMemory::Mode::Execute));
+	auto cursor = vaddr;
+	bool ok     = true;
+	for (const auto& [begin, end]: code) {
+		if (begin > cursor) {
+			ok &= g_guest_address_space->ProtectTransient(cursor, begin - cursor, mode);
+		}
+		ok &= g_guest_address_space->ProtectTransient(begin, end - begin, with_execute);
+		cursor = end;
+	}
+	if (cursor < vaddr + size) {
+		ok &= g_guest_address_space->ProtectTransient(cursor, vaddr + size - cursor, mode);
+	}
+	return ok;
 }
 
 bool FreeGuestMemory(uint64_t vaddr, uint64_t size) {
