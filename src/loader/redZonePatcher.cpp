@@ -5,6 +5,7 @@
 
 #include "common/assert.h"
 #include "common/logging/log.h"
+#include <cinttypes>
 #include "common/virtualMemory.h"
 #include "loader/x64InstructionEmulator.h"
 
@@ -1000,6 +1001,8 @@ void RelocateRedZoneInstructions(PatchModule* module, const DecodedFunction& fun
 		const auto& rewrite = rewrite_sites.at(site);
 		if (rewrite.protect_red_zone && decoded.accesses_memory) {
 			++result.unrelocatable_memory_instruction_count;
+			LOGF("red-zone access left unprotected at +0x%" PRIx64 "\n",
+			     static_cast<uint64_t>(site - reinterpret_cast<uintptr_t>(module->start)));
 		}
 	};
 	const auto overlaps_patched_span = [&patched_spans](uintptr_t start, uintptr_t end) {
