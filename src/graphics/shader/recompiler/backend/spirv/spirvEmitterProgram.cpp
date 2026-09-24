@@ -192,7 +192,7 @@ void EmitStructuredTerminator(ValueEmitContext& ctx, const IR::Block* block,
 				state.builder.AddFunction(spv::OpStore, counter, next);
 				const auto exceeded = state.builder.AllocateId();
 				state.builder.AddFunction(spv::OpUGreaterThan, TypeBool(state), exceeded, next,
-				                          ConstantU32(state, 1u << 18u));
+				                          ConstantU32(state, 1u << 14u));
 				const auto capped = state.builder.AllocateId();
 				if (true_exits) {
 					state.builder.AddFunction(spv::OpLogicalOr, TypeBool(state), capped, condition,

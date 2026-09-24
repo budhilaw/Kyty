@@ -348,6 +348,32 @@ bool InstallHandler(Handler handler) {
 	g_handler.store(handler, std::memory_order_release);
 
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+	// Last resort: a crash no handler reports still leaves a minidump next to the executable.
+	SetUnhandledExceptionFilter([](EXCEPTION_POINTERS* pointers) -> LONG {
+		using WriteDump = BOOL(WINAPI*)(HANDLE, DWORD, HANDLE, int, void*, void*, void*);
+		auto* dbghelp = LoadLibraryA("dbghelp.dll");
+		auto  write   = dbghelp != nullptr
+		                    ? reinterpret_cast<WriteDump>(GetProcAddress(dbghelp, "MiniDumpWriteDump"))
+		                    : nullptr;
+		if (write != nullptr) {
+			auto file = CreateFileA("_crash.dmp", GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS,
+			                        FILE_ATTRIBUTE_NORMAL, nullptr);
+			if (file != INVALID_HANDLE_VALUE) {
+				struct {
+					DWORD               thread;
+					EXCEPTION_POINTERS* pointers;
+					BOOL                client;
+				} info {GetCurrentThreadId(), pointers, FALSE};
+				write(GetCurrentProcess(), GetCurrentProcessId(), file, 0x1000 /* MiniDumpWithThreadInfo */,
+				      &info, nullptr, nullptr);
+				CloseHandle(file);
+			}
+		}
+		std::printf("UNHANDLED EXCEPTION code=0x%08lx pc=0x%p, minidump written to _crash.dmp\n",
+		            pointers->ExceptionRecord->ExceptionCode, pointers->ExceptionRecord->ExceptionAddress);
+		std::fflush(stdout);
+		return EXCEPTION_CONTINUE_SEARCH;
+	});
 	if (AddVectoredExceptionHandler(0, ExceptionFilter) == nullptr) {
 		g_handler.store(nullptr, std::memory_order_release);
 		g_install_state.store(0, std::memory_order_release);

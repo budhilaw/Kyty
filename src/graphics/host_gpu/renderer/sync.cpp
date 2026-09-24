@@ -107,7 +107,9 @@ static void RecordEndOfPipeWrite(uint64_t submit_id, CommandBuffer& buffer, uint
 			*reinterpret_cast<uint32_t*>(destination) = static_cast<uint32_t>(value);
 		}
 		ResolvePendingGuestGpuWrite(pending);
-		NoteGuestGpuWrite(destination);
+		NoteGuestGpuWriteValue(destination, size == EndOfPipeWriteSize::Qword
+		                                        ? value
+		                                        : (value & 0xffffffffull));
 	});
 
 	if (TriggersInterrupt(action)) {

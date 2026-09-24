@@ -22,6 +22,8 @@ namespace Libs::Graphics {
 // Records a GPU-side write to guest memory so a descheduled WAIT_REG_MEM can still observe a
 // value that was overwritten before its queue ran again.
 void NoteGuestGpuWrite(uint64_t address);
+// Same, for a writer that knows the value it stored.
+void NoteGuestGpuWriteValue(uint64_t address, uint64_t value);
 
 // Heartbeat of the GPU thread: the phase it entered last and a counter bumped on each
 // change, so a reporter on another thread can tell where it hangs.

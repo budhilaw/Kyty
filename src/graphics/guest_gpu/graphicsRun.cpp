@@ -34,6 +34,7 @@
 #include <memory>
 #include <mutex>
 #include <semaphore>
+#include <unordered_map>
 
 #ifdef _WIN32
 #ifndef WIN32_LEAN_AND_MEAN
@@ -447,6 +448,9 @@ constexpr size_t              kGuestWriteHistory = 512;
 std::array<GuestGpuWrite, kGuestWriteHistory> g_guest_writes {};
 std::atomic<uint64_t>         g_guest_write_seq {0};
 Common::Mutex                 g_guest_write_mutex;
+// Last value the GPU wrote to each fence address, kept beyond the short history so a queue
+// that fell behind can tell its fence was released before the guest recycled the memory.
+std::unordered_map<uint64_t, uint64_t> g_last_gpu_writes;
 
 } // namespace
 
@@ -589,6 +593,20 @@ uint64_t GpuHeartbeat() {
 	return g_gpu_heartbeat.load(std::memory_order_relaxed);
 }
 
+void NoteGuestGpuWriteValue(uint64_t address, uint64_t value) {
+	if (address == 0) {
+		return;
+	}
+	{
+		Common::LockGuard lock(g_guest_write_mutex);
+		if (g_last_gpu_writes.size() > 65536) {
+			g_last_gpu_writes.clear();
+		}
+		g_last_gpu_writes[address] = value;
+	}
+	NoteGuestGpuWrite(address);
+}
+
 void NoteGuestGpuWrite(uint64_t address) {
 	if (address == 0) {
 		return;
@@ -602,6 +620,12 @@ void NoteGuestGpuWrite(uint64_t address) {
 		value = read;
 	}
 	Common::LockGuard lock(g_guest_write_mutex);
+	if (value != UINT64_MAX) {
+		if (g_last_gpu_writes.size() > 65536) {
+			g_last_gpu_writes.clear();
+		}
+		g_last_gpu_writes[address] = value;
+	}
 	const auto        seq       = g_guest_write_seq.fetch_add(1, std::memory_order_acq_rel) + 1;
 	g_guest_writes[seq % kGuestWriteHistory] = {address, value, seq};
 }
@@ -676,6 +700,12 @@ void CommandProcessor::WaitRegMem(uint32_t func, const T* addr, T ref, T mask, u
 	T current = 0;
 	if (!Libs::LibKernel::Memory::TryReadBacking(wait_address, &current, sizeof(T))) {
 		current = *addr;
+	}
+	if (g_current_execution->TakeForcedPass(wait_address)) {
+		LOGF("\t DEADLOCK BREAKER: wait on 0x%010" PRIx64 " released from the last GPU write\n",
+		     wait_address);
+		g_current_execution->ClearWait();
+		return;
 	}
 	if (TestWaitRegMemValue(current, ref, mask, func)) {
 		g_current_execution->ClearWait();
@@ -1086,6 +1116,32 @@ void GuestGpu::ThreadRun(void* data) {
 				}
 				if (selected_queue < 0 && runnable(0)) {
 					selected_queue = 0;
+				}
+				static uint32_t stall_rounds = 0;
+				if (selected_queue >= 0) {
+					stall_rounds = 0;
+				}
+				if (selected_queue < 0 && ++stall_rounds >= 200) {
+					// Stalled for a while with nothing left to flush: a wait whose fence the GPU
+					// already released, and the guest then reset, is let through.
+					Common::LockGuard write_lock(g_guest_write_mutex);
+					for (uint32_t id = 0; id < QueueCount && selected_queue < 0; id++) {
+						auto& queue = gpu->m_queues[id];
+						if (queue.empty()) {
+							continue;
+						}
+						auto&      execution = queue.front().command_execution;
+						const auto address   = execution.AwaitedAddress();
+						const auto found     = g_last_gpu_writes.find(address);
+						if (address != 0 && found != g_last_gpu_writes.end() &&
+						    TestWaitRegMemValue(found->second, execution.WaitRef(),
+						                        execution.WaitMask(), execution.WaitFunc())) {
+							execution.ForceWaitPass();
+							queue.front().blocked = false;
+							selected_queue        = static_cast<int>(id);
+							stall_rounds          = 0;
+						}
+					}
 				}
 				if (selected_queue < 0) {
 					ReportQueueStall(*gpu);
@@ -1915,7 +1971,9 @@ void CommandProcessor::DispatchIndirectAt(uint64_t args_addr, uint32_t mode) {
 	// The arguments were written by the GPU this frame. Reading them here would drain the
 	// GPU, so the host dispatches indirectly from the cached buffer instead.
 	constexpr uint32_t DispatchInitiatorUseThreadDimensions = 1u << 5u;
-	static const bool  host_indirect = std::getenv("KYTY_NO_INDIRECT_DISPATCH") == nullptr;
+	// The GPU-side path read stale argument words and hung the GPU in the intro video; it stays
+	// opt-in (KYTY_HOST_INDIRECT_DISPATCH=1) until that is understood.
+	static const bool  host_indirect = std::getenv("KYTY_HOST_INDIRECT_DISPATCH") != nullptr;
 	if (host_indirect && (mode & DispatchInitiatorUseThreadDimensions) == 0) {
 		m_sh_ctx.SetCsWaveSize(Pm4::ComputeWaveSize(mode));
 		CheckBuffer();

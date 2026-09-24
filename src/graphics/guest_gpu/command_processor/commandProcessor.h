@@ -51,6 +51,15 @@ public:
 		m_wait_func = func;
 	}
 	void ClearWait() noexcept { m_awaited_address = 0; }
+	// Lets the next WAIT_REG_MEM on the awaited address pass once (deadlock breaker).
+	void ForceWaitPass() noexcept { m_force_pass = m_awaited_address; }
+	[[nodiscard]] bool TakeForcedPass(uint64_t address) noexcept {
+		if (m_force_pass != 0 && m_force_pass == address) {
+			m_force_pass = 0;
+			return true;
+		}
+		return false;
+	}
 
 private:
 	friend class CommandProcessor;
@@ -61,6 +70,7 @@ private:
 	};
 
 	std::vector<BufferCursor> m_buffer_stack;
+	uint64_t                  m_force_pass = 0;
 	std::span<const uint32_t> m_next_buffer;
 	// Checksum of the unparsed remainder at suspend time; a change means the guest reused it.
 	uint64_t                  m_suspend_checksum = 0;
