@@ -632,11 +632,15 @@ private:
 		                      ? m_runtime.read_memory(m_runtime.userdata, address, &word)
 		                      : LibKernel::Memory::TryReadBacking(address, &word, sizeof(word));
 		if (!read) {
-			if (t_srt_failure.empty()) {
-				t_srt_failure = fmt::format("{} read at 0x{:x} failed",
-				                            ValueOpcodeName(inst.GetOpcode()), address);
+			if (inst.GetOpcode() != ValueOpcode::LoadAddressU32) {
+				if (t_srt_failure.empty()) {
+					t_srt_failure = fmt::format("{} read at 0x{:x} failed",
+					                            ValueOpcodeName(inst.GetOpcode()), address);
+				}
+				return false;
 			}
-			return false;
+			// A pointer into unmapped memory belongs to a stale table; it selects nothing.
+			word = 0;
 		}
 		result = word;
 		return true;

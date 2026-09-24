@@ -112,6 +112,14 @@ static LONG WINAPI ExceptionFilter(PEXCEPTION_POINTERS exception) noexcept {
 	} else if (exception_record->ExceptionCode == EXCEPTION_ILLEGAL_INSTRUCTION) {
 		info.type = ExceptionType::IllegalInstruction;
 	} else {
+		// Anything else ends the process silently, so leave a trace of what it was.
+		if (exception_record->ExceptionCode >= 0xC0000000u ||
+		    exception_record->ExceptionCode == 0xE06D7363u) {
+			printf("Unhandled host exception code=0x%08lx address=%p thread=%lu\n",
+			       static_cast<unsigned long>(exception_record->ExceptionCode),
+			       exception_record->ExceptionAddress, GetCurrentThreadId());
+			fflush(stdout);
+		}
 		return EXCEPTION_CONTINUE_SEARCH;
 	}
 

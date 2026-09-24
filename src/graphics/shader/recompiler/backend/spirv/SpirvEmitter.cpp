@@ -218,9 +218,6 @@ Emitter::SpirvRequirements Emitter::AnalyzeProgramRequirements(const IR::Program
 						Fail(program, "buffer operation has invalid resource metadata");
 					}
 					if ((program.info.buffers[memory.resource].packed_stride & (1u << 20u)) != 0u) {
-						if (program.stage != ShaderType::Compute) {
-							Fail(program, "buffer ADD_TID is only valid for compute shaders");
-						}
 						requirements.subgroup_local_invocation_id = true;
 					}
 				}

@@ -885,7 +885,7 @@ bool ReadGpuBackingOrDownload(uint64_t vaddr, void* data, uint64_t size) {
 	}
 	// GPU-produced tables must be brought back before the host can evaluate them.
 	if (g_gpu_resources == nullptr || !Graphics::GuestGpu::IsGpuThread() ||
-	    !IsGpuAddressRange(vaddr, size)) {
+	    !IsGpuAddressRange(vaddr, size) || !g_gpu_resources->IsMapped(vaddr, size)) {
 		return false;
 	}
 	GetGpuResources().GetBufferCache().ReadMemory(vaddr, size);

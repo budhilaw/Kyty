@@ -109,6 +109,8 @@ public:
 
 		// This carries PTS/DTS/attachedData through codecs that reorder B frames.
 		m_codec->flags |= AV_CODEC_FLAG_COPY_OPAQUE;
+		m_codec->thread_count = 0;
+		m_codec->thread_type  = FF_THREAD_FRAME | FF_THREAD_SLICE;
 		const int result = avcodec_open2(m_codec, decoder, nullptr);
 		if (result < 0) {
 			LOGF("Videodec2: avcodec_open2 failed: %s (%d)\n", AvErrorString(result), result);

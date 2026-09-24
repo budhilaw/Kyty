@@ -622,6 +622,12 @@ static bool BuildResourceSpecialization(const ResourcePlan& program, Materialize
 		} else if (image.numeric_class == Prospero::TextureNumericClass::Unsupported ||
 		           (base.depth_compare &&
 		            image.numeric_class != Prospero::TextureNumericClass::Float)) {
+			if (i >= program.info.images.size()) {
+				// A table entry the shader cannot sample this way binds as a null image.
+				next_snapshot.images[i].dwords.fill(0);
+				image.numeric_class = Prospero::TextureNumericClass::Float;
+				continue;
+			}
 			return SpecializationFail(
 			    fmt::format("sampled image descriptor {} uses unsupported format {}", i,
 			                static_cast<uint32_t>(format)));

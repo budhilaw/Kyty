@@ -5,14 +5,18 @@
 #include "libs/videoDec2Decoder.h"
 #include "loader/symbolDatabase.h"
 
+#include <algorithm>
 #include <atomic>
+#include <chrono>
 #include <cinttypes>
 #include <cstddef>
 #include <cstdint>
+#include <condition_variable>
 #include <cstring>
 #include <deque>
 #include <memory>
 #include <mutex>
+#include <thread>
 #include <unordered_map>
 #include <vector>
 
@@ -138,19 +142,41 @@ static_assert(sizeof(VdecswOutputInfo) == 56);
 
 struct PendingInput {
 	std::vector<uint8_t> data;
-	uint64_t             pts;
-	uint64_t             dts;
-	uint64_t             attached;
+	uint64_t             pts      = 0;
+	uint64_t             dts      = 0;
+	uint64_t             attached = 0;
 };
+
+struct DecodedFrame {
+	std::vector<uint8_t>            data;
+	VideoDec2::Decoder::Output      output;
+	VideoDec2::Decoder::PictureInfo picture;
+	bool                            has_picture = false;
+};
+
+enum class RequestKind { Input, Flush, Reset };
+
+struct DecodeRequest {
+	RequestKind  kind = RequestKind::Input;
+	PendingInput input;
+};
+
+constexpr size_t MaxReadyFrames = 3;
 
 struct DecoderState {
 	VideoDec2::Decoder::Instance* instance = nullptr;
-	std::deque<PendingInput>      inputs;
+	std::deque<DecodeRequest>     requests;
 	std::deque<uint64_t>          consumed;
+	std::deque<DecodedFrame>      ready;
+	std::vector<uint8_t>          staging;
 	VdecswFrameBuffer             frame_buffer {};
 	bool                          has_frame_buffer = false;
 	bool                          finalizing       = false;
+	bool                          busy             = false;
+	bool                          stop             = false;
 	std::mutex                    mutex;
+	std::condition_variable       wake;
+	std::thread                   worker;
 };
 
 static int32_t Fail(const char* where, int32_t code) {
@@ -158,13 +184,74 @@ static int32_t Fail(const char* where, int32_t code) {
 	return code;
 }
 
-static std::mutex                                        g_decoder_mutex;
+static std::mutex                                               g_decoder_mutex;
 static std::unordered_map<void*, std::unique_ptr<DecoderState>> g_decoders;
+static std::mutex                                               g_picture_mutex;
+static std::unordered_map<const void*, VideoDec2::Decoder::PictureInfo> g_pictures;
 
 static DecoderState* GetDecoder(VdecswDecoder decoder) {
 	std::scoped_lock lock(g_decoder_mutex);
 	const auto       it = g_decoders.find(decoder);
 	return it != g_decoders.end() ? it->second.get() : nullptr;
+}
+
+// Frames are decoded ahead on a worker so the game thread only copies finished pictures.
+static void DecodeWorker(DecoderState* state) {
+	std::unique_lock lock(state->mutex);
+	for (;;) {
+		state->wake.wait(lock, [&] {
+			return state->stop || (!state->requests.empty() && state->ready.size() < MaxReadyFrames);
+		});
+		if (state->stop) {
+			return;
+		}
+		auto request = std::move(state->requests.front());
+		state->requests.pop_front();
+		state->busy = true;
+		lock.unlock();
+		DecodedFrame                          frame;
+		const auto                            started = std::chrono::steady_clock::now();
+		const VideoDec2::Decoder::FrameBuffer target {state->staging.data(), state->staging.size()};
+		if (request.kind == RequestKind::Reset) {
+			VideoDec2::Decoder::Reset(state->instance);
+		} else if (request.kind == RequestKind::Flush) {
+			(void)VideoDec2::Decoder::Flush(state->instance, target, &frame.output);
+		} else {
+			const auto& in     = request.input;
+			const auto  result = VideoDec2::Decoder::Decode(
+			    state->instance, {in.data.data(), in.data.size(), in.pts, in.dts, in.attached},
+			    target, &frame.output);
+			if (result != VideoDec2::Decoder::Result::Ok) {
+				LOGF("Vdecsw decode failed: %d\n", static_cast<int>(result));
+			}
+		}
+		static std::atomic<uint32_t> timing_count {0};
+		if (timing_count.fetch_add(1) < 48) {
+			LOGF("Vdecsw worker: kind=%d valid=%d ms=%.1f\n", static_cast<int>(request.kind),
+			     frame.output.valid ? 1 : 0,
+			     std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - started)
+			         .count());
+		}
+		if (frame.output.valid) {
+			frame.has_picture =
+			    VideoDec2::Decoder::GetPictureInfo(state->staging.data(), &frame.picture);
+			const auto used =
+			    static_cast<size_t>(frame.output.pitch) * frame.output.height * 3u / 2u;
+			const auto bytes =
+			    used != 0 ? std::min(used, state->staging.size()) : state->staging.size();
+			frame.data.assign(state->staging.begin(), state->staging.begin() + bytes);
+		}
+		lock.lock();
+		state->busy = false;
+		if (request.kind == RequestKind::Input) {
+			state->consumed.push_back(request.input.attached);
+		} else if (request.kind == RequestKind::Flush && !frame.output.valid) {
+			state->finalizing = false;
+		}
+		if (frame.output.valid) {
+			state->ready.push_back(std::move(frame));
+		}
+	}
 }
 
 static void FillNoPictureOutput(DecoderState& state, VdecswOutputInfo* output_info) {
@@ -183,10 +270,7 @@ static void FillNoPictureOutput(DecoderState& state, VdecswOutputInfo* output_in
 }
 
 static void ApplyDecodedOutput(const VideoDec2::Decoder::Output& decoded,
-                               VdecswOutputInfo*                 output_info) {
-	if (!decoded.valid) {
-		return;
-	}
+                               const VdecswFrameBuffer& target, VdecswOutputInfo* output_info) {
 	output_info->is_valid             = true;
 	output_info->is_error_frame       = decoded.error_frame;
 	output_info->picture_count        = 1;
@@ -194,8 +278,8 @@ static void ApplyDecodedOutput(const VideoDec2::Decoder::Output& decoded,
 	output_info->frame_width          = decoded.width;
 	output_info->frame_pitch          = decoded.pitch;
 	output_info->frame_height         = decoded.height;
-	output_info->frame_buffer         = decoded.buffer;
-	output_info->frame_buffer_size    = decoded.buffer_size;
+	output_info->frame_buffer         = target.frame_buffer;
+	output_info->frame_buffer_size    = target.frame_buffer_size;
 	output_info->frame_pitch_in_bytes = decoded.pitch;
 }
 
@@ -294,7 +378,9 @@ static int32_t KYTY_SYSV_ABI CreateDecoder(const VdecswDecoderConfigInfo* config
 
 	auto state      = std::make_unique<DecoderState>();
 	state->instance = instance;
-	auto* handle    = state.get();
+	state->staging.resize(VDECSW_MAX_FRAME_BUFFER_SIZE);
+	auto* handle  = state.get();
+	state->worker = std::thread(DecodeWorker, handle);
 	{
 		std::scoped_lock lock(g_decoder_mutex);
 		g_decoders.emplace(handle, std::move(state));
@@ -316,6 +402,12 @@ static int32_t KYTY_SYSV_ABI DeleteDecoder(VdecswDecoder decoder) {
 		state = std::move(it->second);
 		g_decoders.erase(it);
 	}
+	{
+		std::scoped_lock lock(state->mutex);
+		state->stop = true;
+	}
+	state->wake.notify_all();
+	state->worker.join();
 	VideoDec2::Decoder::Destroy(state->instance);
 	return OK;
 }
@@ -327,11 +419,15 @@ static int32_t KYTY_SYSV_ABI ResetDecoder(VdecswDecoder decoder) {
 	if (state == nullptr) {
 		return Fail(__func__, VDECSW_ERROR_DECODER_INSTANCE);
 	}
-	std::scoped_lock lock(state->mutex);
-	VideoDec2::Decoder::Reset(state->instance);
-	state->inputs.clear();
-	state->consumed.clear();
-	state->finalizing = false;
+	{
+		std::scoped_lock lock(state->mutex);
+		state->requests.clear();
+		state->ready.clear();
+		state->consumed.clear();
+		state->finalizing = false;
+		state->requests.push_back({RequestKind::Reset, {}});
+	}
+	state->wake.notify_all();
 	return OK;
 }
 
@@ -359,11 +455,16 @@ static int32_t KYTY_SYSV_ABI SetDecodeInput(VdecswDecoder decoder, const VdecswI
 	if (input->au_data == nullptr || input->au_size == 0) {
 		return Fail(__func__, VDECSW_ERROR_ARGUMENT_POINTER);
 	}
-	std::scoped_lock lock(state->mutex);
-	const auto*      bytes = static_cast<const uint8_t*>(input->au_data);
-	state->inputs.push_back({std::vector<uint8_t>(bytes, bytes + input->au_size), input->pts_data,
-	                         input->dts_data, input->attached_data});
-	state->finalizing = false;
+	{
+		std::scoped_lock lock(state->mutex);
+		const auto*      bytes = static_cast<const uint8_t*>(input->au_data);
+		state->requests.push_back(
+		    {RequestKind::Input,
+		     {std::vector<uint8_t>(bytes, bytes + input->au_size), input->pts_data,
+		      input->dts_data, input->attached_data}});
+		state->finalizing = false;
+	}
+	state->wake.notify_all();
 	return OK;
 }
 
@@ -420,7 +521,8 @@ static int32_t KYTY_SYSV_ABI TrySyncDecodeInput(VdecswDecoder decoder, VdecswInp
 	}
 	sync->attached_data = 0;
 	sync->input_count   = 0;
-	return state->inputs.empty() ? VDECSW_ERROR_INPUT_QUEUE_EMPTY : VDECSW_ERROR_DECODE_PENDING;
+	return state->requests.empty() && !state->busy ? VDECSW_ERROR_INPUT_QUEUE_EMPTY
+	                                                : VDECSW_ERROR_DECODE_PENDING;
 }
 
 static int32_t KYTY_SYSV_ABI TrySyncDecodeOutput(VdecswDecoder decoder, VdecswOutputInfo* output) {
@@ -448,36 +550,23 @@ static int32_t KYTY_SYSV_ABI TrySyncDecodeOutput(VdecswDecoder decoder, VdecswOu
 		return VDECSW_ERROR_OUTPUT_PENDING;
 	}
 	FillNoPictureOutput(*state, output);
-	const VideoDec2::Decoder::FrameBuffer target {state->frame_buffer.frame_buffer,
-	                                              state->frame_buffer.frame_buffer_size};
-	// Each access unit is decoded on demand; the first frames of a stream may yield no picture.
-	while (!state->inputs.empty()) {
-		auto                       input = std::move(state->inputs.front());
-		VideoDec2::Decoder::Output decoded {};
-		const auto                 result = VideoDec2::Decoder::Decode(
-		    state->instance,
-		    {input.data.data(), input.data.size(), input.pts, input.dts, input.attached}, target,
-		    &decoded);
-		state->inputs.pop_front();
-		state->consumed.push_back(input.attached);
-		if (result != VideoDec2::Decoder::Result::Ok) {
-			LOGF("\t decode failed: %d\n", static_cast<int>(result));
+	if (!state->ready.empty()) {
+		auto frame = std::move(state->ready.front());
+		state->ready.pop_front();
+		const auto bytes = std::min(frame.data.size(), state->frame_buffer.frame_buffer_size);
+		std::memcpy(state->frame_buffer.frame_buffer, frame.data.data(), bytes);
+		ApplyDecodedOutput(frame.output, state->frame_buffer, output);
+		if (frame.has_picture) {
+			std::scoped_lock picture_lock(g_picture_mutex);
+			g_pictures[state->frame_buffer.frame_buffer] = frame.picture;
 		}
-		if (decoded.valid) {
-			ApplyDecodedOutput(decoded, output);
-			state->has_frame_buffer = false;
-			return OK;
-		}
+		state->has_frame_buffer = false;
+		state->wake.notify_all();
+		return OK;
 	}
-	if (state->finalizing) {
-		VideoDec2::Decoder::Output decoded {};
-		(void)VideoDec2::Decoder::Flush(state->instance, target, &decoded);
-		if (decoded.valid) {
-			ApplyDecodedOutput(decoded, output);
-			state->has_frame_buffer = false;
-			return OK;
-		}
-		state->finalizing = false;
+	if (state->requests.empty() && !state->busy && state->finalizing) {
+		state->requests.push_back({RequestKind::Flush, {}});
+		state->wake.notify_all();
 	}
 	return VDECSW_ERROR_DECODE_PENDING;
 }
@@ -489,8 +578,14 @@ static int32_t KYTY_SYSV_ABI FinalizeDecodeSequence(VdecswDecoder decoder) {
 	if (state == nullptr) {
 		return Fail(__func__, VDECSW_ERROR_DECODER_INSTANCE);
 	}
-	std::scoped_lock lock(state->mutex);
-	state->finalizing = true;
+	{
+		std::scoped_lock lock(state->mutex);
+		state->finalizing = true;
+		if (state->requests.empty() && !state->busy) {
+			state->requests.push_back({RequestKind::Flush, {}});
+		}
+	}
+	state->wake.notify_all();
 	return OK;
 }
 
@@ -508,8 +603,13 @@ static int32_t KYTY_SYSV_ABI GetAvcPictureInfo(const VdecswOutputInfo* output, v
 		return Fail(__func__, VDECSW_ERROR_OUTPUT_INFO);
 	}
 	VideoDec2::Decoder::PictureInfo decoded {};
-	if (!VideoDec2::Decoder::GetPictureInfo(output->frame_buffer, &decoded)) {
-		return Fail(__func__, VDECSW_ERROR_OUTPUT_INFO);
+	{
+		std::scoped_lock picture_lock(g_picture_mutex);
+		const auto       it = g_pictures.find(output->frame_buffer);
+		if (it == g_pictures.end()) {
+			return Fail(__func__, VDECSW_ERROR_OUTPUT_INFO);
+		}
+		decoded = it->second;
 	}
 	const auto fill = [&decoded](void* destination, bool valid) -> int32_t {
 		auto*      bytes = static_cast<uint8_t*>(destination);

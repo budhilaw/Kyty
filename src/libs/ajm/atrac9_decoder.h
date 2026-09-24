@@ -4,6 +4,7 @@
 #include "common/logging/log.h"
 #include "libs/ajm/decoder.h"
 
+#include <atomic>
 #include <algorithm>
 #include <cinttypes>
 #include <cstddef>
@@ -123,6 +124,22 @@ public:
 			result.result = AJM_RESULT_NOT_INITIALIZED;
 			return result;
 		}
+
+		static std::atomic<uint32_t> decode_calls {0};
+		const bool                   trace = (decode_calls.fetch_add(1) % 2000) == 0;
+		struct TraceAtExit {
+			bool                   enabled;
+			const AjmDecodeResult& r;
+			size_t                 input_size;
+			size_t                 output_size;
+			~TraceAtExit() {
+				if (enabled) {
+					LOGF("AJM ATRAC9 decode: result=0x%x frames=%u in=%zu/%zu out=%zu/%zu\n",
+					     r.result, r.frames, static_cast<size_t>(r.input_consumed), input_size,
+					     static_cast<size_t>(r.output_written), output_size);
+				}
+			}
+		} trace_at_exit {trace, result, input_size, output_size};
 
 		for (;;) {
 			if (input_offset >= input_size) {
@@ -464,6 +481,14 @@ private:
 			const auto* chunk      = input + offset;
 			const auto  chunk_size = static_cast<size_t>(AjmReadLe32(chunk + 4));
 			const auto  payload    = offset + 8;
+			// A streamed data chunk declares the whole stream; only its start is in this job.
+			if (AjmFourCcEquals(chunk, 'd', 'a', 't', 'a')) {
+				*data_offset                  = payload;
+				result->input_consumed        = payload;
+				result->format                = GetFormat();
+				result->total_decoded_samples = m_total_decoded_samples;
+				return true;
+			}
 			if (payload > input_size || chunk_size > input_size - payload) {
 				result->result = AJM_RESULT_PARTIAL_INPUT;
 				return false;

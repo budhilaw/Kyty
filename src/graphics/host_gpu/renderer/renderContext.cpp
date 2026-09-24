@@ -8,6 +8,7 @@
 #include "graphics/presentation/videoOut.h"
 #include "libs/errno.h"
 
+#include <chrono>
 #include <vector>
 #include <cstdlib>
 #include <algorithm>
@@ -352,6 +353,12 @@ void RenderContext::RunGarbageCollector() {
 	m_texture_cache.ProcessDownloadImages();
 	m_texture_cache.RunGarbageCollector();
 	m_buffer_cache.RunGarbageCollector();
+	// Games rarely exit cleanly, so compiled pipelines are persisted while running.
+	const auto now = std::chrono::steady_clock::now();
+	if (now - m_last_pipeline_save > std::chrono::seconds(20)) {
+		m_last_pipeline_save = now;
+		m_pipeline_cache.SaveIfChanged();
+	}
 }
 
 void RenderContext::AddInterruptEq(LibKernel::EventQueue::KernelEqueue eq, int event_id) {

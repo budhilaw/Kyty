@@ -543,14 +543,14 @@ TextureBinding RenderExecutor::ResolveTexture(const ShaderRecompiler::IR::ImageR
 
 	const auto address         = descriptor.Base40();
 	const auto width           = static_cast<uint32_t>(descriptor.Width5()) + 1u;
-	const auto height          = static_cast<uint32_t>(descriptor.Height5()) + 1u;
+	auto       height          = static_cast<uint32_t>(descriptor.Height5()) + 1u;
 	const auto base_level      = descriptor.BaseLevel();
 	const auto last_level      = descriptor.LastLevel();
 	const auto type            = TextureType(descriptor);
 	const bool multisampled    = IsMultisampledTexture(type);
 	const auto max_mip         = resource.r128 ? last_level : descriptor.MaxMip();
 	const auto physical_levels = multisampled ? 1u : static_cast<uint32_t>(max_mip) + 1u;
-	const auto levels =
+	auto levels =
 	    multisampled ? 1u : std::max(physical_levels, static_cast<uint32_t>(last_level) + 1u);
 	const auto tile       = descriptor.TileMode();
 	const bool depth_tile = tile == Prospero::TileMode::kDepth;
@@ -574,9 +574,14 @@ TextureBinding RenderExecutor::ResolveTexture(const ShaderRecompiler::IR::ImageR
 		     descriptor.fields[6], descriptor.fields[7]);
 	}
 	const auto samples = multisampled ? 1u << last_level : 1u;
-	const auto view_levels =
-	    multisampled ? 1u : static_cast<uint32_t>(last_level - base_level) + 1u;
-	const auto depth          = static_cast<uint32_t>(descriptor.Depth()) + 1u;
+	auto view_levels = multisampled ? 1u : static_cast<uint32_t>(last_level - base_level) + 1u;
+	auto depth = static_cast<uint32_t>(descriptor.Depth()) + 1u;
+	if (type == Prospero::ImageType::kColor1D && (height != 1u || depth != 1u)) {
+		// A 1D descriptor with extra rows is malformed; only its first row can be sampled.
+		LOGF("1D texture descriptor with extent %ux%ux%u clamped\n", width, height, depth);
+		height = 1u;
+		depth  = 1u;
+	}
 	const auto format         = descriptor.Format();
 	const auto surface_format = TextureGetSurfaceFormatInfo(format);
 	const bool shader_conversion =
@@ -600,10 +605,11 @@ TextureBinding RenderExecutor::ResolveTexture(const ShaderRecompiler::IR::ImageR
 		    width, height, volume ? depth : 1u, physical_levels, image_layers};
 		// Texture mip views take precedence over the resource count, but must keep its storage layout.
 		if (!TextureViewPreservesMipLayout(physical, levels)) {
-			EXIT("unsupported texture mip view changes physical layout: base=%u last=%u max=%u "
-			     "extent=%ux%ux%u tile=%u\n",
-			     base_level, last_level, max_mip, width, height, depth,
-			     static_cast<uint32_t>(tile));
+			// Extra view levels that would change the layout are dropped; sampling clamps to them.
+			LOGF("texture mip view clamped to storage: base=%u last=%u max=%u extent=%ux%ux%u\n",
+			     base_level, last_level, max_mip, width, height, depth);
+			levels      = physical_levels;
+			view_levels = base_level < physical_levels ? physical_levels - base_level : 1u;
 		}
 	}
 	uint32_t      pitch = 0;
@@ -670,6 +676,9 @@ TextureBinding RenderExecutor::ResolveTexture(const ShaderRecompiler::IR::ImageR
 	}
 	desc.view_info = TextureViewInfo(resource, descriptor, view_format, surface_format, storage,
 	                                 view_levels, desc.info.resources.layers);
+	if (desc.view_info.base_level >= levels) {
+		desc.view_info.base_level = levels - 1u;
+	}
 	desc.type = storage ? TextureCache::BindingType::Storage : TextureCache::BindingType::Texture;
 
 	auto       id                  = texture_cache.FindImage(desc, shader_conversion);

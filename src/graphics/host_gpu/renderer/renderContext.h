@@ -15,6 +15,7 @@
 #include "graphics/host_gpu/renderer/pipeline/pipelineCache.h"
 #include "kernel/eventQueue.h"
 
+#include <chrono>
 #include <unordered_map>
 #include <memory>
 #include <shared_mutex>
@@ -121,6 +122,7 @@ private:
 	double                                     m_timer_kind_ms[3] {};
 	uint64_t                                   m_timer_last_report = 0;
 	void                                       GpuTimerCollect(GpuTimerBlock& block);
+	std::chrono::steady_clock::time_point m_last_pipeline_save = std::chrono::steady_clock::now();
 };
 
 } // namespace Libs::Graphics
