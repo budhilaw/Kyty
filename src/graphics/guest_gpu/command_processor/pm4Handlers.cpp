@@ -1874,7 +1874,7 @@ KYTY_CP_OP_PARSER(CpOpFlip) {
 	f.flip_arg  = static_cast<int64_t>(buffer[3] | (static_cast<uint64_t>(buffer[4]) << 32u));
 
 	cp.SetFlip(f);
-	cp.Flip();
+	cp.Flip(true);
 	return 5;
 }
 

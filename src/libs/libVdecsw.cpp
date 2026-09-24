@@ -5,6 +5,7 @@
 #include "libs/videoDec2Decoder.h"
 #include "loader/symbolDatabase.h"
 
+#include <atomic>
 #include <cinttypes>
 #include <cstddef>
 #include <cstdint>
@@ -21,15 +22,15 @@ LIB_VERSION("Vdecsw", 1, "Vdecsw", 1, 1);
 
 namespace Vdecsw {
 
-constexpr int32_t VDECSW_ERROR_API_FAIL          = -2125332224; // 0x81510100
-constexpr int32_t VDECSW_ERROR_STRUCT_SIZE       = -2125332223; // 0x81510101
-constexpr int32_t VDECSW_ERROR_ARGUMENT_POINTER  = -2125332222; // 0x81510102
-constexpr int32_t VDECSW_ERROR_DECODER_INSTANCE  = -2125332221; // 0x81510103
-constexpr int32_t VDECSW_ERROR_OUTPUT_PENDING    = -2125332203; // 0x81510115
-constexpr int32_t VDECSW_ERROR_INPUT_QUEUE_EMPTY = -2125332202; // 0x81510116
-constexpr int32_t VDECSW_ERROR_DECODE_PENDING    = -2125332201; // 0x81510117
-constexpr int32_t VDECSW_ERROR_OUTPUT_INFO       = -2125332209; // 0x8151010f
-constexpr int32_t VDECSW_ERROR_CODEC_TYPE        = -2125331964; // 0x81510204
+constexpr int32_t VDECSW_ERROR_API_FAIL = static_cast<int32_t>(0x81510100u);
+constexpr int32_t VDECSW_ERROR_STRUCT_SIZE = static_cast<int32_t>(0x81510101u);
+constexpr int32_t VDECSW_ERROR_ARGUMENT_POINTER = static_cast<int32_t>(0x81510102u);
+constexpr int32_t VDECSW_ERROR_DECODER_INSTANCE = static_cast<int32_t>(0x81510103u);
+constexpr int32_t VDECSW_ERROR_OUTPUT_PENDING = static_cast<int32_t>(0x81510115u);
+constexpr int32_t VDECSW_ERROR_INPUT_QUEUE_EMPTY = static_cast<int32_t>(0x81510116u);
+constexpr int32_t VDECSW_ERROR_DECODE_PENDING = static_cast<int32_t>(0x81510117u);
+constexpr int32_t VDECSW_ERROR_OUTPUT_INFO = static_cast<int32_t>(0x8151010fu);
+constexpr int32_t VDECSW_ERROR_CODEC_TYPE = static_cast<int32_t>(0x81510204u);
 
 constexpr size_t VDECSW_COMPUTE_MEMORY_SIZE   = 0x4000;
 constexpr size_t VDECSW_CPU_MEMORY_SIZE       = 0x100000;
@@ -152,6 +153,11 @@ struct DecoderState {
 	std::mutex                    mutex;
 };
 
+static int32_t Fail(const char* where, int32_t code) {
+	LOGF("Vdecsw %s failed: 0x%08x\n", where, static_cast<uint32_t>(code));
+	return code;
+}
+
 static std::mutex                                        g_decoder_mutex;
 static std::unordered_map<void*, std::unique_ptr<DecoderState>> g_decoders;
 
@@ -197,10 +203,10 @@ static int32_t KYTY_SYSV_ABI QueryComputeMemoryInfo(VdecswComputeMemoryInfo* inf
 	PRINT_NAME();
 
 	if (info == nullptr) {
-		return VDECSW_ERROR_ARGUMENT_POINTER;
+		return Fail(__func__, VDECSW_ERROR_ARGUMENT_POINTER);
 	}
 	if (info->this_size != sizeof(VdecswComputeMemoryInfo)) {
-		return VDECSW_ERROR_STRUCT_SIZE;
+		return Fail(__func__, VDECSW_ERROR_STRUCT_SIZE);
 	}
 	info->cpu_gpu_memory_size = VDECSW_COMPUTE_MEMORY_SIZE;
 	info->cpu_gpu_memory      = nullptr;
@@ -213,11 +219,11 @@ static int32_t KYTY_SYSV_ABI AllocateComputeQueue(const VdecswComputeConfigInfo*
 	PRINT_NAME();
 
 	if (config == nullptr || memory == nullptr || queue == nullptr) {
-		return VDECSW_ERROR_ARGUMENT_POINTER;
+		return Fail(__func__, VDECSW_ERROR_ARGUMENT_POINTER);
 	}
 	if (config->this_size != sizeof(VdecswComputeConfigInfo) ||
 	    memory->this_size != sizeof(VdecswComputeMemoryInfo)) {
-		return VDECSW_ERROR_STRUCT_SIZE;
+		return Fail(__func__, VDECSW_ERROR_STRUCT_SIZE);
 	}
 	*queue = memory->cpu_gpu_memory != nullptr ? memory->cpu_gpu_memory : queue;
 	return OK;
@@ -234,16 +240,16 @@ static int32_t KYTY_SYSV_ABI QueryDecoderMemoryInfo(const VdecswDecoderConfigInf
 	PRINT_NAME();
 
 	if (config == nullptr || memory == nullptr) {
-		return VDECSW_ERROR_ARGUMENT_POINTER;
+		return Fail(__func__, VDECSW_ERROR_ARGUMENT_POINTER);
 	}
 	if (config->this_size != sizeof(VdecswDecoderConfigInfo) ||
 	    memory->this_size != sizeof(VdecswDecoderMemoryInfo)) {
 		LOGF("\t unexpected struct sizes: config=%" PRIu64 " memory=%" PRIu64 "\n",
 		     static_cast<uint64_t>(config->this_size), static_cast<uint64_t>(memory->this_size));
-		return VDECSW_ERROR_STRUCT_SIZE;
+		return Fail(__func__, VDECSW_ERROR_STRUCT_SIZE);
 	}
 	if (!VideoDec2::Decoder::IsCodecSupported(config->codec_type)) {
-		return VDECSW_ERROR_CODEC_TYPE;
+		return Fail(__func__, VDECSW_ERROR_CODEC_TYPE);
 	}
 	LOGF("\t codec=%u profile=%u level=%u size=%dx%d dpb=%d depth=%u\n", config->codec_type,
 	     config->profile, config->max_level, config->max_frame_width, config->max_frame_height,
@@ -266,21 +272,24 @@ static int32_t KYTY_SYSV_ABI CreateDecoder(const VdecswDecoderConfigInfo* config
                                            VdecswDecoder*                 decoder) {
 	PRINT_NAME();
 
+	LOGF("Vdecsw CreateDecoder config=%p memory=%p\n", static_cast<const void*>(config),
+	     static_cast<const void*>(memory));
+
 	if (config == nullptr || memory == nullptr || decoder == nullptr) {
-		return VDECSW_ERROR_ARGUMENT_POINTER;
+		return Fail(__func__, VDECSW_ERROR_ARGUMENT_POINTER);
 	}
 	if (config->this_size != sizeof(VdecswDecoderConfigInfo) ||
 	    memory->this_size != sizeof(VdecswDecoderMemoryInfo)) {
-		return VDECSW_ERROR_STRUCT_SIZE;
+		return Fail(__func__, VDECSW_ERROR_STRUCT_SIZE);
 	}
 	if (!VideoDec2::Decoder::IsCodecSupported(config->codec_type)) {
-		return VDECSW_ERROR_CODEC_TYPE;
+		return Fail(__func__, VDECSW_ERROR_CODEC_TYPE);
 	}
 
 	auto* instance = VideoDec2::Decoder::Create(
 	    {config->codec_type, config->max_frame_width, config->max_frame_height});
 	if (instance == nullptr) {
-		return VDECSW_ERROR_API_FAIL;
+		return Fail(__func__, VDECSW_ERROR_API_FAIL);
 	}
 
 	auto state      = std::make_unique<DecoderState>();
@@ -302,7 +311,7 @@ static int32_t KYTY_SYSV_ABI DeleteDecoder(VdecswDecoder decoder) {
 		std::scoped_lock lock(g_decoder_mutex);
 		const auto       it = g_decoders.find(decoder);
 		if (it == g_decoders.end()) {
-			return VDECSW_ERROR_DECODER_INSTANCE;
+			return Fail(__func__, VDECSW_ERROR_DECODER_INSTANCE);
 		}
 		state = std::move(it->second);
 		g_decoders.erase(it);
@@ -316,7 +325,7 @@ static int32_t KYTY_SYSV_ABI ResetDecoder(VdecswDecoder decoder) {
 
 	auto* state = GetDecoder(decoder);
 	if (state == nullptr) {
-		return VDECSW_ERROR_DECODER_INSTANCE;
+		return Fail(__func__, VDECSW_ERROR_DECODER_INSTANCE);
 	}
 	std::scoped_lock lock(state->mutex);
 	VideoDec2::Decoder::Reset(state->instance);
@@ -329,18 +338,26 @@ static int32_t KYTY_SYSV_ABI ResetDecoder(VdecswDecoder decoder) {
 static int32_t KYTY_SYSV_ABI SetDecodeInput(VdecswDecoder decoder, const VdecswInputData* input) {
 	PRINT_NAME();
 
+	static std::atomic<uint32_t> trace_count {0};
+	if (trace_count.fetch_add(1) < 64) {
+		LOGF("Vdecsw SetDecodeInput decoder=%p size=%" PRIu64 " au=%p bytes=%" PRIu64 "\n", decoder,
+		     static_cast<uint64_t>(input != nullptr ? input->this_size : 0),
+		     input != nullptr ? input->au_data : nullptr,
+		     static_cast<uint64_t>(input != nullptr ? input->au_size : 0));
+	}
+
 	auto* state = GetDecoder(decoder);
 	if (state == nullptr) {
-		return VDECSW_ERROR_DECODER_INSTANCE;
+		return Fail(__func__, VDECSW_ERROR_DECODER_INSTANCE);
 	}
 	if (input == nullptr) {
-		return VDECSW_ERROR_ARGUMENT_POINTER;
+		return Fail(__func__, VDECSW_ERROR_ARGUMENT_POINTER);
 	}
 	if (input->this_size != sizeof(VdecswInputData)) {
-		return VDECSW_ERROR_STRUCT_SIZE;
+		return Fail(__func__, VDECSW_ERROR_STRUCT_SIZE);
 	}
 	if (input->au_data == nullptr || input->au_size == 0) {
-		return VDECSW_ERROR_ARGUMENT_POINTER;
+		return Fail(__func__, VDECSW_ERROR_ARGUMENT_POINTER);
 	}
 	std::scoped_lock lock(state->mutex);
 	const auto*      bytes = static_cast<const uint8_t*>(input->au_data);
@@ -354,18 +371,26 @@ static int32_t KYTY_SYSV_ABI SetDecodeOutput(VdecswDecoder            decoder,
                                              const VdecswFrameBuffer* frame_buffer) {
 	PRINT_NAME();
 
+	static std::atomic<uint32_t> trace_count {0};
+	if (trace_count.fetch_add(1) < 64) {
+		LOGF("Vdecsw SetDecodeOutput decoder=%p size=%" PRIu64 " buffer=%p bytes=%" PRIu64 "\n",
+		     decoder, static_cast<uint64_t>(frame_buffer != nullptr ? frame_buffer->this_size : 0),
+		     frame_buffer != nullptr ? frame_buffer->frame_buffer : nullptr,
+		     static_cast<uint64_t>(frame_buffer != nullptr ? frame_buffer->frame_buffer_size : 0));
+	}
+
 	auto* state = GetDecoder(decoder);
 	if (state == nullptr) {
-		return VDECSW_ERROR_DECODER_INSTANCE;
+		return Fail(__func__, VDECSW_ERROR_DECODER_INSTANCE);
 	}
 	if (frame_buffer == nullptr) {
-		return VDECSW_ERROR_ARGUMENT_POINTER;
+		return Fail(__func__, VDECSW_ERROR_ARGUMENT_POINTER);
 	}
 	if (frame_buffer->this_size != sizeof(VdecswFrameBuffer)) {
-		return VDECSW_ERROR_STRUCT_SIZE;
+		return Fail(__func__, VDECSW_ERROR_STRUCT_SIZE);
 	}
 	if (frame_buffer->frame_buffer == nullptr || frame_buffer->frame_buffer_size == 0) {
-		return VDECSW_ERROR_ARGUMENT_POINTER;
+		return Fail(__func__, VDECSW_ERROR_ARGUMENT_POINTER);
 	}
 	std::scoped_lock lock(state->mutex);
 	state->frame_buffer     = *frame_buffer;
@@ -378,13 +403,13 @@ static int32_t KYTY_SYSV_ABI TrySyncDecodeInput(VdecswDecoder decoder, VdecswInp
 
 	auto* state = GetDecoder(decoder);
 	if (state == nullptr) {
-		return VDECSW_ERROR_DECODER_INSTANCE;
+		return Fail(__func__, VDECSW_ERROR_DECODER_INSTANCE);
 	}
 	if (sync == nullptr) {
-		return VDECSW_ERROR_ARGUMENT_POINTER;
+		return Fail(__func__, VDECSW_ERROR_ARGUMENT_POINTER);
 	}
 	if (sync->this_size != sizeof(VdecswInputSync)) {
-		return VDECSW_ERROR_STRUCT_SIZE;
+		return Fail(__func__, VDECSW_ERROR_STRUCT_SIZE);
 	}
 	std::scoped_lock lock(state->mutex);
 	if (!state->consumed.empty()) {
@@ -401,15 +426,22 @@ static int32_t KYTY_SYSV_ABI TrySyncDecodeInput(VdecswDecoder decoder, VdecswInp
 static int32_t KYTY_SYSV_ABI TrySyncDecodeOutput(VdecswDecoder decoder, VdecswOutputInfo* output) {
 	PRINT_NAME();
 
+	static std::atomic<uint32_t> trace_count {0};
+	if (trace_count.fetch_add(1) < 64) {
+		LOGF("Vdecsw TrySyncDecodeOutput decoder=%p output=%p size=%" PRIu64 "\n", decoder,
+		     static_cast<void*>(output),
+		     static_cast<uint64_t>(output != nullptr ? output->this_size : 0));
+	}
+
 	auto* state = GetDecoder(decoder);
 	if (state == nullptr) {
-		return VDECSW_ERROR_DECODER_INSTANCE;
+		return Fail(__func__, VDECSW_ERROR_DECODER_INSTANCE);
 	}
 	if (output == nullptr) {
-		return VDECSW_ERROR_ARGUMENT_POINTER;
+		return Fail(__func__, VDECSW_ERROR_ARGUMENT_POINTER);
 	}
 	if (output->this_size != sizeof(VdecswOutputInfo)) {
-		return VDECSW_ERROR_STRUCT_SIZE;
+		return Fail(__func__, VDECSW_ERROR_STRUCT_SIZE);
 	}
 	std::scoped_lock lock(state->mutex);
 	if (!state->has_frame_buffer) {
@@ -455,7 +487,7 @@ static int32_t KYTY_SYSV_ABI FinalizeDecodeSequence(VdecswDecoder decoder) {
 
 	auto* state = GetDecoder(decoder);
 	if (state == nullptr) {
-		return VDECSW_ERROR_DECODER_INSTANCE;
+		return Fail(__func__, VDECSW_ERROR_DECODER_INSTANCE);
 	}
 	std::scoped_lock lock(state->mutex);
 	state->finalizing = true;
@@ -467,23 +499,23 @@ static int32_t KYTY_SYSV_ABI GetAvcPictureInfo(const VdecswOutputInfo* output, v
 	PRINT_NAME();
 
 	if (output == nullptr || first == nullptr) {
-		return VDECSW_ERROR_ARGUMENT_POINTER;
+		return Fail(__func__, VDECSW_ERROR_ARGUMENT_POINTER);
 	}
 	if (output->this_size != sizeof(VdecswOutputInfo)) {
-		return VDECSW_ERROR_STRUCT_SIZE;
+		return Fail(__func__, VDECSW_ERROR_STRUCT_SIZE);
 	}
 	if (!output->is_valid || output->picture_count == 0 || output->frame_buffer == nullptr) {
-		return VDECSW_ERROR_OUTPUT_INFO;
+		return Fail(__func__, VDECSW_ERROR_OUTPUT_INFO);
 	}
 	VideoDec2::Decoder::PictureInfo decoded {};
 	if (!VideoDec2::Decoder::GetPictureInfo(output->frame_buffer, &decoded)) {
-		return VDECSW_ERROR_OUTPUT_INFO;
+		return Fail(__func__, VDECSW_ERROR_OUTPUT_INFO);
 	}
 	const auto fill = [&decoded](void* destination, bool valid) -> int32_t {
 		auto*      bytes = static_cast<uint8_t*>(destination);
 		const auto size  = *static_cast<const size_t*>(destination);
 		if (size < 40 || size > 256) {
-			return VDECSW_ERROR_STRUCT_SIZE;
+			return Fail(__func__, VDECSW_ERROR_STRUCT_SIZE);
 		}
 		std::memset(bytes + sizeof(size_t), 0, size - sizeof(size_t));
 		bytes[8] = valid ? 1 : 0;

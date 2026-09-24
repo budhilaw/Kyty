@@ -30,6 +30,14 @@
 
 namespace Libs::Graphics {
 
+// A readback may complete after the game released the pages; the data is then unwanted.
+static void WriteBackingIfMapped(uint64_t vaddr, const void* data, uint64_t size) {
+	if (!Libs::LibKernel::Memory::TryWriteBacking(vaddr, data, size)) {
+		LOGF("Memory: skipped readback into unmapped range addr=0x%016" PRIx64 " size=0x%016" PRIx64 "\n", vaddr, size);
+	}
+}
+
+
 namespace {
 
 constexpr uint64_t NumFramesBeforeRemoval = 32;
@@ -1943,7 +1951,7 @@ bool TextureCache::DownloadImageMemory(ImageId id) {
 	                                               1, &barrier, 0, nullptr);
 	m_scheduler.DeferPriorityOperation([&download, range, mapped, offset] {
 		download.Invalidate(offset, range.size);
-		LibKernel::Memory::WriteBacking(range.address, mapped, range.size);
+		WriteBackingIfMapped(range.address, mapped, range.size);
 	});
 	return true;
 }

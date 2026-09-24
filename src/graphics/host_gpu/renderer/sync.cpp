@@ -204,6 +204,7 @@ void WriteAtEndOfPipeWithInterrupt32(uint64_t submit_id, CommandBuffer& buffer,
 
 uint64_t PrepareVideoOutFlip(CommandBuffer& buffer, int handle, int index, int flip_mode,
                              int64_t flip_arg) {
+	uint32_t invalid_index_waits = 0;
 	for (;;) {
 		uint64_t   request_id = 0;
 		auto&      video_out  = buffer.GetContext().GetVideoOut();
@@ -212,6 +213,16 @@ uint64_t PrepareVideoOutFlip(CommandBuffer& buffer, int handle, int index, int f
 		if (result == OK) {
 			EXIT_IF(request_id == 0);
 			return request_id;
+		}
+		if (result == VideoOut::VIDEO_OUT_ERROR_INVALID_INDEX && index >= 0) {
+			// The game may register the target buffers after submitting; give it a moment.
+			if (++invalid_index_waits <= 5000) {
+				Common::Thread::SleepMicro(1000);
+				continue;
+			}
+			LOGF("GPU flip to unregistered buffer %d on handle %d; presenting blank\n", index, handle);
+			index = -1;
+			continue;
 		}
 		if (result != VideoOut::VIDEO_OUT_ERROR_FLIP_QUEUE_FULL) {
 			EXIT("GPU flip submission failed, result=%d handle=%d index=%d mode=%d arg=%" PRId64

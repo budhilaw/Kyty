@@ -34,6 +34,8 @@ public:
 
 	int  SubmitFlipFromGpu(Graphics::CommandBuffer& buffer, int handle, int index, int flip_mode,
 	                       int64_t flip_arg, uint64_t& request_id);
+	int  ReserveFlipFromGpu(int handle, int index, int flip_mode, int64_t flip_arg,
+	                        uint64_t& request_id);
 	void PrepareFlip(uint64_t request_id, Graphics::CommandBuffer& buffer);
 	void CompleteFlip(uint64_t request_id);
 	void SubmitFlipPreparation(uint64_t request_id);

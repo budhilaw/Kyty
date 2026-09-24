@@ -514,6 +514,9 @@ static int ReserveFlipRequest(VideoOutDriver::Impl& driver, int handle, int inde
 	Common::LockGuard lock(video_out->mutex);
 	if (video_out->closing ||
 	    (!IsSpecialBufferIndex(index) && !video_out->buffers[index].Occupied())) {
+		LOGF("ReserveFlipRequest: handle=%d index=%d closing=%d group=%d source=%d\n", handle,
+		     index, static_cast<int>(video_out->closing), video_out->buffers[index].group_index,
+		     static_cast<int>(source));
 		return VIDEO_OUT_ERROR_INVALID_INDEX;
 	}
 	if (!driver.GetFlipQueue().Reserve(*video_out, index, flip_arg, source, request_id)) {
@@ -677,6 +680,7 @@ bool VideoOutDriver::Impl::Close(int handle) {
 		}
 		config.opened  = false;
 		config.closing = true;
+		LOGF("VideoOutClose: handle=%d\n", handle);
 		if (++config.generation == 0) {
 			EXIT("video-out port generation wrapped\n");
 		}
@@ -1441,6 +1445,7 @@ KYTY_SYSV_ABI int VideoOutUnregisterBuffers(int handle, int set_index) {
 			buffer = VideoOutBuffer {};
 		}
 	}
+	LOGF("VideoOutUnregisterBuffers: handle=%d set=%d\n", handle, set_index);
 
 	return OK;
 }
@@ -1474,6 +1479,12 @@ int VideoOutDriver::SubmitFlipFromGpu(Graphics::CommandBuffer& buffer, int handl
 	m_impl->GetFlipQueue().Prepare(request_id, buffer);
 
 	return OK;
+}
+
+int VideoOutDriver::ReserveFlipFromGpu(int handle, int index, int flip_mode, int64_t flip_arg,
+                                       uint64_t& request_id) {
+	return ReserveFlipRequest(*m_impl, handle, index, flip_mode, flip_arg,
+	                          FlipRequestSource::GpuEop, request_id);
 }
 
 void VideoOutDriver::SubmitFlipPreparation(uint64_t request_id) {

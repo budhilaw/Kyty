@@ -47,7 +47,8 @@ public:
 	void              Submit(std::span<const uint32_t> draw_commands,
 	                         std::span<const uint32_t> constant_commands,
 	                         std::vector<uint32_t>     owned_commands = {},
-	                         const uint32_t*           guest_origin   = nullptr);
+	                         const uint32_t*           guest_origin   = nullptr,
+	                         std::vector<uint64_t>     reserved_flips = {});
 	void              SubmitCompute(uint32_t queue, std::span<const uint32_t> commands,
 	                                std::vector<uint32_t> owned_commands = {},
 	                                const uint32_t*       guest_origin   = nullptr);
@@ -86,6 +87,7 @@ private:
 		// A hardware ring starts on submission, so a wait may observe any write made since then.
 		uint64_t                  submit_seq        = 0;
 		uint64_t                  flip_request_id   = 0;
+		std::vector<uint64_t>     reserved_flips;
 	};
 
 	static void       ReportQueueStall(GuestGpu& gpu);

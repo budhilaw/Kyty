@@ -27,6 +27,14 @@
 
 namespace Libs::Graphics {
 
+// A readback may complete after the game released the pages; the data is then unwanted.
+static void WriteBackingIfMapped(uint64_t vaddr, const void* data, uint64_t size) {
+	if (!Libs::LibKernel::Memory::TryWriteBacking(vaddr, data, size)) {
+		LOGF("Memory: skipped readback into unmapped range addr=0x%016" PRIx64 " size=0x%016" PRIx64 "\n", vaddr, size);
+	}
+}
+
+
 namespace {
 
 constexpr uint64_t MiB           = 1024 * 1024;
@@ -177,7 +185,7 @@ bool BufferCache::DownloadBufferMemory(Buffer& buffer, uint64_t vaddr, uint64_t 
 	                                    copies = std::move(copies)] {
 		m_download_buffer.Invalidate(offset, total_size);
 		for (const auto& copy: copies) {
-			Libs::LibKernel::Memory::WriteBacking(buffer_address + copy.srcOffset,
+			WriteBackingIfMapped(buffer_address + copy.srcOffset,
 			                                      mapped + (copy.dstOffset - offset), copy.size);
 		}
 	});
@@ -383,7 +391,7 @@ bool BufferCache::TryImmediateReadback(Buffer& buffer, uint64_t vaddr, uint64_t 
 	m_readback_buffer->Invalidate(0, total);
 	const auto* mapped = m_readback_buffer->Mapped().data();
 	for (const auto& copy: copies) {
-		Libs::LibKernel::Memory::WriteBacking(buffer_begin + copy.srcOffset,
+		WriteBackingIfMapped(buffer_begin + copy.srcOffset,
 		                                      mapped + copy.dstOffset, copy.size);
 	}
 	for (const auto& range: ranges) {

@@ -7,6 +7,7 @@
 #include "graphics/host_gpu/renderer/renderContext.h"
 
 #include <cstdint>
+#include <deque>
 #include <span>
 #include <vector>
 
@@ -120,8 +121,12 @@ public:
 	                        uint32_t eop_event_type, uint32_t cache_action, uint32_t event_index,
 	                        uint32_t event_write_source, void* dst_gpu_addr, uint64_t value,
 	                        uint32_t interrupt_selector, uint32_t interrupt_context_id = 0);
-	void Flip();
+	void Flip(bool reserved = false);
 	void Flip(void* dst_gpu_addr, uint32_t value);
+	void QueueReservedFlips(const std::vector<uint64_t>& flips) {
+		m_reserved_flips.assign(flips.begin(), flips.end());
+	}
+	uint64_t TakeFlipRequest(CommandBuffer& command, bool reserved);
 	void FlipWithInterrupt(uint32_t eop_event_type, uint32_t cache_action, void* dst_gpu_addr,
 	                       uint32_t value);
 	void PrepareCpuFlip(uint64_t request_id);
@@ -213,6 +218,7 @@ private:
 	uint32_t m_const_ram[0x3000] = {0};
 
 	FlipInfo  m_flip;
+	std::deque<uint64_t> m_reserved_flips;
 	const int m_interrupt_event_id;
 	uint64_t  m_submit_id                   = 0;
 	const uint32_t* m_stream_copy           = nullptr;

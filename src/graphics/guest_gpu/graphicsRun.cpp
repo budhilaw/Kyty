@@ -233,12 +233,14 @@ void GuestGpu::SendCommandSync(Common::UniqueFunction<void>&& command) {
 
 void GuestGpu::Submit(std::span<const uint32_t> draw_commands,
                       std::span<const uint32_t> constant_commands,
-                      std::vector<uint32_t> owned_commands, const uint32_t* guest_origin) {
+                      std::vector<uint32_t> owned_commands, const uint32_t* guest_origin,
+                      std::vector<uint64_t> reserved_flips) {
 	if (draw_commands.empty()) {
 		return;
 	}
 	GpuMutexLock lock(m_submission_mutex);
 	Submission   submission;
+	submission.reserved_flips    = std::move(reserved_flips);
 	submission.type              = SubmissionType::Graphics;
 	submission.queue_id          = 0;
 	submission.commands          = draw_commands;
@@ -1033,6 +1035,7 @@ bool GuestGpu::Process(Submission& submission) {
 		cp.SetSubmitId(++m_submit_id);
 		cp.ResetDeCe();
 		cp.SetFlip({});
+		cp.QueueReservedFlips(submission.reserved_flips);
 	}
 
 	cp.BufferInit();
@@ -2072,7 +2075,21 @@ void CommandProcessor::TriggerEvent(uint32_t event_type, uint32_t event_index,
 	}
 }
 
-void CommandProcessor::Flip() {
+uint64_t CommandProcessor::TakeFlipRequest(CommandBuffer& command, bool reserved) {
+	// A flip reserved at submit time already counts as pending; only attach the command buffer.
+	if (reserved && !m_reserved_flips.empty()) {
+		const auto id = m_reserved_flips.front();
+		m_reserved_flips.pop_front();
+		if (id != 0) {
+			command.GetContext().GetVideoOut().PrepareFlip(id, command);
+			return id;
+		}
+	}
+	return Sync::PrepareVideoOutFlip(command, m_flip.handle, m_flip.index, m_flip.flip_mode,
+	                                 m_flip.flip_arg);
+}
+
+void CommandProcessor::Flip(bool reserved) {
 	CheckBuffer();
 
 	if (GraphicsRunDebugDumpEnabled()) {
@@ -2080,8 +2097,7 @@ void CommandProcessor::Flip() {
 	}
 
 	auto& command = CurrentBuffer();
-	auto request = Sync::PrepareVideoOutFlip(command, m_flip.handle, m_flip.index, m_flip.flip_mode,
-	                                         m_flip.flip_arg);
+	auto  request = TakeFlipRequest(command, reserved);
 	Sync::WriteAtEndOfPipeOnlyFlip(m_submit_id, command, m_flip.handle, m_flip.index,
 	                               m_flip.flip_mode, m_flip.flip_arg, request);
 	GetScheduler().Flush();

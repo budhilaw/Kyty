@@ -4325,9 +4325,36 @@ static void submit_dcb(uint32_t* dcb, uint32_t size_in_dwords) {
 	}
 	GraphicsDbgDumpDcb("d", size_in_dwords, dcb);
 	EXIT_IF(g_renderer == nullptr);
+	// Flips are reserved when submitted so the game sees them pending before the GPU runs them.
+	std::vector<uint64_t> reserved_flips;
+	for (uint32_t offset = 0; offset < size_in_dwords;) {
+		const auto header = dcb[offset];
+		const auto type   = header >> 30u;
+		if (type == 2u) {
+			offset += 1;
+			continue;
+		}
+		if (type != 3u) {
+			break;
+		}
+		if (header == 0xc004105cu && offset + 5u < size_in_dwords) {
+			const auto arg = static_cast<int64_t>(dcb[offset + 4] |
+			                                      (static_cast<uint64_t>(dcb[offset + 5]) << 32u));
+			uint64_t   id  = 0;
+			const auto result = g_renderer->GetVideoOut().ReserveFlipFromGpu(
+			    static_cast<int>(dcb[offset + 1]), static_cast<int>(dcb[offset + 2]),
+			    static_cast<int>(dcb[offset + 3]), arg, id);
+			if (result != OK) {
+				LOGF("\t DCBFLIP: reservation at submit failed result=%d\n", result);
+				id = 0;
+			}
+			reserved_flips.push_back(id);
+		}
+		offset += ((header >> 16u) & 0x3fffu) + 2u;
+	}
 	auto                            owned = snapshot_command_stream(dcb, size_in_dwords, "dcb");
 	const std::span<const uint32_t> commands {owned.data(), size_in_dwords};
-	g_renderer->GetGpu().Submit(commands, {}, std::move(owned), dcb);
+	g_renderer->GetGpu().Submit(commands, {}, std::move(owned), dcb, std::move(reserved_flips));
 }
 
 int KYTY_SYSV_ABI AgcDriverSubmitDcb(const Packet* packet) {
