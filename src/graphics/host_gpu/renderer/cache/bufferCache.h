@@ -68,6 +68,7 @@ public:
 	// Cache-index and exact dirty-range queries require GPU-thread serialization.
 	[[nodiscard]] bool IsRegionRegistered(uint64_t vaddr, uint64_t size);
 	void               SnapshotPagesForWrite(uint64_t vaddr, uint64_t size);
+	void               WriteBackMerged(uint64_t vaddr, const uint8_t* data, uint64_t size);
 	void               AppendUploadCopies(Buffer& buffer, uint64_t address, uint64_t bytes,
 	                                      std::vector<vk::BufferCopy>& copies,
 	                                      uint64_t& total_size) noexcept;

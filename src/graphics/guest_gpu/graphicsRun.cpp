@@ -693,6 +693,13 @@ void CommandProcessor::WaitRegMem(uint32_t func, const T* addr, T ref, T mask, u
 	// download the GPU copy over the value a fence write placed here at parse time.
 	T current = 0;
 	if (!Libs::LibKernel::Memory::TryReadBacking(wait_address, &current, sizeof(T))) {
+		MEMORY_BASIC_INFORMATION info {};
+		if (VirtualQuery(addr, &info, sizeof(info)) == 0 || info.State != MEM_COMMIT) {
+			// A wait on unmapped memory comes from a damaged packet; nothing can release it.
+			LOGF("\t WAITREGMEM: unmapped address 0x%016" PRIx64 " skipped\n", wait_address);
+			g_current_execution->ClearWait();
+			return;
+		}
 		current = *addr;
 	}
 	if (g_current_execution->TakeForcedPass(wait_address)) {
@@ -727,7 +734,7 @@ void CommandProcessor::WaitRegMem(uint32_t func, const T* addr, T ref, T mask, u
 		if (LabelTraceEnabled()) {
 			LOGF("LABEL wait q=%d sub=%" PRIu64 " addr=0x%010" PRIx64 " cur=0x%" PRIx64
 			     " ref=0x%" PRIx64 " mask=0x%" PRIx64 " func=%" PRIu32 "\n",
-			     QueueTag(), m_submit_id, wait_address, static_cast<uint64_t>(*addr),
+			     QueueTag(), m_submit_id, wait_address, static_cast<uint64_t>(current),
 			     static_cast<uint64_t>(ref), static_cast<uint64_t>(mask), func);
 		}
 	}
@@ -739,13 +746,13 @@ void CommandProcessor::WaitRegMem(uint32_t func, const T* addr, T ref, T mask, u
 		if ((wrm_seen % 2048) == 0) {
 			LOGF("\t WRMPOLL: addr=0x%016" PRIx64 " current=0x%016" PRIx64 " ref=0x%016" PRIx64
 			     " mask=0x%016" PRIx64 " func=%" PRIu32 " size=%zu\n",
-			     wait_address, static_cast<uint64_t>(*addr), static_cast<uint64_t>(ref),
+			     wait_address, static_cast<uint64_t>(current), static_cast<uint64_t>(ref),
 			     static_cast<uint64_t>(mask), func, sizeof(T));
 		}
 		if (wrm_seen < 3) {
 			LOGF("\t WAITREGMEM: addr=0x%016" PRIx64 " current=0x%08" PRIx64 " ref=0x%08" PRIx64
 			     " mask=0x%08" PRIx64 " func=%" PRIu32 "\n",
-			     reinterpret_cast<uint64_t>(addr), static_cast<uint64_t>(*addr),
+			     reinterpret_cast<uint64_t>(addr), static_cast<uint64_t>(current),
 			     static_cast<uint64_t>(ref), static_cast<uint64_t>(mask), func);
 			Pm4TraceDump();
 			const auto* words = reinterpret_cast<const uint32_t*>(
@@ -1140,6 +1147,30 @@ void GuestGpu::ThreadRun(void* data) {
 							queue.front().blocked = false;
 							selected_queue        = static_cast<int>(id);
 							stall_rounds          = 0;
+						}
+					}
+				}
+				static auto stall_since = std::chrono::steady_clock::now();
+				if (selected_queue >= 0 || stall_rounds < 200) {
+					stall_since = std::chrono::steady_clock::now();
+				} else if (std::chrono::steady_clock::now() - stall_since > std::chrono::seconds(3)) {
+					// Every queue has been blocked for seconds: a compute wait on a fence no stream ever
+					// wrote lost its release. Hardware never deadlocks here, so let that wait through.
+					Common::LockGuard write_lock(g_guest_write_mutex);
+					for (uint32_t id = 1; id < QueueCount && selected_queue < 0; id++) {
+						auto& queue = gpu->m_queues[id];
+						if (queue.empty()) {
+							continue;
+						}
+						auto&      execution = queue.front().command_execution;
+						const auto address   = execution.AwaitedAddress();
+						if (address != 0 && !g_last_gpu_writes.contains(address)) {
+							LOGF("\t STALLBREAK: queue=%u forcing wait on never-written 0x%016" PRIx64 "\n", id, address);
+							execution.ForceWaitPass();
+							queue.front().blocked = false;
+							selected_queue        = static_cast<int>(id);
+							stall_rounds          = 0;
+							stall_since           = std::chrono::steady_clock::now();
 						}
 					}
 				}

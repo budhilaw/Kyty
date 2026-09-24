@@ -150,6 +150,11 @@ void FaultManager::ProcessFaultBuffer() {
 		}
 		fault_ranges.ForEach([this](uint64_t start, uint64_t end) {
 			EXIT_IF(end - start > std::numeric_limits<uint32_t>::max());
+			// A shader pointer outside guest mappings is garbage; giving it a GPU copy would let
+			// later writes through it land in host memory on readback.
+			if (!m_scheduler.Context().IsMapped(start, end - start)) {
+				return;
+			}
 			(void)m_buffer_cache.FindBuffer(start, end - start);
 		});
 		// Pages a shader wrote through a device address are owned by the GPU from now on.

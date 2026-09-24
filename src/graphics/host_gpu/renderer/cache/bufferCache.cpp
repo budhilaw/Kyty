@@ -252,7 +252,7 @@ bool BufferCache::DownloadBufferMemory(Buffer& buffer, uint64_t vaddr, uint64_t 
 	                                    copies = std::move(copies)] {
 		m_download_buffer.Invalidate(offset, total_size);
 		for (const auto& copy: copies) {
-			WriteBackingIfMapped(buffer_address + copy.srcOffset,
+			WriteBackMerged(buffer_address + copy.srcOffset,
 			                                      mapped + (copy.dstOffset - offset), copy.size);
 		}
 	});
@@ -458,7 +458,7 @@ bool BufferCache::TryImmediateReadback(Buffer& buffer, uint64_t vaddr, uint64_t 
 	m_readback_buffer->Invalidate(0, total);
 	const auto* mapped = m_readback_buffer->Mapped().data();
 	for (const auto& copy: copies) {
-		WriteBackingIfMapped(buffer_begin + copy.srcOffset,
+		WriteBackMerged(buffer_begin + copy.srcOffset,
 		                                      mapped + copy.dstOffset, copy.size);
 	}
 	for (const auto& range: ranges) {
@@ -767,6 +767,38 @@ BufferId BufferCache::CreateBuffer(uint64_t vaddr, uint64_t size) {
 	}
 	Register(id);
 	return id;
+}
+
+void BufferCache::WriteBackMerged(uint64_t vaddr, const uint8_t* data, uint64_t size) {
+	// GPU writes through raw pointers mark whole pages only after the dispatch; bytes the CPU
+	// changed since its first write to such a page are newer than the GPU copy and are kept.
+	constexpr uint64_t   Page = TRACKER_PAGE_SIZE;
+	std::vector<uint8_t> merged;
+	{
+		std::lock_guard lock(m_snapshot_mutex);
+		for (auto page = vaddr & ~(Page - 1u); page < vaddr + size; page += Page) {
+			const auto found = m_write_snapshots.find(page);
+			if (found == m_write_snapshots.end()) {
+				continue;
+			}
+			std::vector<uint8_t> current(Page);
+			if (!Libs::LibKernel::Memory::TryReadBacking(page, current.data(), Page)) {
+				continue;
+			}
+			const auto begin = std::max(page, vaddr);
+			const auto end   = std::min(page + Page, vaddr + size);
+			for (auto address = begin; address < end; address++) {
+				const auto offset = address - page;
+				if (current[offset] != found->second[offset]) {
+					if (merged.empty()) {
+						merged.assign(data, data + size);
+					}
+					merged[address - vaddr] = current[offset];
+				}
+			}
+		}
+	}
+	WriteBackingIfMapped(vaddr, merged.empty() ? data : merged.data(), size);
 }
 
 void BufferCache::SnapshotPagesForWrite(uint64_t vaddr, uint64_t size) {
