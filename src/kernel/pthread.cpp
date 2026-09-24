@@ -3853,7 +3853,8 @@ void KYTY_SYSV_ABI KernelSetThreadDtors(thread_dtors_func_t dtors) {
 
 int KYTY_SYSV_ABI KernelUsleep(KernelUseconds microseconds) {
 	Common::WaitTrace::Scope wait_scope(Common::WaitTrace::Kind::Sleep);
-	LOGF("\t GWAIT: usleep usec=%u thread=%d\n", microseconds, Common::Thread::GetThreadIdUnique());
+	LOGF("\t GWAIT: usleep usec=%u thread=%d caller=%p\n", microseconds,
+	     Common::Thread::GetThreadIdUnique(), __builtin_return_address(0));
 	Common::Timer t;
 	t.Start();
 	SleepMicroWithSignalPoll(microseconds);

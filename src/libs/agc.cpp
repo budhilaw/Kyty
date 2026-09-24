@@ -4352,6 +4352,10 @@ static void submit_dcb(uint32_t* dcb, uint32_t size_in_dwords) {
 		}
 		offset += ((header >> 16u) & 0x3fffu) + 2u;
 	}
+	if (Libs::Graphics::LabelTraceEnabled()) {
+		LOGF("LABEL submit dcb addr=0x%010" PRIx64 " dw=%" PRIu32 "\n",
+		     reinterpret_cast<uint64_t>(dcb), size_in_dwords);
+	}
 	auto                            owned = snapshot_command_stream(dcb, size_in_dwords, "dcb");
 	const std::span<const uint32_t> commands {owned.data(), size_in_dwords};
 	g_renderer->GetGpu().Submit(commands, {}, std::move(owned), dcb, std::move(reserved_flips));
@@ -4411,6 +4415,10 @@ int KYTY_SYSV_ABI AgcDriverSubmitMultiDcbs(uint32_t* const* dcb_gpu_addrs,
 }
 
 static void submit_acb(uint32_t queue, uint32_t* acb, uint32_t size_in_dwords) {
+	if (Libs::Graphics::LabelTraceEnabled()) {
+		LOGF("LABEL submit acb queue=0x%02" PRIx32 " addr=0x%010" PRIx64 " dw=%" PRIu32 "\n", queue,
+		     reinterpret_cast<uint64_t>(acb), size_in_dwords);
+	}
 	if (acb == nullptr || size_in_dwords == 0) {
 		return;
 	}

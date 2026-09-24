@@ -13,6 +13,8 @@
 
 namespace Libs::Graphics {
 
+bool LabelTraceEnabled();
+
 bool TestWaitRegMemValue(uint64_t value, uint64_t ref, uint64_t mask, uint32_t func);
 
 enum class Pm4ProcessResult { Complete, Blocked };
@@ -169,6 +171,7 @@ public:
 	void             ProcessIndirectBuffer(std::span<const uint32_t> commands, bool chain);
 
 	void SetFlip(const FlipInfo& flip) { m_flip = flip; }
+	[[nodiscard]] int QueueTag() const { return m_interrupt_event_id; }
 
 	[[nodiscard]] uint64_t GetSubmitId() const { return m_submit_id; }
 	void                   SetSubmitId(uint64_t submit_id) { m_submit_id = submit_id; }

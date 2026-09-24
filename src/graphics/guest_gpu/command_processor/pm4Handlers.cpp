@@ -1636,6 +1636,11 @@ KYTY_CP_OP_PARSER(CpOpDmaData) {
 	const uint8_t  write_confirm = static_cast<uint8_t>((control2 >> 31u) & 0x1u);
 	const uint32_t num_bytes     = control2 & 0x03ffffffu;
 
+	if (LabelTraceEnabled()) {
+		LOGF("LABEL dma_data q=%d dst=0x%010" PRIx64 " dst_sel=%u src=0x%010" PRIx64
+		     " src_sel=%u bytes=%" PRIu32 "\n",
+		     cp.QueueTag(), dst, dst_sel, src, src_sel, num_bytes);
+	}
 	cp.DmaData(engine, dst_sel, dst_cache_policy, dst, src_sel, src_cache_policy, src, num_bytes,
 	           wait_previous, write_confirm, block_engine);
 
@@ -2122,9 +2127,10 @@ KYTY_CP_OP_PARSER(CpOpIndirectShRegs) {
 		}
 
 		if (cmd_offset >= Pm4::SH_NUM) {
-			EXIT("unsupported indirect SH register offset 0x%08" PRIx32 " (raw 0x%08" PRIx32
-			     "), value = 0x%08" PRIx32 "\n",
-			     cmd_offset, raw_cmd_offset, value);
+			// Hardware drops writes outside the SH register window; stale table entries land here.
+			LOGF("skipped indirect SH register offset 0x%08" PRIx32 " value 0x%08" PRIx32 "\n",
+			     raw_cmd_offset, value);
+			continue;
 		}
 
 		auto pfunc = g_hw_sh_indirect_func[cmd_offset];
@@ -2184,9 +2190,9 @@ KYTY_CP_OP_PARSER(CpOpIndirectUcRegs) {
 			continue;
 		}
 		if (cmd_offset >= Pm4::UC_NUM) {
-			EXIT("unsupported indirect UC register offset 0x%08" PRIx32 " (raw 0x%08" PRIx32
-			     "), value = 0x%08" PRIx32 "\n",
-			     cmd_offset, raw_cmd_offset, value);
+			LOGF("skipped indirect UC register offset 0x%08" PRIx32 " value 0x%08" PRIx32 "\n",
+			     raw_cmd_offset, value);
+			continue;
 		}
 
 		auto pfunc = g_hw_uc_indirect_func[cmd_offset & (Pm4::UC_NUM - 1)];
@@ -2330,7 +2336,12 @@ KYTY_CP_OP_PARSER(CpOpReleaseMem) {
 
 	{
 		static std::atomic<uint32_t> rm_log_count {0};
-		if (rm_log_count.fetch_add(1) < 256) {
+		if (LabelTraceEnabled()) {
+			LOGF("LABEL release_mem q=%d dst=0x%010" PRIx64 " value=0x%" PRIx64 " data_sel=%" PRIu32
+			     " int_sel=%" PRIu32 " ctx=%" PRIu32 "\n",
+			     cp.QueueTag(), reinterpret_cast<uint64_t>(dst_gpu_addr), value, data_sel,
+			     interrupt_selector, interrupt_context_id);
+		} else if (rm_log_count.fetch_add(1) < 256) {
 			LOGF("\t RELEASEMEM: dst=0x%016" PRIx64 " value=0x%016" PRIx64 " data_sel=%" PRIu32
 			     " int_sel=%" PRIu32 " release_dst=%" PRIu32 "\n",
 			     reinterpret_cast<uint64_t>(dst_gpu_addr), value, data_sel, interrupt_selector,

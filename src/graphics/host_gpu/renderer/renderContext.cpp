@@ -8,6 +8,7 @@
 #include "graphics/presentation/videoOut.h"
 #include "libs/errno.h"
 
+#include <atomic>
 #include <chrono>
 #include <vector>
 #include <cstdlib>
@@ -266,7 +267,23 @@ void RenderContext::GpuTimerBegin(vk::CommandBuffer command) {
 	}
 }
 
+static std::array<std::atomic<uint64_t>, 64> g_recent_shaders {};
+static std::atomic<uint32_t>                   g_recent_shader_index {0};
+
+void PrintRecentShaders() {
+	const auto end = g_recent_shader_index.load();
+	std::printf("Last shaders sent to the GPU, oldest first:");
+	for (uint32_t i = end > 64 ? end - 64 : 0; i < end; i++) {
+		std::printf(" %016llx", static_cast<unsigned long long>(g_recent_shaders[i % 64].load()));
+	}
+	std::printf("\n");
+	std::fflush(stdout);
+}
+
 void RenderContext::GpuTimerMark(vk::CommandBuffer command, uint64_t label, uint8_t kind) {
+	if (label != 0) {
+		g_recent_shaders[g_recent_shader_index.fetch_add(1) % 64].store(label | (uint64_t {kind} << 60u));
+	}
 	if (m_timer_current < 0) {
 		return;
 	}

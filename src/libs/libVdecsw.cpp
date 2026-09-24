@@ -3,6 +3,7 @@
 #include "libs/errno.h"
 #include "libs/libs.h"
 #include "libs/videoDec2Decoder.h"
+#include "kernel/memory.h"
 #include "loader/symbolDatabase.h"
 
 #include <algorithm>
@@ -174,6 +175,8 @@ struct DecoderState {
 	bool                          finalizing       = false;
 	bool                          busy             = false;
 	bool                          stop             = false;
+	uint64_t                      frames_in        = 0;
+	uint64_t                      frames_out       = 0;
 	std::mutex                    mutex;
 	std::condition_variable       wake;
 	std::thread                   worker;
@@ -215,7 +218,7 @@ static void DecodeWorker(DecoderState* state) {
 		if (request.kind == RequestKind::Reset) {
 			VideoDec2::Decoder::Reset(state->instance);
 		} else if (request.kind == RequestKind::Flush) {
-			(void)VideoDec2::Decoder::Flush(state->instance, target, &frame.output);
+			(void)VideoDec2::Decoder::Drain(state->instance, target, &frame.output);
 		} else {
 			const auto& in     = request.input;
 			const auto  result = VideoDec2::Decoder::Decode(
@@ -243,10 +246,10 @@ static void DecodeWorker(DecoderState* state) {
 		}
 		lock.lock();
 		state->busy = false;
-		if (request.kind == RequestKind::Input) {
-			state->consumed.push_back(request.input.attached);
-		} else if (request.kind == RequestKind::Flush && !frame.output.valid) {
+		if (request.kind == RequestKind::Flush && !frame.output.valid) {
 			state->finalizing = false;
+			LOGF("Vdecsw drained: in=%" PRIu64 " out=%" PRIu64 " ready=%zu\n", state->frames_in,
+			     state->frames_out, state->ready.size());
 		}
 		if (frame.output.valid) {
 			state->ready.push_back(std::move(frame));
@@ -462,7 +465,10 @@ static int32_t KYTY_SYSV_ABI SetDecodeInput(VdecswDecoder decoder, const VdecswI
 		    {RequestKind::Input,
 		     {std::vector<uint8_t>(bytes, bytes + input->au_size), input->pts_data,
 		      input->dts_data, input->attached_data}});
+		// The access unit is copied, so the game may reuse its buffer at once.
+		state->consumed.push_back(input->attached_data);
 		state->finalizing = false;
+		state->frames_in++;
 	}
 	state->wake.notify_all();
 	return OK;
@@ -554,7 +560,13 @@ static int32_t KYTY_SYSV_ABI TrySyncDecodeOutput(VdecswDecoder decoder, VdecswOu
 		auto frame = std::move(state->ready.front());
 		state->ready.pop_front();
 		const auto bytes = std::min(frame.data.size(), state->frame_buffer.frame_buffer_size);
-		std::memcpy(state->frame_buffer.frame_buffer, frame.data.data(), bytes);
+		// Writing through the backing alias avoids a protection fault on every tracked page.
+		const auto target = reinterpret_cast<uint64_t>(state->frame_buffer.frame_buffer);
+		LibKernel::Memory::InvalidateMemory(target, bytes);
+		if (!LibKernel::Memory::TryWriteBacking(target, frame.data.data(), bytes)) {
+			std::memcpy(state->frame_buffer.frame_buffer, frame.data.data(), bytes);
+		}
+		state->frames_out++;
 		ApplyDecodedOutput(frame.output, state->frame_buffer, output);
 		if (frame.has_picture) {
 			std::scoped_lock picture_lock(g_picture_mutex);
@@ -581,6 +593,8 @@ static int32_t KYTY_SYSV_ABI FinalizeDecodeSequence(VdecswDecoder decoder) {
 	{
 		std::scoped_lock lock(state->mutex);
 		state->finalizing = true;
+		LOGF("Vdecsw FinalizeDecodeSequence: in=%" PRIu64 " out=%" PRIu64 " pending=%zu ready=%zu\n",
+		     state->frames_in, state->frames_out, state->requests.size(), state->ready.size());
 		if (state->requests.empty() && !state->busy) {
 			state->requests.push_back({RequestKind::Flush, {}});
 		}

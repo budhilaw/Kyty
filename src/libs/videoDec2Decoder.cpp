@@ -224,13 +224,44 @@ public:
 		return result;
 	}
 
+	// End of sequence: signal end of stream, hand out every delayed picture, then reopen.
+	[[nodiscard]] Result DrainOutput(const FrameBuffer& frame_buffer, Output* output) {
+		std::scoped_lock lock(m_mutex);
+		*output = {};
+		if (!m_draining) {
+			const int sent = avcodec_send_packet(m_codec, nullptr);
+			if (sent < 0 && sent != AVERROR_EOF) {
+				LOGF("Videodec2: entering drain failed: %s (%d)\n", AvErrorString(sent), sent);
+				return Result::ApiFail;
+			}
+			m_draining = true;
+		}
+		AVFrame* frame = av_frame_alloc();
+		if (frame == nullptr) {
+			return Result::ApiFail;
+		}
+		const int receive_result = avcodec_receive_frame(m_codec, frame);
+		if (receive_result < 0) {
+			av_frame_free(&frame);
+			avcodec_flush_buffers(m_codec);
+			m_draining = false;
+			return Result::Ok;
+		}
+		const auto result = CopyFrame(frame, frame_buffer, output);
+		av_frame_free(&frame);
+		return result;
+	}
+
 	void ResetDecoder() {
 		std::scoped_lock lock(m_mutex);
 		avcodec_flush_buffers(m_codec);
+		m_draining = false;
 		ClearPictureMetadata();
 	}
 
 private:
+	bool m_draining = false;
+
 	[[nodiscard]] PictureInfo MakePictureInfo(const AVFrame* frame) const {
 		PictureInfo result {};
 		if (frame->opaque_ref != nullptr && frame->opaque_ref->size >= sizeof(PacketMetadata)) {
@@ -386,6 +417,10 @@ Result Decode(Instance* instance, const Input& input, const FrameBuffer& frame_b
 
 Result Flush(Instance* instance, const FrameBuffer& frame_buffer, Output* output) {
 	return instance->FlushOutput(frame_buffer, output);
+}
+
+Result Drain(Instance* instance, const FrameBuffer& frame_buffer, Output* output) {
+	return instance->DrainOutput(frame_buffer, output);
 }
 
 void Reset(Instance* instance) {

@@ -141,9 +141,10 @@ NativeStorageBuffer(RenderContext& context, const PreparedBindings::BufferSource
 	auto [buffer, offset] = context.GetBufferCache().ObtainBuffer(address, size, resource.written,
 	                                                              resource.formatted, id);
 	const auto aligned_offset = Common::AlignDown(offset, alignment);
-	const auto adjustment     = offset - aligned_offset;
-	const auto max_range      = graphics.GetPhysicalDeviceProperties().limits.maxStorageBufferRange;
-	if (adjustment % sizeof(uint32_t) != 0 || adjustment >= 256 || size > max_range - adjustment) {
+	// Dword buffer loads ignore the low two address bits on AMD hardware, so drop them here too.
+	const auto adjustment = (offset - aligned_offset) & ~uint64_t {3};
+	const auto max_range  = graphics.GetPhysicalDeviceProperties().limits.maxStorageBufferRange;
+	if (adjustment >= 256 || size > max_range - adjustment) {
 		EXIT("storage buffer offset adjustment is unsupported\n");
 	}
 	buffer_offset = static_cast<uint32_t>(adjustment);
@@ -576,6 +577,10 @@ TextureBinding RenderExecutor::ResolveTexture(const ShaderRecompiler::IR::ImageR
 	const auto samples = multisampled ? 1u << last_level : 1u;
 	auto view_levels = multisampled ? 1u : static_cast<uint32_t>(last_level - base_level) + 1u;
 	auto depth = static_cast<uint32_t>(descriptor.Depth()) + 1u;
+	if (type == Prospero::ImageType::kColor1DArray && height != 1u) {
+		LOGF("1D array texture descriptor with height %u clamped\n", height);
+		height = 1u;
+	}
 	if (type == Prospero::ImageType::kColor1D && (height != 1u || depth != 1u)) {
 		// A 1D descriptor with extra rows is malformed; only its first row can be sampled.
 		LOGF("1D texture descriptor with extent %ux%ux%u clamped\n", width, height, depth);

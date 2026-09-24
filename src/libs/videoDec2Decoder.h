@@ -78,6 +78,7 @@ void                    Destroy(Instance* instance);
 [[nodiscard]] Result Decode(Instance* instance, const Input& input, const FrameBuffer& frame_buffer,
                             Output* output);
 [[nodiscard]] Result Flush(Instance* instance, const FrameBuffer& frame_buffer, Output* output);
+[[nodiscard]] Result Drain(Instance* instance, const FrameBuffer& frame_buffer, Output* output);
 void                 Reset(Instance* instance);
 [[nodiscard]] bool   GetPictureInfo(void* frame_buffer, PictureInfo* picture_info);
 

@@ -21,6 +21,7 @@
 #include "libs/agc.h"
 #include "libs/errno.h"
 
+#include <chrono>
 #include <algorithm>
 #include <array>
 #include <atomic>
@@ -555,6 +556,15 @@ bool TestWaitRegMemValue(uint64_t value, uint64_t ref, uint64_t mask, uint32_t f
 	return false;
 }
 
+// Address whose pending wait is forced through after a sustained all-queue deadlock.
+static std::atomic<uint64_t> g_force_release_address {0};
+
+bool LabelTraceEnabled() {
+	// KYTY_LABEL_TRACE=1 logs every GPU label write and wait with its queue, for sync debugging.
+	static const bool enabled = std::getenv("KYTY_LABEL_TRACE") != nullptr;
+	return enabled;
+}
+
 template <typename T>
 void CommandProcessor::WaitRegMem(uint32_t func, const T* addr, T ref, T mask, uint32_t poll,
                                   uint32_t wait_op) {
@@ -575,8 +585,20 @@ void CommandProcessor::WaitRegMem(uint32_t func, const T* addr, T ref, T mask, u
 		g_current_execution->ClearWait();
 		return;
 	}
+	if (auto forced = wait_address; g_force_release_address.compare_exchange_strong(forced, 0)) {
+		LOGF("DEADLOCK: forced wait on 0x%010" PRIx64 " through (value 0x%" PRIx64 ")\n",
+		     wait_address, static_cast<uint64_t>(*addr));
+		g_current_execution->ClearWait();
+		return;
+	}
 	if (g_current_execution->AwaitedAddress() != wait_address) {
 		g_current_execution->BeginWait(wait_address, g_current_execution->BaselineSeq());
+		if (LabelTraceEnabled()) {
+			LOGF("LABEL wait q=%d sub=%" PRIu64 " addr=0x%010" PRIx64 " cur=0x%" PRIx64
+			     " ref=0x%" PRIx64 " mask=0x%" PRIx64 " func=%" PRIu32 "\n",
+			     QueueTag(), m_submit_id, wait_address, static_cast<uint64_t>(*addr),
+			     static_cast<uint64_t>(ref), static_cast<uint64_t>(mask), func);
+		}
 	}
 	g_current_execution->SetWaitOperands(ref, mask, func);
 	{
@@ -616,6 +638,11 @@ void CommandProcessor::WriteData(uint32_t* dst, const uint32_t* src, uint32_t dw
                                  uint32_t write_control) {
 	const uint32_t dst_sel = ((write_control >> 30u) & 0x1u) | ((write_control >> 7u) & 0x1eu);
 	const bool     write_one_address = ((write_control >> 16u) & 0x1u) != 0;
+	if (LabelTraceEnabled()) {
+		LOGF("LABEL write_data q=%d sub=%" PRIu64 " dst=0x%010" PRIx64 " dw=%" PRIu32
+		     " value=0x%08" PRIx32 " was=0x%08" PRIx32 "\n",
+		     QueueTag(), m_submit_id, reinterpret_cast<uint64_t>(dst), dw_num, src[0], dst[0]);
+	}
 	if (IsAwaitedFence(reinterpret_cast<uint64_t>(dst))) {
 		static std::atomic<uint32_t> reset_log_count {0};
 		if (reset_log_count.fetch_add(1) < 64) {
@@ -870,6 +897,8 @@ void GuestGpu::ThreadRun(void* data) {
 	g_gpu_state  = gpu;
 
 	uint64_t last_stall_flush_tick = 0;
+	uint64_t stall_seq             = 0;
+	auto     stall_since           = std::chrono::steady_clock::now();
 
 	for (;;) {
 		Submission                   submission;
@@ -909,6 +938,27 @@ void GuestGpu::ThreadRun(void* data) {
 				}
 				if (selected_queue < 0) {
 					ReportQueueStall(*gpu);
+					// A wait that no queued work can satisfy for a long time would hang forever;
+					// release the oldest compute wait, then graphics, so the game keeps running.
+					if (CurrentGuestGpuWriteSeq() != stall_seq) {
+						stall_seq   = CurrentGuestGpuWriteSeq();
+						stall_since = std::chrono::steady_clock::now();
+					} else if (std::chrono::steady_clock::now() - stall_since >
+					           std::chrono::milliseconds(750)) {
+						for (uint32_t pass = 0; pass < 2 && g_force_release_address == 0; pass++) {
+							for (uint32_t id = pass == 0 ? 1u : 0u;
+							     id < (pass == 0 ? QueueCount : 1u) && g_force_release_address == 0;
+							     id++) {
+								const auto& q = gpu->m_queues[id];
+								if (!q.empty() && q.front().blocked &&
+								    q.front().command_execution.AwaitedAddress() != 0) {
+									g_force_release_address =
+									    q.front().command_execution.AwaitedAddress();
+								}
+							}
+						}
+						stall_since = std::chrono::steady_clock::now();
+					}
 					gpu->m_processing = false;
 					// Every queue waits on a fence. The end-of-pipe write that releases it may
 					// still sit in a command buffer this thread has not submitted, and the

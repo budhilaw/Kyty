@@ -29,6 +29,8 @@ namespace Libs::Graphics {
 
 class GuestGpu;
 
+void PrintRecentShaders();
+
 class RenderContext {
 public:
 	explicit RenderContext(GraphicContext& graphics);

@@ -144,6 +144,22 @@ static LONG WINAPI ExceptionFilter(PEXCEPTION_POINTERS exception) noexcept {
 	if (handler != nullptr && handler(info)) {
 		return EXCEPTION_CONTINUE_EXECUTION;
 	}
+	// Unhandled faults otherwise end the process silently; name the code and its module offset.
+	HMODULE module = nullptr;
+	GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+	                       GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+	                   static_cast<LPCSTR>(exception_record->ExceptionAddress), &module);
+	char module_name[MAX_PATH] = "?";
+	if (module != nullptr) {
+		GetModuleFileNameA(module, module_name, MAX_PATH);
+	}
+	printf("Unhandled host fault code=0x%08lx at %s+0x%llx address=0x%llx thread=%lu\n",
+	       static_cast<unsigned long>(exception_record->ExceptionCode), module_name,
+	       static_cast<unsigned long long>(
+	           reinterpret_cast<uint64_t>(exception_record->ExceptionAddress) -
+	           reinterpret_cast<uint64_t>(module)),
+	       static_cast<unsigned long long>(info.access_violation_vaddr), GetCurrentThreadId());
+	fflush(stdout);
 	return EXCEPTION_CONTINUE_SEARCH;
 }
 

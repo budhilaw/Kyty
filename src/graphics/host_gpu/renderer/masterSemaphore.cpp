@@ -1,10 +1,12 @@
 #include "graphics/host_gpu/renderer/masterSemaphore.h"
+#include "graphics/host_gpu/renderer/renderContext.h"
 
 #include "common/assert.h"
 #include "common/timer.h"
 #include "graphics/host_gpu/graphicContext.h"
 
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+#include <cinttypes>
 #include <windows.h>
 #else
 #include <immintrin.h>
@@ -76,7 +78,10 @@ void MasterSemaphore::Wait(uint64_t tick) {
 	wait_info.pValues        = &tick;
 
 	const auto result = m_graphics.device.waitSemaphores(&wait_info, UINT64_MAX);
-	EXIT_NOT_IMPLEMENTED(result != vk::Result::eSuccess);
+	if (result != vk::Result::eSuccess) {
+		PrintRecentShaders();
+		EXIT("GPU wait failed: %s (tick %" PRIu64 ")\n", vk::to_string(result).c_str(), tick);
+	}
 	Refresh();
 }
 
