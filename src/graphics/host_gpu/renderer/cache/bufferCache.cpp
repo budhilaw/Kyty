@@ -158,6 +158,16 @@ void BufferCache::DeleteBuffer(BufferId id) {
 	if (m_scheduler.Active()) {
 		m_scheduler.DeferOperation([this, id] { m_slot_buffers.erase(id); });
 	} else {
+		// Submitted work may still reference the buffer; let the GPU finish it first.
+		static std::atomic<uint32_t> log_count {0};
+		if (log_count.fetch_add(1) < 16) {
+			LOGF("BufferCache: deleting buffer 0x%016" PRIx64 " while the scheduler is idle\n",
+			     m_slot_buffers[id].CpuAddress());
+			Common::WaitTrace::PrintHostStack("idle buffer delete");
+		}
+		if (m_scheduler.CurrentTick() > 0) {
+			m_scheduler.Wait(m_scheduler.CurrentTick() - 1);
+		}
 		m_slot_buffers.erase(id);
 	}
 }
@@ -485,6 +495,7 @@ void BufferCache::ReadMemory(uint64_t vaddr, uint64_t size, bool is_write) {
 		// A read of data that a prefetch already has in flight only waits for that download.
 		if (!m_gpu_modified_ranges.Intersects(vaddr, size) && TryWaitPendingDownload(vaddr, size)) {
 			if (is_write) {
+				SnapshotPagesForWrite(vaddr, size);
 				m_memory_tracker.MarkRegionAsCpuModified(vaddr, size);
 			}
 			return;
@@ -552,6 +563,7 @@ void BufferCache::ReadMemory(uint64_t vaddr, uint64_t size, bool is_write) {
 			}
 		}
 		if (is_write) {
+			SnapshotPagesForWrite(vaddr, size);
 			m_memory_tracker.MarkRegionAsCpuModified(vaddr, size);
 		}
 	});
@@ -726,6 +738,67 @@ BufferId BufferCache::CreateBuffer(uint64_t vaddr, uint64_t size) {
 	return id;
 }
 
+void BufferCache::SnapshotPagesForWrite(uint64_t vaddr, uint64_t size) {
+	constexpr uint64_t Page = TRACKER_PAGE_SIZE;
+	if (m_write_snapshots.size() > 4096) {
+		m_write_snapshots.clear();
+	}
+	for (auto page = vaddr & ~(Page - 1u); page < vaddr + size; page += Page) {
+		if (m_write_snapshots.contains(page) || !IsRegionRegistered(page, Page)) {
+			continue;
+		}
+		std::vector<uint8_t> data(Page);
+		if (Libs::LibKernel::Memory::TryReadBacking(page, data.data(), Page)) {
+			m_write_snapshots.emplace(page, std::move(data));
+		}
+	}
+}
+
+void BufferCache::AppendUploadCopies(Buffer& buffer, uint64_t address, uint64_t bytes,
+                                     std::vector<vk::BufferCopy>& copies,
+                                     uint64_t& total_size) noexcept {
+	constexpr uint64_t Page = TRACKER_PAGE_SIZE;
+	const auto         push = [&](uint64_t begin, uint64_t length) {
+		if (length != 0) {
+			copies.emplace_back(total_size, buffer.Offset(begin), length);
+			total_size += length;
+		}
+	};
+	uint64_t run_begin = address;
+	for (auto page = address & ~(Page - 1u); page < address + bytes; page += Page) {
+		const auto found = m_write_snapshots.find(page);
+		if (found == m_write_snapshots.end()) {
+			continue;
+		}
+		const auto           begin = std::max(page, address);
+		const auto           end   = std::min(page + Page, address + bytes);
+		std::vector<uint8_t> current(Page);
+		const bool readable = Libs::LibKernel::Memory::TryReadBacking(page, current.data(), Page);
+		const auto snapshot = std::move(found->second);
+		m_write_snapshots.erase(found);
+		if (!readable) {
+			continue;
+		}
+		// Everything before this page is uploaded whole; inside it only changed dwords go.
+		push(run_begin, begin - run_begin);
+		for (uint64_t offset = begin - page; offset < end - page;) {
+			if (std::memcmp(current.data() + offset, snapshot.data() + offset, 4) == 0) {
+				offset += 4;
+				continue;
+			}
+			auto changed_end = offset + 4;
+			while (changed_end < end - page &&
+			       std::memcmp(current.data() + changed_end, snapshot.data() + changed_end, 4) != 0) {
+				changed_end += 4;
+			}
+			push(page + offset, changed_end - offset);
+			offset = changed_end;
+		}
+		run_begin = end;
+	}
+	push(run_begin, address + bytes - run_begin);
+}
+
 bool BufferCache::SynchronizeBuffer(Buffer& buffer, uint64_t vaddr, uint64_t size, bool is_written,
                                     bool is_texel_buffer) {
 	std::vector<vk::BufferCopy> copies;
@@ -736,8 +809,7 @@ bool BufferCache::SynchronizeBuffer(Buffer& buffer, uint64_t vaddr, uint64_t siz
 	    [&](uint64_t address, uint64_t bytes) noexcept {
 		    TraceArgs("upload", address, bytes,
 		              fmt::format("into buffer=0x{:x}+0x{:x}", buffer.CpuAddress(), buffer.Size()));
-		    copies.emplace_back(total_size, buffer.Offset(address), bytes);
-		    total_size += bytes;
+		    AppendUploadCopies(buffer, address, bytes, copies, total_size);
 	    },
 	    [&]() noexcept { source = UploadCopies(buffer, copies, total_size); });
 	if (source) {

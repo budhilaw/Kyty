@@ -501,7 +501,7 @@ static ImageViewInfo TextureViewInfo(const ShaderRecompiler::IR::ImageResource& 
 			view.type       = vk::ImageViewType::e2DArray;
 			view.base_layer = descriptor.BaseArray5();
 			if (view.base_layer >= image_layers) {
-				EXIT("texture array base layer is out of bounds\n");
+				view.base_layer = image_layers - 1u; // corrupt descriptor; clamp like hardware
 			}
 			view.layer_count = image_layers - view.base_layer;
 			break;
@@ -510,7 +510,7 @@ static ImageViewInfo TextureViewInfo(const ShaderRecompiler::IR::ImageResource& 
 			view.type       = vk::ImageViewType::e2D;
 			view.base_layer = descriptor.BaseArray5();
 			if (view.base_layer >= image_layers) {
-				EXIT("texture base layer is out of bounds\n");
+				view.base_layer = image_layers - 1u; // corrupt descriptor; clamp like hardware
 			}
 			view.layer_count = 1;
 			break;
@@ -617,6 +617,17 @@ TextureBinding RenderExecutor::ResolveTexture(const ShaderRecompiler::IR::ImageR
 	                             type == Prospero::ImageType::kColor2DArray ||
 	                             type == Prospero::ImageType::kColor2DMsaaArray;
 	const auto    image_layers = layered ? depth : 1u;
+	if (image_layers > 2048u || (volume && depth > 2048u)) {
+		// Beyond every device limit: corrupt descriptor data. Bind a null image instead.
+		static std::atomic<uint32_t> log_count {0};
+		if (log_count.fetch_add(1) < 16) {
+			LOGF("TEXDESC: %u layers/depth exceeds device limits; bound as null\n", depth);
+		}
+		auto       desc = NullTextureDesc(resource, storage ? TextureCache::BindingType::Storage
+		                                                    : TextureCache::BindingType::Texture);
+		const auto id   = texture_cache.FindImage(desc);
+		return {id, nullptr, std::move(desc)};
+	}
 	if (levels > physical_levels) {
 		const TileSurfaceDescription physical {
 		    format, tile, volume ? TileSurfaceDimension::Dim3D : TileSurfaceDimension::Dim2D,

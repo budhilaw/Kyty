@@ -146,6 +146,7 @@ vk::Sampler SamplerCache::GetSampler(const ShaderSamplerResource& r) {
 		sampler_info.addressModeV     = vk::SamplerAddressMode::eClampToEdge;
 		sampler_info.addressModeW     = vk::SamplerAddressMode::eClampToEdge;
 		sampler_info.mipmapMode       = vk::SamplerMipmapMode::eNearest;
+		sampler_info.minFilter        = sampler_info.magFilter; // Vulkan requires them equal here
 		sampler_info.minLod           = 0.0f;
 		sampler_info.maxLod           = 0.0f;
 		sampler_info.anisotropyEnable = VK_FALSE;

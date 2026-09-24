@@ -66,6 +66,10 @@ public:
 	                bool src_gds);
 	// Cache-index and exact dirty-range queries require GPU-thread serialization.
 	[[nodiscard]] bool IsRegionRegistered(uint64_t vaddr, uint64_t size);
+	void               SnapshotPagesForWrite(uint64_t vaddr, uint64_t size);
+	void               AppendUploadCopies(Buffer& buffer, uint64_t address, uint64_t bytes,
+	                                      std::vector<vk::BufferCopy>& copies,
+	                                      uint64_t& total_size) noexcept;
 	[[nodiscard]] bool HasGpuDirtyBytes(uint64_t vaddr, uint64_t size);
 	[[nodiscard]] bool IsRegionCpuModified(uint64_t vaddr, uint64_t size);
 	[[nodiscard]] bool IsRegionGpuModified(uint64_t vaddr, uint64_t size);
@@ -148,6 +152,9 @@ private:
 	BufferMap                                         m_buffers;
 	PageTable                                         m_page_table;
 	RangeSet                                          m_gpu_modified_ranges;
+	// Contents of GPU-owned pages at the moment the CPU first wrote to them. The upload of such
+	// a page sends only the bytes the CPU changed, so GPU writes elsewhere in the page survive.
+	std::unordered_map<uint64_t, std::vector<uint8_t>> m_write_snapshots;
 	MemoryTracker                                     m_memory_tracker;
 	StreamBuffer                                      m_staging_buffer;
 	StreamBuffer                                      m_stream_buffer;

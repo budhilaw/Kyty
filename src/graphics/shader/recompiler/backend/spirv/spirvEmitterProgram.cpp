@@ -98,7 +98,8 @@ void EmitReturn(ValueEmitContext& ctx) {
 	ctx.state.builder.AddFunction(spv::OpReturn);
 }
 
-// Experimental runaway-loop cap for compute shaders; off unless KYTY_LOOP_CAP=1.
+// Experimental runaway-loop cap for compute shaders; off unless KYTY_LOOP_CAP=1. It can cut
+// legitimate long loops short, which corrupts game data.
 static bool LoopCapEnabled(const EmitterState& state) {
 	static const bool enabled = [] {
 		const char* text = std::getenv("KYTY_LOOP_CAP");

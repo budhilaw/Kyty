@@ -779,6 +779,9 @@ static bool IsReadableRange(uint64_t addr, uint64_t size) {
 	return true;
 }
 
+static thread_local uint32_t g_free_page_retries = 0;
+static thread_local uint64_t g_free_page_address = 0;
+
 static bool KytyExceptionHandler(const Common::HostException::ExceptionInfo& exception_info) {
 	const auto* info = &exception_info;
 
@@ -804,13 +807,21 @@ static bool KytyExceptionHandler(const Common::HostException::ExceptionInfo& exc
 			MEMORY_BASIC_INFORMATION mbi {};
 			if (VirtualQuery(reinterpret_cast<void*>(info->access_violation_vaddr), &mbi,
 			                 sizeof(mbi)) != 0 &&
-			    mbi.State == MEM_FREE) {
+			    mbi.State == MEM_FREE &&
+			    (g_free_page_address == info->access_violation_vaddr
+			         ? ++g_free_page_retries
+			         : (g_free_page_address = info->access_violation_vaddr, g_free_page_retries = 1)) > 2000) {
 				std::printf("guest access to unreserved host page: addr=0x%016" PRIx64
 				            " access=%d rip=0x%016" PRIx64 "\n",
 				            info->access_violation_vaddr, static_cast<int>(access), info->exception_address);
 				std::fflush(stdout);
+			} else if (mbi.State == MEM_FREE) {
+				// A remap replaces the range with a fresh view; the page is briefly absent.
+				Sleep(1);
+				return true;
 			} else if (Libs::LibKernel::Memory::HandleGpuFault(access,
 			                                                    info->access_violation_vaddr)) {
+				g_free_page_retries = 0;
 				return true;
 			}
 		}
