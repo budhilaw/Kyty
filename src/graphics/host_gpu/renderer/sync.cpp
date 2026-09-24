@@ -107,9 +107,12 @@ static void RecordEndOfPipeWrite(uint64_t submit_id, CommandBuffer& buffer, uint
 			*reinterpret_cast<uint32_t*>(destination) = static_cast<uint32_t>(value);
 		}
 		ResolvePendingGuestGpuWrite(pending);
-		NoteGuestGpuWriteValue(destination, size == EndOfPipeWriteSize::Qword
-		                                        ? value
-		                                        : (value & 0xffffffffull));
+		// Only 32-bit writes are fences; 64-bit ones are timestamps that would flood the map.
+		if (size == EndOfPipeWriteSize::Dword) {
+			NoteGuestGpuWriteValue(destination, value & 0xffffffffull);
+		} else {
+			NoteGuestGpuWrite(destination);
+		}
 	});
 
 	if (TriggersInterrupt(action)) {

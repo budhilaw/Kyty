@@ -620,12 +620,6 @@ void NoteGuestGpuWrite(uint64_t address) {
 		value = read;
 	}
 	Common::LockGuard lock(g_guest_write_mutex);
-	if (value != UINT64_MAX) {
-		if (g_last_gpu_writes.size() > 65536) {
-			g_last_gpu_writes.clear();
-		}
-		g_last_gpu_writes[address] = value;
-	}
 	const auto        seq       = g_guest_write_seq.fetch_add(1, std::memory_order_acq_rel) + 1;
 	g_guest_writes[seq % kGuestWriteHistory] = {address, value, seq};
 }
@@ -688,9 +682,9 @@ template <typename T>
 void CommandProcessor::WaitRegMem(uint32_t func, const T* addr, T ref, T mask, uint32_t poll,
                                   uint32_t wait_op) {
 	EXIT_IF(addr == nullptr);
-	if ((wait_op & ~1u) != 0) {
-		EXIT("unsupported wait_reg_mem operation: 0x%08" PRIx32 "\n", wait_op);
-	}
+	// Bits above the operation select cache and engine behavior the host does not model.
+	wait_op &= 1u;
+	(void)wait_op;
 
 	(void)poll;
 	const auto wait_address = reinterpret_cast<uint64_t>(addr);
@@ -823,7 +817,11 @@ void CommandProcessor::WriteData(uint32_t* dst, const uint32_t* src, uint32_t dw
 	                write_one_address ? sizeof(uint32_t)
 	                                  : static_cast<uint64_t>(dw_num) * sizeof(uint32_t),
 	                "write_data");
-	NoteGuestGpuWrite(reinterpret_cast<uint64_t>(dst));
+	if (dw_num == 1 || write_one_address) {
+		NoteGuestGpuWriteValue(reinterpret_cast<uint64_t>(dst), src[dw_num - 1]);
+	} else {
+		NoteGuestGpuWrite(reinterpret_cast<uint64_t>(dst));
+	}
 }
 
 void CommandProcessor::WriteReferenceClock(uint64_t dst_address, uint32_t num_bytes) {
@@ -1538,6 +1536,21 @@ void CommandProcessor::ProcessPm4(Pm4Execution& execution) {
 
 		auto handler = g_cp_op_func[opcode];
 
+		if (handler == nullptr && (execution.m_buffer_stack.size() > 1 ||
+		                           packet - (total_dw - remaining_dw) != m_stream_copy)) {
+			// An indirect buffer is read live from guest memory; the game may already have
+			// reused it. Skip the rest of it rather than stop the emulator.
+			static std::atomic<uint32_t> skip_log_count {0};
+			if (skip_log_count.fetch_add(1) < 32) {
+				LOGF("PM4: unknown packet 0x%08" PRIx32 " in indirect buffer 0x%016" PRIx64
+				     " at dw 0x%05" PRIx32 "/%" PRIu32 "; skipping the rest of the buffer\n",
+				     packet_header, reinterpret_cast<uint64_t>(packet - (total_dw - remaining_dw)),
+				     total_dw - remaining_dw, total_dw);
+			}
+			execution.m_buffer_stack.pop_back();
+			execution.m_made_progress = true;
+			continue;
+		}
 		if (handler == nullptr) {
 			const auto offset = total_dw - remaining_dw;
 			KYTY_PM4_FATAL_LOG("unknown PM4 packet: data=0x%016" PRIx64 ", num_dw=%" PRIu32

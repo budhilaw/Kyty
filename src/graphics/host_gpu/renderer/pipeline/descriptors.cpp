@@ -398,6 +398,29 @@ static TextureCache::ImageDesc NullTextureDesc(const ShaderRecompiler::IR::Image
 	                                ? vk::ImageUsageFlagBits::eStorage
 	                                : vk::ImageUsageFlagBits::eSampled;
 	desc.type                 = binding;
+	// The placeholder must match the shader's image dimension; a 2D view in a 3D or array slot
+	// is invalid and can fault the GPU.
+	using Dim = ShaderRecompiler::Decoder::ImageDimension;
+	if (!resource.cube) {
+		switch (resource.dimension) {
+			case Dim::Dim3D:
+				desc.info.type      = Prospero::ImageType::kColor3D;
+				desc.view_info.type = vk::ImageViewType::e3D;
+				break;
+			case Dim::Dim2DArray:
+				desc.view_info.type = vk::ImageViewType::e2DArray;
+				break;
+			case Dim::Dim1D:
+				desc.info.type      = Prospero::ImageType::kColor1D;
+				desc.view_info.type = vk::ImageViewType::e1D;
+				break;
+			case Dim::Dim1DArray:
+				desc.info.type      = Prospero::ImageType::kColor1D;
+				desc.view_info.type = vk::ImageViewType::e1DArray;
+				break;
+			default: break;
+		}
+	}
 	return desc;
 }
 
