@@ -3,6 +3,7 @@
 
 #include "common/common.h"
 
+#include <cstdio>
 #include <memory>
 #include <string>
 
@@ -50,6 +51,7 @@ void               Report(double fps, uint64_t frame);
 // Records the in-module return addresses of the caller so the report can say who triggers a kind.
 void NoteCaller(Kind kind);
 void PrintHostStack(const char* label);
+void DumpThreads(FILE* out);
 
 // Accumulates one blocked region; does nothing at all when the trace is off.
 class Scope {

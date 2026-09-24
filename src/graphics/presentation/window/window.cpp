@@ -201,6 +201,11 @@ static void SetPause(WindowLoopState& game, bool flag) {
 
 static void GameEventQuit(WindowLoopState& game) {
 	LOGF("Event: quit\n");
+	// Closing a stuck game leaves a record of where every thread was waiting.
+	if (FILE* dump = std::fopen("_threaddump.txt", "w"); dump != nullptr) {
+		Common::WaitTrace::DumpThreads(dump);
+		std::fclose(dump);
+	}
 
 	game.need_exit = true;
 }

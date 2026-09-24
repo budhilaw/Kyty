@@ -30,6 +30,7 @@
 
 #ifdef KYTY_WIN_CS
 #include <windows.h> // IWYU pragma: keep
+#include <tlhelp32.h>
 // IWYU pragma: no_include <winbase.h>
 constexpr DWORD    KYTY_CS_SPIN_COUNT          = 4000;
 constexpr uint64_t KYTY_SLEEP_SPIN_LIMIT_100NS = 500; // 50 us
@@ -504,6 +505,57 @@ uint32_t HottestOsThread(Kind kind) {
 
 // A thread that is blocked all second is idle and uninteresting. What matters is the thread that
 // is awake, so rows are ordered by how much of the second each one spent NOT waiting.
+void DumpThreads(FILE* out) {
+#ifdef _WIN32
+	// Game code is mapped at a fixed base, so its return addresses stand out on each stack.
+	constexpr uint64_t GameBegin = 0x900000000ull;
+	constexpr uint64_t GameEnd   = 0x904000000ull;
+	const auto         self      = GetCurrentThreadId();
+	HANDLE             snapshot  = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
+	THREADENTRY32      entry {};
+	entry.dwSize = sizeof(entry);
+	for (BOOL ok = Thread32First(snapshot, &entry); ok; ok = Thread32Next(snapshot, &entry)) {
+		if (entry.th32OwnerProcessID != GetCurrentProcessId() || entry.th32ThreadID == self) {
+			continue;
+		}
+		HANDLE thread = OpenThread(THREAD_ALL_ACCESS, FALSE, entry.th32ThreadID);
+		if (thread == nullptr) {
+			continue;
+		}
+		if (SuspendThread(thread) == static_cast<DWORD>(-1)) {
+			CloseHandle(thread);
+			continue;
+		}
+		CONTEXT context {};
+		context.ContextFlags = CONTEXT_FULL;
+		if (GetThreadContext(thread, &context) != 0) {
+			std::fprintf(out, "tid %lu rip=%llx:", entry.th32ThreadID,
+			             static_cast<unsigned long long>(context.Rip));
+			const auto* stack = reinterpret_cast<const uint64_t*>(context.Rsp);
+			int         found = 0;
+			for (int slot = 0; slot < 4096 && found < 20; slot++) {
+				uint64_t value = 0;
+				if (ReadProcessMemory(GetCurrentProcess(), stack + slot, &value, sizeof(value),
+				                      nullptr) == 0) {
+					break;
+				}
+				if (value >= GameBegin && value < GameEnd) {
+					std::fprintf(out, " %llx", static_cast<unsigned long long>(value - GameBegin));
+					found++;
+				}
+			}
+			std::fprintf(out, "\n");
+		}
+		ResumeThread(thread);
+		CloseHandle(thread);
+	}
+	CloseHandle(snapshot);
+	std::fflush(out);
+#else
+	(void)out;
+#endif
+}
+
 void PrintHostStack(const char* label) {
 #ifdef _WIN32
 	void*      raw[24] {};

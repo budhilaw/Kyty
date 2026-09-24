@@ -468,6 +468,64 @@ extern std::atomic<uint64_t> g_kyty_flip_counter;
 
 // KYTY_HANG_DUMP=1: when no frame has been presented for eight seconds, print the wait
 // report and where the command-processor thread is, a few times, so a hang can be read.
+// KYTY_THREAD_DUMP=<seconds>: after that delay, print every thread's position in game code and
+// the game return addresses found on its stack, to see where a stuck game waits.
+static void StartThreadDump() {
+	const char* text = std::getenv("KYTY_THREAD_DUMP");
+	if (text == nullptr) {
+		return;
+	}
+	const auto delay = std::strtoul(text, nullptr, 10);
+	std::thread([delay] {
+		constexpr uint64_t GameBegin = 0x900000000ull;
+		constexpr uint64_t GameEnd   = 0x904000000ull;
+		for (int round = 0; round < 3; round++) {
+			std::this_thread::sleep_for(std::chrono::seconds(round == 0 ? delay : 5));
+			const auto self     = GetCurrentThreadId();
+			HANDLE     snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
+			THREADENTRY32 entry {};
+			entry.dwSize = sizeof(entry);
+			printf("THREADDUMP round %d\n", round);
+			for (BOOL ok = Thread32First(snapshot, &entry); ok; ok = Thread32Next(snapshot, &entry)) {
+				if (entry.th32OwnerProcessID != GetCurrentProcessId() || entry.th32ThreadID == self) {
+					continue;
+				}
+				HANDLE thread = OpenThread(THREAD_ALL_ACCESS, FALSE, entry.th32ThreadID);
+				if (thread == nullptr || SuspendThread(thread) == static_cast<DWORD>(-1)) {
+					if (thread != nullptr) {
+						CloseHandle(thread);
+					}
+					continue;
+				}
+				CONTEXT context {};
+				context.ContextFlags = CONTEXT_FULL;
+				if (GetThreadContext(thread, &context) != 0) {
+					printf("  tid %lu rip=%llx:", entry.th32ThreadID,
+					       static_cast<unsigned long long>(context.Rip));
+					const auto* stack = reinterpret_cast<const uint64_t*>(context.Rsp);
+					int         found = 0;
+					for (int slot = 0; slot < 4096 && found < 16; slot++) {
+						uint64_t value = 0;
+						if (ReadProcessMemory(GetCurrentProcess(), stack + slot, &value, sizeof(value),
+						                      nullptr) == 0) {
+							break;
+						}
+						if (value >= GameBegin && value < GameEnd) {
+							printf(" %llx", static_cast<unsigned long long>(value - GameBegin));
+							found++;
+						}
+					}
+					printf("\n");
+				}
+				ResumeThread(thread);
+				CloseHandle(thread);
+			}
+			CloseHandle(snapshot);
+			fflush(stdout);
+		}
+	}).detach();
+}
+
 static void StartHangWatch() {
 	if (std::getenv("KYTY_HANG_DUMP") == nullptr) {
 		return;
@@ -847,6 +905,7 @@ static int Main(int argc, char* argv[]) {
 	StartHardwareWatch();
 	StartSampler();
 	StartHangWatch();
+	StartThreadDump();
 #endif
 
 	RunOptions options;
