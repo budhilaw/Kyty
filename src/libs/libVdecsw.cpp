@@ -13,6 +13,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <condition_variable>
+#include <cstdio>
 #include <cstring>
 #include <deque>
 #include <memory>
@@ -173,6 +174,8 @@ struct DecoderState {
 	VdecswFrameBuffer             frame_buffer {};
 	bool                          has_frame_buffer = false;
 	bool                          finalizing       = false;
+	bool                          finalize_called  = false;
+	bool                          eos_signaled     = false;
 	bool                          busy             = false;
 	bool                          stop             = false;
 	uint64_t                      frames_in        = 0;
@@ -536,6 +539,27 @@ static int32_t KYTY_SYSV_ABI TrySyncDecodeInput(VdecswDecoder decoder, VdecswInp
 	return code;
 }
 
+// Experiment: the game's movie object keeps our handle at +0x160 and waits for a 64-bit
+// end-of-stream flag at +0x150 that nothing in the game sets; set it once all output is out.
+static void SignalEndOfStream(VdecswDecoder decoder, const VdecswOutputInfo* output) {
+	const auto handle = reinterpret_cast<uint64_t>(decoder);
+	const auto from   = reinterpret_cast<uint64_t>(output);
+	for (uint64_t offset = 0; offset < 0x2000; offset += 8) {
+		const auto value = *reinterpret_cast<const volatile uint64_t*>(from - offset);
+		if (value != handle) {
+			continue;
+		}
+		const auto flag = from - offset - 0x160 + 0x150;
+		*reinterpret_cast<volatile uint64_t*>(flag) = 1;
+		const bool ok = true;
+		LOGF("Vdecsw end of stream: set flag at 0x%" PRIx64 " ok=%d\n", flag, ok ? 1 : 0);
+		std::printf("Vdecsw end of stream: set flag at 0x%llx ok=%d\n",
+		            static_cast<unsigned long long>(flag), ok ? 1 : 0);
+		return;
+	}
+	std::printf("Vdecsw end of stream: decoder object not found\n");
+}
+
 static int32_t KYTY_SYSV_ABI TrySyncDecodeOutput(VdecswDecoder decoder, VdecswOutputInfo* output) {
 	PRINT_NAME();
 
@@ -585,6 +609,12 @@ static int32_t KYTY_SYSV_ABI TrySyncDecodeOutput(VdecswDecoder decoder, VdecswOu
 		state->requests.push_back({RequestKind::Flush, {}});
 		state->wake.notify_all();
 	}
+	if (state->finalize_called && !state->finalizing && !state->eos_signaled &&
+	    state->requests.empty() && !state->busy && state->ready.empty() &&
+	    state->frames_out >= state->frames_in) {
+		state->eos_signaled = true;
+		SignalEndOfStream(decoder, output);
+	}
 	static std::atomic<uint32_t> end_log {0};
 	if (state->frames_out + 4 >= state->frames_in && state->frames_in > 100 &&
 	    end_log.fetch_add(1) < 40) {
@@ -603,7 +633,8 @@ static int32_t KYTY_SYSV_ABI FinalizeDecodeSequence(VdecswDecoder decoder) {
 	}
 	{
 		std::scoped_lock lock(state->mutex);
-		state->finalizing = true;
+		state->finalizing      = true;
+		state->finalize_called = true;
 		LOGF("Vdecsw FinalizeDecodeSequence: in=%" PRIu64 " out=%" PRIu64 " pending=%zu ready=%zu\n",
 		     state->frames_in, state->frames_out, state->requests.size(), state->ready.size());
 		if (state->requests.empty() && !state->busy) {

@@ -2,6 +2,8 @@
 
 #include "common/assert.h"
 
+#include <utility>
+#include <cstdlib>
 #include <algorithm>
 #include <fmt/format.h>
 #include <iterator>
@@ -719,7 +721,7 @@ void PruneUnreachableBlocks(Graph& graph) {
 	RebuildPredecessors(graph);
 }
 
-void ComputeDominators(Graph& graph) {
+void ComputeDominatorsLegacy(Graph& graph) {
 	const auto count = static_cast<uint32_t>(graph.blocks.size());
 	const auto all   = AllBlockIds(count);
 
@@ -753,7 +755,7 @@ void ComputeDominators(Graph& graph) {
 	}
 }
 
-void ComputePostDominators(Graph& graph) {
+void ComputePostDominatorsLegacy(Graph& graph) {
 	const auto count = static_cast<uint32_t>(graph.blocks.size());
 	const auto all   = AllBlockIds(count);
 
@@ -780,6 +782,157 @@ void ComputePostDominators(Graph& graph) {
 				block.post_dominators = std::move(next);
 				changed               = true;
 			}
+		}
+	}
+}
+
+// Cooper-Harvey-Kennedy immediate dominators: the same result as the set-based fixpoint,
+// in near-linear time. Returns UINT32_MAX for nodes not reachable from the root.
+std::vector<uint32_t> ImmediateDominators(uint32_t count, uint32_t root,
+                                          const std::vector<std::vector<uint32_t>>& successors,
+                                          const std::vector<std::vector<uint32_t>>& predecessors) {
+	std::vector<uint32_t> postorder;
+	std::vector<uint32_t> postorder_index(count, UINT32_MAX);
+	std::vector<uint8_t>  visited(count, 0);
+	postorder.reserve(count);
+	std::vector<std::pair<uint32_t, uint32_t>> stack;
+	stack.emplace_back(root, 0u);
+	visited[root] = 1;
+	while (!stack.empty()) {
+		const auto node = stack.back().first;
+		const auto next = stack.back().second;
+		if (next < successors[node].size()) {
+			stack.back().second++;
+			const auto succ = successors[node][next];
+			if (succ < count && visited[succ] == 0) {
+				visited[succ] = 1;
+				stack.emplace_back(succ, 0u);
+			}
+			continue;
+		}
+		postorder_index[node] = static_cast<uint32_t>(postorder.size());
+		postorder.push_back(node);
+		stack.pop_back();
+	}
+	std::vector<uint32_t> idom(count, UINT32_MAX);
+	idom[root]   = root;
+	bool changed = true;
+	while (changed) {
+		changed = false;
+		for (auto it = postorder.rbegin(); it != postorder.rend(); ++it) {
+			const auto node = *it;
+			if (node == root) {
+				continue;
+			}
+			uint32_t candidate = UINT32_MAX;
+			for (const auto pred: predecessors[node]) {
+				if (pred >= count || idom[pred] == UINT32_MAX) {
+					continue;
+				}
+				if (candidate == UINT32_MAX) {
+					candidate = pred;
+					continue;
+				}
+				auto a = pred;
+				auto b = candidate;
+				while (a != b) {
+					while (postorder_index[a] < postorder_index[b]) {
+						a = idom[a];
+					}
+					while (postorder_index[b] < postorder_index[a]) {
+						b = idom[b];
+					}
+				}
+				candidate = a;
+			}
+			if (candidate != UINT32_MAX && idom[node] != candidate) {
+				idom[node] = candidate;
+				changed    = true;
+			}
+		}
+	}
+	return idom;
+}
+
+// Expands an immediate-dominator tree into each node's sorted dominator set.
+std::vector<uint32_t> DominatorChain(const std::vector<uint32_t>& idom, uint32_t node,
+                                     uint32_t root, uint32_t skip) {
+	std::vector<uint32_t> chain;
+	for (auto current = node;; current = idom[current]) {
+		if (current != skip) {
+			chain.push_back(current);
+		}
+		if (current == root) {
+			break;
+		}
+	}
+	std::sort(chain.begin(), chain.end());
+	return chain;
+}
+
+void ComputeDominators(Graph& graph) {
+	const auto count = static_cast<uint32_t>(graph.blocks.size());
+	if (count == 0 || graph.entry_block >= count) {
+		ComputeDominatorsLegacy(graph);
+		return;
+	}
+	std::vector<std::vector<uint32_t>> successors(count);
+	std::vector<std::vector<uint32_t>> predecessors(count);
+	for (const auto& block: graph.blocks) {
+		successors[block.id]   = block.successors;
+		predecessors[block.id] = block.predecessors;
+	}
+	const auto idom = ImmediateDominators(count, graph.entry_block, successors, predecessors);
+	const auto all  = AllBlockIds(count);
+	for (auto& block: graph.blocks) {
+		if (idom[block.id] != UINT32_MAX) {
+			block.dominators = DominatorChain(idom, block.id, graph.entry_block, UINT32_MAX);
+		} else {
+			block.dominators = block.predecessors.empty() ? std::vector<uint32_t> {block.id} : all;
+		}
+	}
+}
+
+void ComputePostDominators(Graph& graph) {
+	const auto count = static_cast<uint32_t>(graph.blocks.size());
+	if (count == 0) {
+		return;
+	}
+	// Post-dominators are dominators of the reversed graph rooted at a virtual exit node.
+	const auto                         exit = count;
+	std::vector<std::vector<uint32_t>> successors(count + 1u);
+	std::vector<std::vector<uint32_t>> predecessors(count + 1u);
+	for (const auto& block: graph.blocks) {
+		successors[block.id]   = block.predecessors;
+		predecessors[block.id] = block.successors;
+		if (block.successors.empty()) {
+			successors[exit].push_back(block.id);
+			predecessors[block.id].push_back(exit);
+		}
+	}
+	const auto idom = ImmediateDominators(count + 1u, exit, successors, predecessors);
+	const auto all  = AllBlockIds(count);
+	for (auto& block: graph.blocks) {
+		if (idom[block.id] != UINT32_MAX) {
+			block.post_dominators = DominatorChain(idom, block.id, exit, exit);
+		} else {
+			block.post_dominators = all;
+		}
+	}
+}
+
+void CheckDominatorsAgainstLegacy(Graph& graph) {
+	static const bool enabled = std::getenv("KYTY_CFG_CHECK") != nullptr;
+	if (!enabled) {
+		return;
+	}
+	Graph legacy = graph;
+	ComputeDominatorsLegacy(legacy);
+	ComputePostDominatorsLegacy(legacy);
+	for (uint32_t i = 0; i < graph.blocks.size(); i++) {
+		if (legacy.blocks[i].dominators != graph.blocks[i].dominators ||
+		    legacy.blocks[i].post_dominators != graph.blocks[i].post_dominators) {
+			EXIT("CFG dominator mismatch at block %u\n", i);
 		}
 	}
 }
@@ -966,6 +1119,7 @@ void ComputeComponents(Graph& graph) {
 void RecomputeAnalyses(Graph& graph) {
 	ComputeDominators(graph);
 	ComputePostDominators(graph);
+	CheckDominatorsAgainstLegacy(graph);
 	ComputeBackEdges(graph);
 	ComputeNaturalLoops(graph);
 	ComputeComponents(graph);

@@ -796,9 +796,21 @@ private:
 		}
 		auto& memory = m_program.memory_info[flags.index];
 		if (memory.formatted || memory.typed) {
+			std::string words;
+			for (uint32_t i = 0; i < 4u; i++) {
+				const auto value = handle->Arg(i).Resolve();
+				if (value.IsImmediate()) {
+					words += fmt::format(" d{}=imm:0x{:x}", i, value.U32());
+				} else if (const auto* def = value.TryInstruction(); def != nullptr) {
+					words += fmt::format(" d{}={}", i, ValueOpcodeName(def->GetOpcode()));
+				} else {
+					words += fmt::format(" d{}=?", i);
+				}
+			}
 			Fail(flags.pc, fmt::format("{} dword {} is not a valid runtime value on a formatted "
-			                           "access",
-			                           ValueOpcodeName(op), bad_dword));
+			                           "access (formatted={} typed={}):{}",
+			                           ValueOpcodeName(op), bad_dword, memory.formatted,
+			                           memory.typed, words));
 		}
 		auto* block = inst.Parent();
 		auto  it    = std::find_if(block->begin(), block->end(),

@@ -2051,14 +2051,10 @@ KYTY_CP_OP_PARSER(CpOpIndirectCxRegs) {
 				LOGF("\t temporary: skipping unknown indirect CX extended offset = 0x%08" PRIx32
 				     ", value = 0x%08" PRIx32 "\n",
 				     cmd_offset, value);
-				const auto* live = cp.LiveGuestPacket(buffer);
 				LOGF("\t   INDIRECTCX: entry %" PRIu32 "/%" PRIu32 " table=0x%016" PRIx64
-				     " copy packet: %08" PRIx32 " %08" PRIx32 " %08" PRIx32 " %08" PRIx32
-				     " live packet: %08" PRIx32 " %08" PRIx32 " %08" PRIx32 " %08" PRIx32 "\n",
+				     " packet: %08" PRIx32 " %08" PRIx32 " %08" PRIx32 " %08" PRIx32 "\n",
 				     i, indirect_num_dw, reinterpret_cast<uint64_t>(indirect_buffer), buffer[0],
-				     buffer[1], buffer[2], buffer[3], live != nullptr ? live[0] : 0u,
-				     live != nullptr ? live[1] : 0u, live != nullptr ? live[2] : 0u,
-				     live != nullptr ? live[3] : 0u);
+				     buffer[1], buffer[2], buffer[3]);
 			}
 			continue;
 		}
@@ -2653,8 +2649,9 @@ static uint32_t CpOpWaitRegMemSized(CommandProcessor& cp, uint32_t cmd_id, const
 
 	constexpr auto address_align_mask = (sizeof(T) == sizeof(uint32_t) ? 0x3u : 0x7u);
 	auto  ctrl = buffer[0];
+	// Guest addresses are 48 bits wide; the bits above carry packet flags.
 	auto* addr = reinterpret_cast<const T*>((buffer[1] & ~address_align_mask) |
-	                                        (static_cast<uint64_t>(buffer[2] & 0x3ffffu) << 32u));
+	                                        (static_cast<uint64_t>(buffer[2] & 0xffffu) << 32u));
 	auto  ref  = CpOpWaitRegMemReadValue<T>(buffer + 3u);
 	auto  mask = CpOpWaitRegMemReadValue<T>(buffer + 3u + value_dw);
 	auto  poll = buffer[3u + value_dw * 2u];

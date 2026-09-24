@@ -292,16 +292,16 @@ bool MaterializeIndirectImage(const DescriptorSource::IndirectImage& indirect,
 	const auto residue     = static_cast<uint64_t>(indirect.selector_offset) % step;
 	const auto size        = material.GetSize();
 	const auto limit       = std::min<uint64_t>(UINT32_MAX, size + 3u);
-	const auto probe_count = residue <= limit ? (limit - residue) / step + 1u : 0u;
-	if (probe_count > MaxIndirectImageProbes) {
-		return SpecializationFail("resource materialization line 278");
-	}
+	// Very large material tables are probed up to the cap; later records map to no texture.
+	const auto probe_count = std::min<uint64_t>(
+	    residue <= limit ? (limit - residue) / step + 1u : 0u, MaxIndirectImageProbes);
 
 	std::vector<uint32_t>        keys {0u};
 	std::unordered_set<uint32_t> seen {0u};
 	keys.reserve(static_cast<size_t>(probe_count) + 1u);
 	seen.reserve(static_cast<size_t>(probe_count) + 1u);
-	for (uint64_t offset = residue; offset <= limit && probe_count != 0u; offset += step) {
+	uint64_t probed = 0;
+	for (uint64_t offset = residue; offset <= limit && probed < probe_count; offset += step, probed++) {
 		uint32_t key = 0;
 		if (!ReadScalarBufferWord(material, static_cast<uint32_t>(offset), 0u, runtime, key)) {
 			return SpecializationFail("resource materialization line 288");
@@ -343,7 +343,16 @@ bool MaterializeIndirectImage(const DescriptorSource::IndirectImage& indirect,
 		const auto found = std::ranges::find(next.descriptors, candidate);
 		if (found == next.descriptors.end()) {
 			if (next.descriptors.size() >= ShaderInfo::MaxImages) {
-				return SpecializationFail("resource materialization line 327");
+				// More distinct textures than a shader can bind: the overflow keys bind nothing.
+				candidate.dwords.fill(0);
+				const auto null_found = std::ranges::find(next.descriptors, candidate);
+				if (null_found != next.descriptors.end()) {
+					next.candidates.push_back(
+					    static_cast<uint32_t>(null_found - next.descriptors.begin()));
+					continue;
+				}
+				next.candidates.push_back(0u);
+				continue;
 			}
 			next.descriptors.push_back(candidate);
 			next.candidates.push_back(static_cast<uint32_t>(next.descriptors.size() - 1u));

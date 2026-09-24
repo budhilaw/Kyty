@@ -95,6 +95,21 @@ static LONG WINAPI ExceptionFilter(PEXCEPTION_POINTERS exception) noexcept {
 		return EXCEPTION_CONTINUE_EXECUTION;
 	}
 
+	if (exception_record->ExceptionCode == EXCEPTION_STACK_OVERFLOW) {
+		// Almost no stack is left here, so format the address by hand and write it directly.
+		static char message[] = "STACK OVERFLOW at pc=0x0000000000000000 rsp=0x0000000000000000\n";
+		const auto  put_hex   = [](char* out, uint64_t value) {
+            for (int i = 15; i >= 0; i--, value >>= 4u) {
+                out[i] = "0123456789abcdef"[value & 0xfu];
+            }
+		};
+		put_hex(message + 23, reinterpret_cast<uint64_t>(exception_record->ExceptionAddress));
+		put_hex(message + 46, exception->ContextRecord->Rsp);
+		DWORD written = 0;
+		WriteFile(GetStdHandle(STD_OUTPUT_HANDLE), message, sizeof(message) - 1, &written, nullptr);
+		return EXCEPTION_CONTINUE_SEARCH;
+	}
+
 	ExceptionInfo info {};
 	info.exception_address = reinterpret_cast<uint64_t>(exception_record->ExceptionAddress);
 	info.native_code       = exception_record->ExceptionCode;

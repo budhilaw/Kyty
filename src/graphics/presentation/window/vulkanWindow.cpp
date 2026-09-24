@@ -697,6 +697,12 @@ static vk::Device VulkanCreateDevice(GraphicContext& graphics,
 		provoking_vertex.transformFeedbackPreservesProvokingVertex = VK_FALSE;
 		create_info.pNext = &provoking_vertex;
 	}
+	vk::PhysicalDeviceFaultFeaturesEXT fault_features {};
+	if (graphics.device_fault_enabled) {
+		fault_features.deviceFault = VK_TRUE;
+		fault_features.pNext       = const_cast<void*>(create_info.pNext);
+		create_info.pNext          = &fault_features;
+	}
 	vk::PhysicalDevicePipelineExecutablePropertiesFeaturesKHR executable_properties {};
 	if (graphics.pipeline_stats_enabled) {
 		executable_properties.pipelineExecutableInfo = VK_TRUE;
@@ -1093,6 +1099,10 @@ void WindowContext::CreateVulkan() {
 			if (HasExtension(available_extensions, extension)) {
 				device_extensions.push_back(extension);
 			}
+		}
+		if (HasExtension(available_extensions, VK_EXT_DEVICE_FAULT_EXTENSION_NAME)) {
+			device_extensions.push_back(VK_EXT_DEVICE_FAULT_EXTENSION_NAME);
+			graphic_ctx.device_fault_enabled = true;
 		}
 		if (std::getenv("KYTY_PIPELINE_STATS") != nullptr &&
 		    HasExtension(available_extensions,

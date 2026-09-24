@@ -46,6 +46,7 @@ struct GraphicContext {
 	vk::Queue                          readback_queue = nullptr;
 	// KYTY_PIPELINE_STATS=1: driver statistics (registers, spills) are printed per pipeline.
 	bool                               pipeline_stats_enabled = false;
+	bool                               device_fault_enabled   = false;
 
 	[[nodiscard]] const vk::PhysicalDeviceProperties& GetPhysicalDeviceProperties() const {
 		return physical_device_properties;
