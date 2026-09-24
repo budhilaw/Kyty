@@ -206,7 +206,7 @@ bool MaterializeIndirectImage(const DescriptorSource::IndirectImage& indirect,
 	ShaderBufferResource heap;
 	if (!DecodeBufferDescriptor(material_value, material) ||
 	    !DecodeBufferDescriptor(heap_value, heap)) {
-		return false;
+		return SpecializationFail("resource materialization line 209");
 	}
 	if (indirect.direct) {
 		if (indirect.selector_stride == 0u) {
@@ -263,7 +263,7 @@ bool MaterializeIndirectImage(const DescriptorSource::IndirectImage& indirect,
 		return true;
 	}
 	if (!indirect.address_heap && material.Stride() != indirect.selector_stride) {
-		return false;
+		return SpecializationFail("resource materialization line 266");
 	}
 
 	// S_BUFFER_LOAD ignores vector-buffer swizzle/add-thread fields. The shader computes the
@@ -275,7 +275,7 @@ bool MaterializeIndirectImage(const DescriptorSource::IndirectImage& indirect,
 	const auto limit       = std::min<uint64_t>(UINT32_MAX, size + 3u);
 	const auto probe_count = residue <= limit ? (limit - residue) / step + 1u : 0u;
 	if (probe_count > MaxIndirectImageProbes) {
-		return false;
+		return SpecializationFail("resource materialization line 278");
 	}
 
 	std::vector<uint32_t>        keys {0u};
@@ -285,7 +285,7 @@ bool MaterializeIndirectImage(const DescriptorSource::IndirectImage& indirect,
 	for (uint64_t offset = residue; offset <= limit && probe_count != 0u; offset += step) {
 		uint32_t key = 0;
 		if (!ReadScalarBufferWord(material, static_cast<uint32_t>(offset), 0u, runtime, key)) {
-			return false;
+			return SpecializationFail("resource materialization line 288");
 		}
 		if (seen.insert(key).second) {
 			keys.push_back(key);
@@ -309,7 +309,7 @@ bool MaterializeIndirectImage(const DescriptorSource::IndirectImage& indirect,
 			if (!ReadScalarBufferWord(heap, heap_offset, dword * sizeof(uint32_t), runtime,
 			                          candidate.dwords[dword])) {
 				if (!indirect.address_heap) {
-					return false;
+					return SpecializationFail("resource materialization line 312");
 				}
 				readable = false;
 				break;
@@ -324,7 +324,7 @@ bool MaterializeIndirectImage(const DescriptorSource::IndirectImage& indirect,
 		const auto found = std::ranges::find(next.descriptors, candidate);
 		if (found == next.descriptors.end()) {
 			if (next.descriptors.size() >= ShaderInfo::MaxImages) {
-				return false;
+				return SpecializationFail("resource materialization line 327");
 			}
 			next.descriptors.push_back(candidate);
 			next.candidates.push_back(static_cast<uint32_t>(next.descriptors.size() - 1u));
@@ -341,18 +341,18 @@ bool MaterializeIndirectImage(const DescriptorSource::IndirectImage& indirect,
 static bool MaterializeSnapshot(const ResourcePlan& program, const SrtRuntime& runtime,
                                 MaterializedSnapshot& snapshot) {
 	if (!program.resource_tracking_complete) {
-		return false;
+		return SpecializationFail("resource materialization line 344");
 	}
 
 	if (program.requires_specialization_memory && runtime.read_specialization_memory == nullptr) {
-		return false;
+		return SpecializationFail("resource materialization line 348");
 	}
 	std::vector<DescriptorValue> values;
 	std::vector<uint32_t>        flattened_srt;
 	std::vector<uint8_t>         active_sources;
 	if (!EvaluateRuntimeSources(program, program.materialization_sources, runtime, values,
 	                            flattened_srt, program.clean_flat_slots, active_sources)) {
-		return false;
+		return SpecializationFail("resource materialization line 355");
 	}
 
 	auto&                   next  = snapshot.resources;
@@ -386,14 +386,14 @@ static bool MaterializeSnapshot(const ResourcePlan& program, const SrtRuntime& r
 			clean_runtime.read_memory      = runtime.read_specialization_memory;
 			std::vector<DescriptorValue> tables;
 			if (!EvaluateDescriptorSources(program, requests, clean_runtime, tables)) {
-				return false;
+				return SpecializationFail("resource materialization line 389");
 			}
 			const auto&   material = tables[0];
 			const auto&   heap     = tables[1];
 			IndirectImage table;
 			if (!MaterializeIndirectImage(*source->indirect_image, material, heap, image.r128,
 			                              runtime, table)) {
-				return false;
+				return SpecializationFail("resource materialization line 396");
 			}
 			next.images[image_index] = table.descriptors[table.candidates[0]];
 			if (table.descriptors.size() > 1u) {

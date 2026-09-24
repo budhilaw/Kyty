@@ -845,6 +845,17 @@ static bool KytyExceptionHandler(const Common::HostException::ExceptionInfo& exc
 			}
 			std::printf("\n");
 		}
+		// The 4 KiB before the fault go to a file for disassembly; name records the base.
+		if (IsReadableRange(info->exception_address - 4096, 4096 + 64)) {
+			char name[64];
+			std::snprintf(name, sizeof(name), "_guestcode_%016" PRIx64 ".bin",
+			              static_cast<uint64_t>(info->exception_address - 4096));
+			if (auto* file = std::fopen(name, "wb"); file != nullptr) {
+				std::fwrite(reinterpret_cast<const void*>(info->exception_address - 4096), 1,
+				            4096 + 64, file);
+				std::fclose(file);
+			}
+		}
 		if (IsReadableRange(info->rsp, 32 * sizeof(uint64_t))) {
 			const auto* stack = reinterpret_cast<const uint64_t*>(info->rsp);
 			std::printf("stack:");

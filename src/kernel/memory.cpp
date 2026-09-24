@@ -879,6 +879,19 @@ bool TryReadGpuCleanBacking(uint64_t vaddr, void* data, uint64_t size) {
 	return TryReadBacking(vaddr, data, size);
 }
 
+bool ReadGpuBackingOrDownload(uint64_t vaddr, void* data, uint64_t size) {
+	if (TryReadGpuCleanBacking(vaddr, data, size)) {
+		return true;
+	}
+	// GPU-produced tables must be brought back before the host can evaluate them.
+	if (g_gpu_resources == nullptr || !Graphics::GuestGpu::IsGpuThread() ||
+	    !IsGpuAddressRange(vaddr, size)) {
+		return false;
+	}
+	GetGpuResources().GetBufferCache().ReadMemory(vaddr, size);
+	return TryReadBacking(vaddr, data, size);
+}
+
 uint64_t ClampRangeSize(uint64_t vaddr, uint64_t size) {
 	EXIT_IF(g_virtual_ranges == nullptr);
 
