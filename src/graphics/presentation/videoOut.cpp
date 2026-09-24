@@ -23,6 +23,7 @@
 #include "loader/systemContent.h"
 
 #include <algorithm>
+#include <cstdlib>
 #include <array>
 #include <list>
 #include <thread>
@@ -1674,9 +1675,13 @@ KYTY_SYSV_ABI int VideoOutGetOutputStatus(int handle, VideoOutOutputStatus* stat
 	int32_t attribute3 = 0;
 	Loader::SystemContentParamSfoGetInt("ATTRIBUTE3", &attribute3);
 	ctx->mutex.Lock();
-	// Primary output reports 4K unless param.json Video-out Info enables resolution detection.
+	// Report the size the game opened the output with. Upstream reports 4K unless
+	// param.json enables detection, which makes PPSA05684 render at 4K and overrun the
+	// host GPU timeout; KYTY_REPORT_4K_OUTPUT=1 restores that behavior.
+	static const bool force_4k = std::getenv("KYTY_REPORT_4K_OUTPUT") != nullptr;
+	(void)attribute3;
 	status->resolution =
-	    ((attribute3 & 4) != 0 && ctx->width < 3840 && ctx->height < 2160 ? 1u : 2u);
+	    (!force_4k && ctx->width < 3840 && ctx->height < 2160 ? 1u : 2u);
 	status->dynamicRange = 1;
 	status->refreshRate =
 	    (ctx->output_mode == VIDEO_OUT_OUTPUT_MODE_119_88HZ || Config::GetVblankFrequency() >= 119

@@ -154,6 +154,15 @@ void BufferCache::DeleteBuffer(BufferId id) {
 	if (IsBufferInvalid(id)) {
 		return;
 	}
+	{
+		// Snapshots belong to the buffer's GPU copy; a later buffer starts from a fresh upload.
+		std::lock_guard lock(m_snapshot_mutex);
+		const auto&     buffer = m_slot_buffers[id];
+		for (auto page = buffer.CpuAddress(); page < buffer.CpuAddress() + buffer.Size();
+		     page += TRACKER_PAGE_SIZE) {
+			m_write_snapshots.erase(page);
+		}
+	}
 	Unregister(id);
 	if (m_scheduler.Active()) {
 		m_scheduler.DeferOperation([this, id] { m_slot_buffers.erase(id); });
@@ -173,6 +182,17 @@ void BufferCache::DeleteBuffer(BufferId id) {
 }
 
 bool BufferCache::DownloadBufferMemory(Buffer& buffer, uint64_t vaddr, uint64_t size) {
+	{
+		// A GPU-modified range can span several buffers; only this buffer's part is copied
+		// from it, or the copy would read past its end.
+		const auto begin = std::max(vaddr, buffer.CpuAddress());
+		const auto end   = std::min(vaddr + size, buffer.CpuAddress() + buffer.Size());
+		if (begin >= end) {
+			return false;
+		}
+		vaddr = begin;
+		size  = end - begin;
+	}
 	std::vector<vk::BufferCopy> copies;
 	uint64_t                    total_size     = 0;
 	const auto                  buffer_address = buffer.CpuAddress();
@@ -473,6 +493,12 @@ void BufferCache::InvalidateMemory(uint64_t vaddr, uint64_t size) {
 		EXIT("BufferCache: invalid memory-invalidation range\n");
 	}
 	TraceArgs("invalidate", vaddr, size, "");
+	// First CPU write to a page the GPU holds a copy of: remember its contents so the next
+	// upload sends only what the CPU changed and GPU writes elsewhere in the page survive.
+	if (!m_memory_tracker.IsRegionGpuModified(vaddr, size) &&
+	    !m_memory_tracker.IsRegionCpuModified(vaddr, size) && IsRegionRegistered(vaddr, size)) {
+		SnapshotPagesForWrite(vaddr, size);
+	}
 	m_memory_tracker.InvalidateRegion(vaddr, size,
 	                                  [this, vaddr, size] { ReadMemory(vaddr, size, true); });
 }
@@ -545,8 +571,13 @@ void BufferCache::ReadMemory(uint64_t vaddr, uint64_t size, bool is_write) {
 			if (owner == nullptr || !*owner || &m_slot_buffers[*owner] == &buffer) {
 				return;
 			}
-			extras.push_back({*owner, start, range_size});
-			budget -= range_size;
+			// Adjacent buffers can merge into one range; only the owner's part is downloaded
+			// here (and only that part is released from GPU ownership afterwards).
+			const auto& owner_buffer = m_slot_buffers[*owner];
+			const auto  owned =
+			    std::min(range_size, owner_buffer.CpuAddress() + owner_buffer.Size() - start);
+			extras.push_back({*owner, start, owned});
+			budget -= owned;
 		});
 
 		bool downloaded = DownloadBufferMemory(buffer, window_begin, window_end - window_begin);
@@ -740,11 +771,15 @@ BufferId BufferCache::CreateBuffer(uint64_t vaddr, uint64_t size) {
 
 void BufferCache::SnapshotPagesForWrite(uint64_t vaddr, uint64_t size) {
 	constexpr uint64_t Page = TRACKER_PAGE_SIZE;
+	std::lock_guard    lock(m_snapshot_mutex);
 	if (m_write_snapshots.size() > 4096) {
 		m_write_snapshots.clear();
 	}
 	for (auto page = vaddr & ~(Page - 1u); page < vaddr + size; page += Page) {
-		if (m_write_snapshots.contains(page) || !IsRegionRegistered(page, Page)) {
+		// The page was just downloaded, so its current contents are the GPU copy; an older
+		// snapshot would hide CPU changes made since then.
+		m_write_snapshots.erase(page);
+		if (!IsRegionRegistered(page, Page)) {
 			continue;
 		}
 		std::vector<uint8_t> data(Page);
@@ -758,6 +793,7 @@ void BufferCache::AppendUploadCopies(Buffer& buffer, uint64_t address, uint64_t 
                                      std::vector<vk::BufferCopy>& copies,
                                      uint64_t& total_size) noexcept {
 	constexpr uint64_t Page = TRACKER_PAGE_SIZE;
+	std::lock_guard    lock(m_snapshot_mutex);
 	const auto         push = [&](uint64_t begin, uint64_t length) {
 		if (length != 0) {
 			copies.emplace_back(total_size, buffer.Offset(begin), length);

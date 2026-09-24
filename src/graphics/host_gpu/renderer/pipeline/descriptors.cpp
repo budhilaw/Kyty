@@ -32,6 +32,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <cstdlib>
 #include <bit>
 #include <fmt/format.h>
 #include <limits>
@@ -403,25 +404,38 @@ static TextureCache::ImageDesc NullTextureDesc(const ShaderRecompiler::IR::Image
 	using Dim = ShaderRecompiler::Decoder::ImageDimension;
 	if (!resource.cube) {
 		switch (resource.dimension) {
-			case Dim::Dim3D:
-				desc.info.type      = Prospero::ImageType::kColor3D;
-				desc.view_info.type = vk::ImageViewType::e3D;
-				break;
 			case Dim::Dim2DArray:
 				desc.view_info.type = vk::ImageViewType::e2DArray;
-				break;
-			case Dim::Dim1D:
-				desc.info.type      = Prospero::ImageType::kColor1D;
-				desc.view_info.type = vk::ImageViewType::e1D;
-				break;
-			case Dim::Dim1DArray:
-				desc.info.type      = Prospero::ImageType::kColor1D;
-				desc.view_info.type = vk::ImageViewType::e1DArray;
 				break;
 			default: break;
 		}
 	}
 	return desc;
+}
+
+// Binds a null texture shaped for the slot: a depth placeholder for comparison slots, since a
+// colour view there is invalid, otherwise a 1x1 colour image.
+static TextureBinding NullTextureBinding(const ShaderRecompiler::IR::ImageResource& resource,
+                                         bool storage, TextureCache& texture_cache) {
+	auto desc = NullTextureDesc(resource, storage ? TextureCache::BindingType::Storage
+	                                              : TextureCache::BindingType::Texture);
+	if (resource.depth_compare && !storage) {
+		const auto  id    = texture_cache.GetComparePlaceholder(desc.view_info.type,
+		                                                        desc.view_info.layer_count, 1.0f);
+		const auto& image = texture_cache.GetImage(id);
+		desc.info                  = image.info;
+		desc.view_info.format      = vk::Format::eD32Sfloat;
+		desc.view_info.aspect      = vk::ImageAspectFlagBits::eDepth;
+		desc.view_info.base_level  = 0;
+		desc.view_info.level_count = 1;
+		desc.view_info.base_layer  = 0;
+		desc.view_info.min_lod     = 0;
+		desc.view_info.mapping     = {};
+		desc.type                  = TextureCache::BindingType::Texture;
+		return {id, nullptr, std::move(desc)};
+	}
+	const auto id = texture_cache.FindImage(desc);
+	return {id, nullptr, std::move(desc)};
 }
 
 static void PopulateTextureMipLayout(ImageInfo& info) {
@@ -569,10 +583,7 @@ TextureBinding RenderExecutor::ResolveTexture(const ShaderRecompiler::IR::ImageR
 
 	auto& texture_cache = m_context.GetTextureCache();
 	if (descriptor.IsNull()) {
-		auto       desc = NullTextureDesc(resource, storage ? TextureCache::BindingType::Storage
-		                                                    : TextureCache::BindingType::Texture);
-		const auto id   = texture_cache.FindImage(desc);
-		return {id, nullptr, std::move(desc)};
+		return NullTextureBinding(resource, storage, texture_cache);
 	}
 
 	const auto address         = descriptor.Base40();
@@ -613,10 +624,7 @@ TextureBinding RenderExecutor::ResolveTexture(const ShaderRecompiler::IR::ImageR
 		     resource.read, resource.written, descriptor.fields[0], descriptor.fields[1],
 		     descriptor.fields[2], descriptor.fields[3], descriptor.fields[4], descriptor.fields[5],
 		     descriptor.fields[6], descriptor.fields[7]);
-		auto       desc = NullTextureDesc(resource, storage ? TextureCache::BindingType::Storage
-		                                                    : TextureCache::BindingType::Texture);
-		const auto id   = texture_cache.FindImage(desc);
-		return {id, nullptr, std::move(desc)};
+		return NullTextureBinding(resource, storage, texture_cache);
 	}
 	const auto samples = multisampled ? 1u << last_level : 1u;
 	auto depth = static_cast<uint32_t>(descriptor.Depth()) + 1u;
@@ -653,10 +661,7 @@ TextureBinding RenderExecutor::ResolveTexture(const ShaderRecompiler::IR::ImageR
 		if (log_count.fetch_add(1) < 16) {
 			LOGF("TEXDESC: %u layers/depth exceeds device limits; bound as null\n", depth);
 		}
-		auto       desc = NullTextureDesc(resource, storage ? TextureCache::BindingType::Storage
-		                                                    : TextureCache::BindingType::Texture);
-		const auto id   = texture_cache.FindImage(desc);
-		return {id, nullptr, std::move(desc)};
+		return NullTextureBinding(resource, storage, texture_cache);
 	}
 	if (levels > physical_levels) {
 		const TileSurfaceDescription physical {
@@ -698,10 +703,7 @@ TextureBinding RenderExecutor::ResolveTexture(const ShaderRecompiler::IR::ImageR
 				     descriptor.fields[2], descriptor.fields[3], descriptor.fields[4],
 				     descriptor.fields[5], descriptor.fields[6], descriptor.fields[7]);
 			}
-			auto       desc = NullTextureDesc(resource, storage ? TextureCache::BindingType::Storage
-			                                                    : TextureCache::BindingType::Texture);
-			const auto id   = texture_cache.FindImage(desc);
-			return {id, nullptr, std::move(desc)};
+			return NullTextureBinding(resource, storage, texture_cache);
 		}
 	}
 	EXIT_NOT_IMPLEMENTED(size.size == 0 || size.align == 0 ||
@@ -1049,6 +1051,12 @@ void RenderExecutor::RebindImages(PreparedBindings& prepared) {
 }
 
 void RenderExecutor::MapUserDataPointers(const PreparedBindings& bindings) {
+	// Opt-in (KYTY_MAP_USER_POINTERS=1): buffers over whole pointer windows can shadow game
+	// objects that the CPU keeps writing.
+	static const bool enabled = std::getenv("KYTY_MAP_USER_POINTERS") != nullptr;
+	if (!enabled) {
+		return;
+	}
 	constexpr uint64_t Window = 256u * 1024u;
 	const auto&        user_data = bindings.runtime->resources->user_data;
 	auto&              cache     = m_context.GetBufferCache();

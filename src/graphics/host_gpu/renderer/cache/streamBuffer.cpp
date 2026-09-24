@@ -1,4 +1,9 @@
 #include "graphics/host_gpu/renderer/cache/streamBuffer.h"
+#include "common/logging/log.h"
+#include "common/threads.h"
+#include <atomic>
+#include <unordered_map>
+#include <mutex>
 
 #include "common/alignment.h"
 #include "common/assert.h"
@@ -11,6 +16,13 @@
 #include <vk_mem_alloc.h>
 
 namespace Libs::Graphics {
+
+namespace {
+// Live buffer handles and their sizes, to catch copies through a stale handle.
+std::mutex                                g_live_buffers_mutex;
+std::unordered_map<VkBuffer, uint64_t>    g_live_buffers;
+} // namespace
+
 
 namespace {
 
@@ -88,6 +100,10 @@ Buffer::Buffer(GraphicContext& graphics, CommandScheduler& scheduler, MemoryUsag
 	EXIT_NOT_IMPLEMENTED(result != vk::Result::eSuccess);
 
 	m_buffer = native_buffer;
+	{
+		std::lock_guard lock(g_live_buffers_mutex);
+		g_live_buffers[native_buffer] = size;
+	}
 	if (with_bda) {
 		vk::BufferDeviceAddressInfo address_info {};
 		address_info.buffer = m_buffer;
@@ -104,7 +120,27 @@ Buffer::Buffer(GraphicContext& graphics, CommandScheduler& scheduler, MemoryUsag
 	}
 }
 
+static void CheckLiveBuffer(const Buffer& buffer, const char* role, uint64_t needed) {
+	std::lock_guard lock(g_live_buffers_mutex);
+	const auto      found = g_live_buffers.find(static_cast<VkBuffer>(buffer.Handle()));
+	if (found == g_live_buffers.end() || found->second != buffer.Size() || needed > found->second) {
+		static std::atomic<uint32_t> log_count {0};
+		if (log_count.fetch_add(1) < 32) {
+			LOGF("STALE BUFFER: %s handle=0x%016" PRIx64 " object_size=0x%" PRIx64
+			     " live_size=0x%" PRIx64 " needed=0x%" PRIx64 " cpu=0x%016" PRIx64 "\n",
+			     role, reinterpret_cast<uint64_t>(static_cast<VkBuffer>(buffer.Handle())),
+			     buffer.Size(), found == g_live_buffers.end() ? 0 : found->second, needed,
+			     buffer.CpuAddress());
+			Common::WaitTrace::PrintHostStack("stale buffer copy");
+		}
+	}
+}
+
 Buffer::~Buffer() {
+	{
+		std::lock_guard lock(g_live_buffers_mutex);
+		g_live_buffers.erase(static_cast<VkBuffer>(m_buffer));
+	}
 	if (m_buffer != nullptr) {
 		vmaDestroyBuffer(m_graphics->allocator, m_buffer, m_allocation);
 	}
@@ -167,6 +203,8 @@ void Buffer::CopyFrom(CommandBuffer& command, const Buffer& source, uint64_t sou
 	    destination_offset < source_offset + size) {
 		EXIT("Buffer: overlapping self-copy\n");
 	}
+	CheckLiveBuffer(source, "copy source", source_offset + size);
+	CheckLiveBuffer(*this, "copy destination", destination_offset + size);
 	command.EndRendering();
 	const vk::BufferMemoryBarrier before[] = {
 	    source.Barrier(source_offset, size, source_before, vk::AccessFlagBits::eTransferRead),

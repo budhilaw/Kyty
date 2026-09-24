@@ -901,13 +901,15 @@ void CommandProcessor::DmaData(uint8_t engine, uint8_t dst_sel, uint8_t dst_cach
 		// buffer cache would make the label page GPU-owned, and every later host read of a
 		// label in that page would drain the GPU and overwrite values other fence writes
 		// placed there at parse time. Fills inside GPU buffers (counters) stay on the GPU.
-		const uint32_t words[2] {static_cast<uint32_t>(src_address_or_offset_or_immediate),
-		                         static_cast<uint32_t>(src_address_or_offset_or_immediate >> 32u)};
-		WriteData(reinterpret_cast<uint32_t*>(dst_address_or_offset), words, num_bytes / 4u, 0);
-		const auto pending = NotePendingGuestGpuWrite(
-		    dst_address_or_offset, src_address_or_offset_or_immediate & 0xffffffffu, num_bytes);
-		m_renderer.GetCommandScheduler().DeferPriorityOperation(
-		    [pending] { ResolvePendingGuestGpuWrite(pending); });
+		// The value lands at end of pipe, after the work recorded before it: the guest reads
+		// these fences to learn the GPU is done with memory, so an early write lets it reuse
+		// buffers the GPU has not consumed yet.
+		const auto value = static_cast<uint32_t>(src_address_or_offset_or_immediate);
+		for (uint32_t word = 0; word < num_bytes / 4u; word++) {
+			Sync::WriteAtEndOfPipe32(m_submit_id, CurrentBuffer(),
+			                         reinterpret_cast<uint32_t*>(dst_address_or_offset) + word,
+			                         value);
+		}
 		return;
 	}
 	if (src_sel == 2) {

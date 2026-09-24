@@ -31,6 +31,8 @@ struct TextureCacheTestAccess;
 
 class TextureCache {
 public:
+	[[nodiscard]] ImageId GetComparePlaceholder(vk::ImageViewType view_type, uint32_t layers,
+	                                            float value);
 	enum class BindingType : uint8_t { Texture, Storage, RenderTarget, DepthTarget, VideoOut };
 
 	struct ImageDesc {
@@ -114,8 +116,6 @@ private:
 	[[nodiscard]] ImageId     InsertImage(const ImageInfo& info, uint32_t capacity_layers = 0);
 	[[nodiscard]] ImageId     GetNullImage(const ImageDesc& desc);
 	// A one-texel depth image holding `value`, for comparison samples of colour textures.
-	[[nodiscard]] ImageId GetComparePlaceholder(vk::ImageViewType view_type, uint32_t layers,
-	                                            float value);
 	void                      RegisterImage(ImageId id);
 	void                      UnregisterImage(ImageId id);
 	void                      DeleteImage(ImageId id);

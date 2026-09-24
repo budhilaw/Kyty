@@ -29,6 +29,8 @@
 #include <cstdlib>
 #include <memory>
 #include <algorithm>
+#include <fmt/format.h>
+#include <string>
 #include <array>
 #include <atomic>
 #include <cmath>
@@ -406,6 +408,18 @@ void RenderExecutor::Dispatch(uint64_t submit_id, CommandBuffer& buffer, uint32_
 	auto& bindings = m_compute_bindings;
 	PrepareBindings(input_info.stage, bindings);
 	FindBuffers(bindings);
+	// Diagnostic: KYTY_SKIP_DMA_DISPATCH=1 skips every raw-pointer compute shader; a list of
+	// hex hashes skips only those.
+	static const std::string skip_dma = [] {
+		const char* text = std::getenv("KYTY_SKIP_DMA_DISPATCH");
+		return std::string(text != nullptr ? text : "");
+	}();
+	if (!skip_dma.empty() && program.info.uses_dma &&
+	    (skip_dma == "1" ||
+	     skip_dma.find(fmt::format("{:016x}", program.shader_hash)) != std::string::npos)) {
+		ResetBindings();
+		return;
+	}
 	if (program.info.uses_dma) {
 		MapUserDataPointers(bindings);
 		m_context.PrepareBda();

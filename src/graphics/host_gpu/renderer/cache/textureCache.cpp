@@ -917,6 +917,18 @@ TextureCache::OverlapResult TextureCache::ResolveOverlap(const ImageInfo& reques
 			            ? result_id
 			            : ImageId {}};
 		}
+		// The guest reinterprets the memory (for example mips as layers). Treat it as a new
+		// image, as for an incompatible format above, instead of stopping.
+		static std::atomic<uint32_t> overlap_log_count {0};
+		if (overlap_log_count.fetch_add(1) < 16) {
+			LOGF("TextureCache: equal-address overlap %ux%u vs cached %ux%u at 0x%016" PRIx64
+			     "; creating a separate image\n",
+			     requested.resources.levels, requested.resources.layers,
+			     cached.info.resources.levels, cached.info.resources.layers, requested.data.address);
+		}
+		if (requested.data.address != 0) {
+			return {ImageId {}};
+		}
 		EXIT("TextureCache: unresolvable equal-address image overlap, address=0x%016" PRIx64
 		     " requested=%ux%u "
 		     "cached=%ux%u requested_size=0x%016" PRIx64 " cached_size=0x%016" PRIx64

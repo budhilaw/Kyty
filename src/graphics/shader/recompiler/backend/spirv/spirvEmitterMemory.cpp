@@ -3,6 +3,7 @@
 #include "graphics/host_gpu/renderer/cache/bufferCache.h"
 
 #include <algorithm>
+#include <cstdlib>
 
 namespace Libs::Graphics::ShaderRecompiler::Spirv::Emitter {
 namespace {
@@ -258,6 +259,11 @@ uint32_t LoadBda(ValueEmitContext& ctx, uint32_t address, uint32_t active, uint3
 }
 
 void StoreBda(ValueEmitContext& ctx, const IR::Inst& inst, const IR::MemoryInfo& mem) {
+	// Diagnostic: KYTY_NO_BDA_STORE=1 drops raw-pointer stores.
+	static const bool no_store = std::getenv("KYTY_NO_BDA_STORE") != nullptr;
+	if (no_store) {
+		return;
+	}
 	auto&      state   = ctx.state;
 	const auto address = GuestAddress(ctx, inst, mem);
 	const auto active  = ctx.Arg(inst, inst.NumArgs() - 1);
