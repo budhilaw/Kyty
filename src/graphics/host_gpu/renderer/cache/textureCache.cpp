@@ -539,6 +539,43 @@ ImageId TextureCache::GetNullImage(const ImageDesc& desc) {
 	return id;
 }
 
+ImageId TextureCache::GetComparePlaceholder(vk::ImageViewType view_type, uint32_t layers,
+                                            float value) {
+	const auto key = std::make_tuple(static_cast<uint32_t>(view_type), layers,
+	                                 static_cast<int>(value * 255.0f));
+	if (const auto found = m_compare_placeholders.find(key); found != m_compare_placeholders.end()) {
+		return found->second;
+	}
+	ImageInfo info {};
+	info.pixel_format = vk::Format::eD32Sfloat;
+	info.guest_format = Prospero::BufferFormat::k32Float;
+	info.type         = view_type == vk::ImageViewType::eCube ||
+	                            view_type == vk::ImageViewType::eCubeArray
+	                        ? Prospero::ImageType::kCube
+	                    : layers > 1 ? Prospero::ImageType::kColor2DArray
+	                                 : Prospero::ImageType::kColor2D;
+	info.extent          = {1, 1, 1};
+	info.resources       = {1, layers};
+	info.pitch           = 1;
+	info.bytes_per_block = 4;
+	info.samples         = 1;
+	info.tile_mode       = Prospero::TileMode::kLinear;
+	info.mip_layout[0]   = {0, 4u * layers, 1, 1};
+	const auto id        = InsertImage(info);
+	auto&      image     = m_slot_images[id];
+	auto&      command   = m_scheduler.Current();
+	command.EndRendering();
+	image.Transit(vk::ImageLayout::eTransferDstOptimal, vk::AccessFlagBits2::eTransferWrite, {},
+	              command.Handle());
+	const vk::ClearDepthStencilValue clear {value, 0};
+	const vk::ImageSubresourceRange  range {vk::ImageAspectFlagBits::eDepth, 0, 1, 0, layers};
+	command.Handle().clearDepthStencilImage(image.backing.image,
+	                                        vk::ImageLayout::eTransferDstOptimal, &clear, 1,
+	                                        &range);
+	m_compare_placeholders.emplace(key, id);
+	return id;
+}
+
 void TextureCache::ValidateImageDesc(const ImageDesc& desc) const {
 	ImageOps::Validate(desc.info);
 	if (desc.view_info.format == vk::Format::eUndefined || desc.view_info.level_count == 0 ||

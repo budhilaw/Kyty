@@ -683,6 +683,33 @@ TextureBinding RenderExecutor::ResolveTexture(const ShaderRecompiler::IR::ImageR
 			EXIT("depth target cannot be bound as a storage image\n");
 		}
 		ValidateSampledDepthBinding(resource, descriptor, *image, pixel_format, size.size);
+	} else if (resource.depth_compare && !storage) {
+		// The guest compares against red; the host cannot compare a colour view, so a depth
+		// placeholder carries the texture's first red value instead.
+		uint32_t texel = 0;
+		float    red   = 1.0f;
+		if (!desc.info.IsBlock() && Prospero::NumBytesPerElement(format) == 4 &&
+		    Libs::LibKernel::Memory::TryReadBacking(address, &texel, sizeof(texel))) {
+			red = static_cast<float>(texel & 0xffu) / 255.0f;
+		}
+		static std::atomic<uint32_t> log_count {0};
+		if (log_count.fetch_add(1) < 16) {
+			LOGF("\t SHADOWPLACEHOLDER: addr=0x%016" PRIx64 " format=%u extent=%ux%u layers=%u "
+			     "red=%.3f\n",
+			     address, static_cast<uint32_t>(format), width, height,
+			     desc.view_info.layer_count, red);
+		}
+		id    = texture_cache.GetComparePlaceholder(desc.view_info.type,
+		                                            desc.view_info.layer_count, red);
+		image = &texture_cache.GetImage(id);
+		desc.info                  = image->info;
+		desc.view_info.format      = vk::Format::eD32Sfloat;
+		desc.view_info.aspect      = vk::ImageAspectFlagBits::eDepth;
+		desc.view_info.base_level  = 0;
+		desc.view_info.level_count = 1;
+		desc.view_info.base_layer  = 0;
+		desc.view_info.min_lod     = 0;
+		desc.view_info.mapping     = {};
 	} else if (storage) {
 		ValidateStorageColorView(image->info.pixel_format, view_format, descriptor.DstSelXYZW());
 	} else {

@@ -220,7 +220,7 @@ BufferCache::BufferCache(GraphicContext& graphics, CommandScheduler& scheduler,
 }
 
 void BufferCache::InitializeReadbackQueue() {
-	if (m_graphics.readback_queue == nullptr || std::getenv("KYTY_NO_READBACK_QUEUE") != nullptr) {
+	if (m_graphics.readback_queue == nullptr || std::getenv("KYTY_READBACK_QUEUE") == nullptr) {
 		return;
 	}
 	vk::CommandPoolCreateInfo pool_info {};

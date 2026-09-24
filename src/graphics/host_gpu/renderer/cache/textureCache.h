@@ -12,6 +12,7 @@
 #include "graphics/host_gpu/renderer/image/image.h"
 #include "graphics/host_gpu/renderer/image/tiler.h"
 
+#include <tuple>
 #include <map>
 #include <type_traits>
 #include <unordered_map>
@@ -112,6 +113,9 @@ private:
 
 	[[nodiscard]] ImageId     InsertImage(const ImageInfo& info, uint32_t capacity_layers = 0);
 	[[nodiscard]] ImageId     GetNullImage(const ImageDesc& desc);
+	// A one-texel depth image holding `value`, for comparison samples of colour textures.
+	[[nodiscard]] ImageId GetComparePlaceholder(vk::ImageViewType view_type, uint32_t layers,
+	                                            float value);
 	void                      RegisterImage(ImageId id);
 	void                      UnregisterImage(ImageId id);
 	void                      DeleteImage(ImageId id);
@@ -174,6 +178,7 @@ private:
 	Common::SlotVector<Image>                         m_slot_images;
 	ImagePageTable                                    m_image_page_table;
 	std::unordered_map<vk::Format, ImageId>           m_null_images;
+	std::map<std::tuple<uint32_t, uint32_t, int>, ImageId> m_compare_placeholders;
 	Common::LeastRecentlyUsedCache<ImageId, uint64_t> m_lru_cache;
 	std::unordered_set<ImageId>                       m_download_images;
 	std::map<uint64_t, MetaDataInfo>                  m_surface_metas;
