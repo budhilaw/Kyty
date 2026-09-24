@@ -857,7 +857,11 @@ static VKAPI_ATTR vk::Bool32 VKAPI_CALL VulkanDebugMessengerCallback(
 		// KYTY_VALIDATION_NONFATAL keeps a run going past the first validation error, so one
 		// session reports every problem instead of stopping at the earliest.
 		static const bool nonfatal = std::getenv("KYTY_VALIDATION_NONFATAL") != nullptr;
-		if (!nonfatal) {
+		// A colour placeholder bound to a shadow slot samples with comparison; harmless, not fatal.
+		const bool placeholder_shadow =
+		    callback_data->pMessage != nullptr &&
+		    std::strstr(callback_data->pMessage, "SAMPLED_IMAGE_DEPTH_COMPARISON_BIT") != nullptr;
+		if (!nonfatal && !placeholder_shadow) {
 			EXIT_COLOR(severity_style, "[Vulkan][%s][%u]: %s\n", severity_str,
 			           static_cast<uint32_t>(message_types), callback_data->pMessage);
 		}
