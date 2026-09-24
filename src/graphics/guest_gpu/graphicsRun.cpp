@@ -23,6 +23,7 @@
 #include "libs/errno.h"
 
 #include <chrono>
+#include <map>
 #include <algorithm>
 #include <array>
 #include <atomic>
@@ -743,6 +744,31 @@ void CommandProcessor::WaitRegMem(uint32_t func, const T* addr, T ref, T mask, u
 		g_current_execution->ClearWait();
 		return;
 	}
+	{
+		// A wait that keeps failing while no GPU write lands anywhere is a deadlock: its release
+		// was lost. Hardware never stalls like this, so after three seconds the wait passes.
+		struct StalledWait {
+			std::chrono::steady_clock::time_point since;
+			uint64_t                              seq;
+		};
+		static std::map<std::pair<int, uint64_t>, StalledWait> stalled;
+		const auto key  = std::make_pair(static_cast<int>(QueueTag()), wait_address);
+		const auto now  = std::chrono::steady_clock::now();
+		const auto seq  = CurrentGuestGpuWriteSeq();
+		auto [entry, fresh] = stalled.try_emplace(key, StalledWait {now, seq});
+		if (!fresh && entry->second.seq != seq) {
+			entry->second = {now, seq};
+		} else if (!fresh && now - entry->second.since > std::chrono::seconds(3)) {
+			LOGF("\t STALLBREAK: q=%d wait on 0x%016" PRIx64 " released after 3 s without GPU progress\n",
+			     QueueTag(), wait_address);
+			stalled.erase(entry);
+			g_current_execution->ClearWait();
+			return;
+		}
+		if (stalled.size() > 256) {
+			stalled.clear();
+		}
+	}
 	if (g_current_execution->AwaitedAddress() != wait_address) {
 		g_current_execution->BeginWait(wait_address, g_current_execution->BaselineSeq());
 		if (LabelTraceEnabled()) {
@@ -1178,8 +1204,11 @@ void GuestGpu::ThreadRun(void* data) {
 						}
 						auto&      execution = queue.front().command_execution;
 						const auto address   = execution.AwaitedAddress();
-						if (address != 0 && !g_last_gpu_writes.contains(address)) {
-							LOGF("\t STALLBREAK: queue=%u forcing wait on never-written 0x%016" PRIx64 "\n", id, address);
+						uint64_t promised = 0;
+						if (address != 0 &&
+						    !PendingGuestGpuWriteSatisfies(address, execution.WaitRef(), execution.WaitMask(),
+						                                   execution.WaitFunc(), promised)) {
+							LOGF("\t STALLBREAK: queue=%u forcing wait on unreleased 0x%016" PRIx64 "\n", id, address);
 							execution.ForceWaitPass();
 							queue.front().blocked = false;
 							selected_queue        = static_cast<int>(id);

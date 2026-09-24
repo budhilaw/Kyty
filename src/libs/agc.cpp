@@ -286,9 +286,9 @@ struct CommandBuffer {
 	static inline thread_local uint32_t    s_recent_write_index = 0;
 
 	void DumpRecentWrites(uint32_t num_dw, uint64_t remaining) const {
-		std::printf("COMMAND BUFFER FULL: requested=%" PRIu32 " remaining=%" PRIu64 " reserved=%" PRIu32
+		std::printf("COMMAND BUFFER FULL: object=%p requested=%" PRIu32 " remaining=%" PRIu64 " reserved=%" PRIu32
 		     " bottom=%p top=%p cursor_up=%p cursor_down=%p\n",
-		     num_dw, remaining, reserved_dw, static_cast<const void*>(bottom),
+		     static_cast<const void*>(this), num_dw, remaining, reserved_dw, static_cast<const void*>(bottom),
 		     static_cast<const void*>(top), static_cast<const void*>(cursor_up),
 		     static_cast<const void*>(cursor_down));
 		for (uint32_t i = 0; i < 32; i++) {

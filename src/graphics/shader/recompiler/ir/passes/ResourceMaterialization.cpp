@@ -1,3 +1,4 @@
+#include <atomic>
 #include "graphics/shader/recompiler/ir/passes/ResourceMaterialization.h"
 
 #include "common/assert.h"
@@ -633,15 +634,18 @@ static bool BuildResourceSpecialization(const ResourcePlan& program, Materialize
 		} else if (image.numeric_class == Prospero::TextureNumericClass::Unsupported ||
 		           (base.depth_compare &&
 		            image.numeric_class != Prospero::TextureNumericClass::Float)) {
-			if (i >= program.info.images.size()) {
-				// A table entry the shader cannot sample this way binds as a null image.
-				next_snapshot.images[i].dwords.fill(0);
-				image.numeric_class = Prospero::TextureNumericClass::Float;
-				continue;
+			// An image the shader cannot sample this way (an integer image read with a depth
+			// comparison, or a format the host lacks) binds as a null image.
+			static std::atomic<uint32_t> log_count {0};
+			if (log_count.fetch_add(1) < 16) {
+				std::fprintf(stderr,
+				             "shader resource: sampled image descriptor %u format %u compare=%d "
+				             "binds as a null image\n",
+				             i, static_cast<uint32_t>(format), base.depth_compare ? 1 : 0);
 			}
-			return SpecializationFail(
-			    fmt::format("sampled image descriptor {} uses unsupported format {}", i,
-			                static_cast<uint32_t>(format)));
+			next_snapshot.images[i].dwords.fill(0);
+			image.numeric_class = Prospero::TextureNumericClass::Float;
+			continue;
 		}
 	}
 	for (uint32_t root_index = 0; root_index < next_specialization.images.size(); root_index++) {

@@ -1079,6 +1079,12 @@ void WindowContext::CreateVulkan() {
 				device_extensions.push_back(extension);
 			}
 		}
+		if (std::getenv("KYTY_GPU_CHECKPOINTS") != nullptr &&
+		    HasExtension(available_extensions, VK_NV_DEVICE_DIAGNOSTIC_CHECKPOINTS_EXTENSION_NAME)) {
+			device_extensions.push_back(VK_NV_DEVICE_DIAGNOSTIC_CHECKPOINTS_EXTENSION_NAME);
+			graphic_ctx.checkpoints_enabled = true;
+			Libs::Graphics::SetGpuCheckpointsEnabled(true);
+		}
 		if (HasExtension(available_extensions, VK_EXT_DEVICE_FAULT_EXTENSION_NAME)) {
 			device_extensions.push_back(VK_EXT_DEVICE_FAULT_EXTENSION_NAME);
 			graphic_ctx.device_fault_enabled = true;

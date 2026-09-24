@@ -31,6 +31,9 @@ namespace Libs::Graphics {
 class GuestGpu;
 
 void PrintRecentShaders();
+void SetGpuCheckpointsEnabled(bool enabled);
+// Leaves an NV diagnostic checkpoint when KYTY_GPU_CHECKPOINTS is set; a no-op otherwise.
+void GpuCheckpoint(vk::CommandBuffer command, uint64_t marker);
 // Logs the command scheduler's submit and priority-operation state for hang reports.
 void ReportSchedulerState();
 

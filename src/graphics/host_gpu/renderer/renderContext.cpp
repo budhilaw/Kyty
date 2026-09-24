@@ -128,6 +128,7 @@ bool RenderContext::ClampIndirectArgs(vk::CommandBuffer command, const Buffer& s
 	command.bindPipeline(vk::PipelineBindPoint::eCompute, m_clamp_pipeline);
 	command.pushConstants(m_clamp_layout, vk::ShaderStageFlagBits::eCompute, 0, sizeof(push),
 	                      &push);
+	GpuCheckpoint(command, 0xF000000000000003ull);
 	command.dispatch(1, 1, 1);
 
 	vk::MemoryBarrier2 after {};
@@ -431,6 +432,18 @@ void RenderContext::GpuTimerBegin(vk::CommandBuffer command) {
 static std::array<std::atomic<uint64_t>, 64> g_recent_shaders {};
 static std::atomic<uint32_t>                   g_recent_shader_index {0};
 
+static std::atomic<bool> g_gpu_checkpoints {false};
+
+void SetGpuCheckpointsEnabled(bool enabled) {
+	g_gpu_checkpoints = enabled;
+}
+
+void GpuCheckpoint(vk::CommandBuffer command, uint64_t marker) {
+	if (g_gpu_checkpoints) {
+		command.setCheckpointNV(reinterpret_cast<const void*>(marker));
+	}
+}
+
 void PrintRecentShaders() {
 	const auto end = g_recent_shader_index.load();
 	std::printf("Last shaders sent to the GPU, oldest first:");
@@ -445,6 +458,9 @@ void RenderContext::GpuTimerMark(vk::CommandBuffer command, uint64_t label, uint
                                  uint64_t detail) {
 	if (label != 0) {
 		g_recent_shaders[g_recent_shader_index.fetch_add(1) % 64].store(label | (uint64_t {kind} << 60u));
+		if (g_gpu_checkpoints) {
+			command.setCheckpointNV(reinterpret_cast<const void*>(label | (uint64_t {kind} << 60u)));
+		}
 	}
 	if (m_timer_current < 0) {
 		return;

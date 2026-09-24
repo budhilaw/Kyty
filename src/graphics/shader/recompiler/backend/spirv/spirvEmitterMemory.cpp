@@ -1071,13 +1071,26 @@ void DefineGetBdaPointer(EmitterState& state) {
 
 	const auto page64        = Binary(state, spv::OpShiftRightLogical, type, address,
 	                                  ConstantDeviceAddress(state, BufferCache::CACHING_PAGEBITS));
-	const auto page          = Unary(state, spv::OpUConvert, TypeU32(state), page64);
+	// Pointers beyond the 40-bit guest range are garbage; truncating their page number would
+	// alias them onto an unrelated buffer, so they resolve to "not present" instead.
+	const auto select = [&](uint32_t result_type, uint32_t condition, uint32_t a, uint32_t b) {
+		const auto id = state.builder.AllocateId();
+		state.builder.AddFunction(spv::OpSelect, result_type, id, condition, a, b);
+		return id;
+	};
+	const auto in_range      = Binary(state, spv::OpULessThan, TypeBool(state), page64,
+	                                  ConstantDeviceAddress(state, BufferCache::CACHING_NUMPAGES));
+	// Page 0 (guest address 0) never holds a buffer, so its fault record is ignored.
+	const auto page          = select(TypeU32(state), in_range,
+	                                  Unary(state, spv::OpUConvert, TypeU32(state), page64),
+	                                  ConstantU32(state, 0));
 	const auto entry_pointer = state.builder.AllocateId();
 	state.builder.AddFunction(spv::OpAccessChain, TypeStorageBufferU64ElementPointer(state),
 	                          entry_pointer, state.bda_pagetable_variable, ConstantU32(state, 0),
 	                          page);
-	const auto base = state.builder.AllocateId();
-	state.builder.AddFunction(spv::OpLoad, type, base, entry_pointer);
+	const auto loaded = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpLoad, type, loaded, entry_pointer);
+	const auto base = select(type, in_range, loaded, ConstantDeviceAddress(state, 0));
 	const auto missing =
 	    Binary(state, spv::OpIEqual, TypeBool(state), base, ConstantDeviceAddress(state, 0));
 	const auto fault_label     = state.builder.AllocateId();

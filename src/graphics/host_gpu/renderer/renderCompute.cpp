@@ -474,6 +474,7 @@ void RenderExecutor::Dispatch(uint64_t submit_id, CommandBuffer& buffer, uint32_
 		ShaderWriteHazardBarrier(vk_buffer, vk::PipelineStageFlagBits::eComputeShader);
 	}
 	vk_buffer.bindPipeline(vk::PipelineBindPoint::eCompute, pipeline.pipeline);
+	GpuCheckpoint(vk_buffer, program.shader_hash | (uint64_t {0xE} << 60u));
 	if (indirect) {
 		// The argument triple was produced by an earlier shader or copy in this queue.
 		vk::MemoryBarrier2 args_barrier {};

@@ -884,15 +884,27 @@ private:
 			// one, memory past the buffer. Such elements store only their own bytes.
 			const auto is8   = emit(ValueOpcode::IEqual32, {stride, Value(1u)});
 			const auto is16  = emit(ValueOpcode::IEqual32, {stride, Value(2u)});
-			const auto flags_raw = inst.Flags<uint64_t>();
+			// Each address access carries its own metadata, sized to its data width.
+			const auto narrow_flags = [&](uint32_t bits) {
+				auto info            = m_program.memory_info[flags.index];
+				info.kind            = ResourceKind::Global;
+				info.address_is_full = false;
+				info.data_bits       = bits;
+				m_program.memory_info.push_back(info);
+				auto narrow  = flags;
+				narrow.index = static_cast<decltype(narrow.index)>(m_program.memory_info.size() - 1u);
+				uint64_t raw = 0;
+				std::memcpy(&raw, &narrow, sizeof(narrow));
+				return raw;
+			};
 			block->PrependNewInst(it, ValueOpcode::StoreAddressU8,
 			                      {address, low, Value(0u), emit(ValueOpcode::ConvertU8U32, {data}),
 			                       emit(ValueOpcode::LogicalAnd, {exec, is8})},
-			                      flags_raw);
+			                      narrow_flags(8u));
 			block->PrependNewInst(it, ValueOpcode::StoreAddressU16,
 			                      {address, low, Value(0u), emit(ValueOpcode::ConvertU16U32, {data}),
 			                       emit(ValueOpcode::LogicalAnd, {exec, is16})},
-			                      flags_raw);
+			                      narrow_flags(16u));
 			exec = emit(ValueOpcode::LogicalAnd,
 			            {exec, emit(ValueOpcode::LogicalNot,
 			                        {emit(ValueOpcode::LogicalOr, {is8, is16})})});
@@ -908,8 +920,9 @@ private:
 		} else {
 			inst.SetArg(3, exec);
 		}
-		memory.kind            = ResourceKind::Global;
-		memory.address_is_full = false;
+		auto& lowered_memory           = m_program.memory_info[flags.index];
+		lowered_memory.kind            = ResourceKind::Global;
+		lowered_memory.address_is_full = false;
 		return true;
 	}
 

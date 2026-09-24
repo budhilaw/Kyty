@@ -36,7 +36,28 @@ MasterSemaphore::~MasterSemaphore() {
 }
 
 // After a device loss the driver can say which GPU address faulted and how it was accessed.
+static void PrintCheckpoints(GraphicContext& graphics) {
+	if (!graphics.checkpoints_enabled) {
+		return;
+	}
+	for (auto queue: {graphics.queue, graphics.readback_queue}) {
+		if (!queue) {
+			continue;
+		}
+		const auto points = queue.getCheckpointDataNV();
+		std::printf("GPU checkpoints (%zu):\n", points.size());
+		for (const auto& point: points) {
+			const auto marker = reinterpret_cast<uint64_t>(point.pCheckpointMarker);
+			std::printf("  stage=%s kind=%u hash=%016llx\n", vk::to_string(point.stage).c_str(),
+			            static_cast<unsigned>(marker >> 60u),
+			            static_cast<unsigned long long>(marker & ((1ull << 60u) - 1u)));
+		}
+	}
+	std::fflush(stdout);
+}
+
 static void PrintDeviceFault(GraphicContext& graphics) {
+	PrintCheckpoints(graphics);
 	if (!graphics.device_fault_enabled) {
 		std::printf("Device fault details unavailable (VK_EXT_device_fault not supported)\n");
 		return;
