@@ -143,6 +143,10 @@ private:
 
 public:
 	void PrefetchReadbacks();
+	// Starts an asynchronous download of GPU-modified pages around [vaddr, vaddr+size) unless one
+	// is already pending; the guest copy updates when the GPU reaches it. Returns true if the
+	// range is GPU-modified (the caller is reading data older than the GPU's).
+	bool PrefetchRange(uint64_t vaddr, uint64_t size);
 
 private:
 	GraphicContext&                                   m_graphics;

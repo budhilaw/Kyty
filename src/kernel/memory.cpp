@@ -919,6 +919,37 @@ bool ReadGpuBackingOrDownload(uint64_t vaddr, void* data, uint64_t size) {
 	return TryReadBacking(vaddr, data, size);
 }
 
+bool IsCommittedRange(uint64_t vaddr, uint64_t size) {
+	for (uint64_t cursor = vaddr; cursor < vaddr + size;) {
+		MEMORY_BASIC_INFORMATION info {};
+		if (VirtualQuery(reinterpret_cast<const void*>(cursor), &info, sizeof(info)) == 0 ||
+		    info.State != MEM_COMMIT) {
+			return false;
+		}
+		cursor = reinterpret_cast<uint64_t>(info.BaseAddress) + info.RegionSize;
+	}
+	return true;
+}
+
+bool ReadGpuBackingOrPrefetch(uint64_t vaddr, void* data, uint64_t size) {
+	// Waiting for the GPU inside shader setup stalled the whole pipeline once per frame for
+	// every GPU-built descriptor table. The last known copy is used instead and a fresh one
+	// is downloaded asynchronously for the next frame. KYTY_SYNC_MATERIALIZE=1 waits instead.
+	static const bool sync = std::getenv("KYTY_SYNC_MATERIALIZE") != nullptr;
+	if (sync) {
+		return ReadGpuBackingOrDownload(vaddr, data, size);
+	}
+	if (TryReadGpuCleanBacking(vaddr, data, size)) {
+		return true;
+	}
+	if (g_gpu_resources == nullptr || !Graphics::GuestGpu::IsGpuThread() ||
+	    !IsGpuAddressRange(vaddr, size) || !g_gpu_resources->IsMapped(vaddr, size)) {
+		return false;
+	}
+	(void)GetGpuResources().GetBufferCache().PrefetchRange(vaddr, size);
+	return TryReadBacking(vaddr, data, size);
+}
+
 uint64_t ClampRangeSize(uint64_t vaddr, uint64_t size) {
 	EXIT_IF(g_virtual_ranges == nullptr);
 

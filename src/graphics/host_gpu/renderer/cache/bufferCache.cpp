@@ -693,6 +693,41 @@ void BufferCache::PrefetchReadbacks() {
 	m_scheduler.Flush();
 }
 
+bool BufferCache::PrefetchRange(uint64_t vaddr, uint64_t size) {
+	if (!m_memory_tracker.IsRegionGpuModified(vaddr, size)) {
+		return false;
+	}
+	constexpr uint64_t Page  = 4096;
+	const auto         begin = vaddr & ~(Page - 1u);
+	const auto         end   = (vaddr + size + Page - 1u) & ~(Page - 1u);
+	for (const auto& pending: m_pending_downloads) {
+		if (pending.begin < end && pending.begin + pending.size > begin) {
+			return true;
+		}
+	}
+	const auto* owner = m_page_table.Find(begin >> PageTable::kPageBits);
+	if (owner == nullptr || !*owner) {
+		return true;
+	}
+	auto&      buffer = m_slot_buffers[*owner];
+	const auto from   = std::max(begin, buffer.CpuAddress());
+	const auto to     = std::min(end, buffer.CpuAddress() + buffer.Size());
+	if (from >= to) {
+		return true;
+	}
+	{
+		// These pages are wanted on the host: let their readback reach guest memory.
+		std::lock_guard lock(m_snapshot_mutex);
+		for (auto page = from & ~(Page - 1u); page < to; page += Page) {
+			m_read_fault_counts[page] += 4;
+		}
+	}
+	if (DownloadBufferMemory(buffer, from, to - from)) {
+		m_pending_downloads.push_back({from, to - from, m_scheduler.CurrentTick()});
+	}
+	return true;
+}
+
 BufferId BufferCache::FindBuffer(uint64_t vaddr, uint64_t size) {
 	if (vaddr == 0) {
 		return NULL_BUFFER_ID;

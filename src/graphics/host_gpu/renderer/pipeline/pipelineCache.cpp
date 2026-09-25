@@ -151,16 +151,34 @@ struct ShaderReadCache {
 	}
 };
 thread_local ShaderReadCache g_shader_read_cache;
+// While set, every successful materialization read is appended (address, value); a failed read
+// marks the log unusable for memoization.
+thread_local std::vector<std::pair<uint64_t, uint32_t>>* g_shader_read_log    = nullptr;
+thread_local bool                                        g_shader_read_failed = false;
 } // namespace
 
 void ResetShaderGuestMemoryCache() {
 	g_shader_read_cache.Reset();
 }
 
+static bool ReadShaderGuestMemoryImpl(uint64_t address, uint32_t* value);
+
 bool ReadShaderGuestMemory(void*, uint64_t address, uint32_t* value) {
 	if (value == nullptr) {
 		return false;
 	}
+	const bool ok = ReadShaderGuestMemoryImpl(address, value);
+	if (g_shader_read_log != nullptr) {
+		if (ok) {
+			g_shader_read_log->emplace_back(address, *value);
+		} else {
+			g_shader_read_failed = true;
+		}
+	}
+	return ok;
+}
+
+static bool ReadShaderGuestMemoryImpl(uint64_t address, uint32_t* value) {
 	auto&      cache = g_shader_read_cache;
 	const auto base  = address & ~(ShaderReadCache::BlockBytes - 1u);
 	if ((address & 3u) == 0) {
@@ -171,7 +189,7 @@ bool ReadShaderGuestMemory(void*, uint64_t address, uint32_t* value) {
 			}
 		}
 		auto& block = cache.blocks[cache.next];
-		if (Libs::LibKernel::Memory::ReadGpuBackingOrDownload(base, block.words.data(),
+		if (Libs::LibKernel::Memory::ReadGpuBackingOrPrefetch(base, block.words.data(),
 		                                                      ShaderReadCache::BlockBytes)) {
 			block.base = base;
 			cache.next = (cache.next + 1u) % ShaderReadCache::Slots;
@@ -179,7 +197,7 @@ bool ReadShaderGuestMemory(void*, uint64_t address, uint32_t* value) {
 			return true;
 		}
 	}
-	return Libs::LibKernel::Memory::ReadGpuBackingOrDownload(address, value, sizeof(*value));
+	return Libs::LibKernel::Memory::ReadGpuBackingOrPrefetch(address, value, sizeof(*value));
 }
 
 void DumpShaderSpirv(const char* stage_name, uint64_t shader_hash,
@@ -290,7 +308,45 @@ struct PipelineCache::ProgramCache {
 		ShaderRecompiler::IR::ResourceSpecialization specialization;
 		std::vector<Permutation>                    permutations;
 		bool                                        skip_dispatch = false;
+		// Inputs of the last materialization: identical inputs give identical resources.
+		bool                                        memo_valid = false;
+		std::vector<uint32_t>                       memo_user_data;
+		uint64_t                                    memo_base = 0;
+		std::vector<std::pair<uint64_t, uint32_t>>  memo_reads;
 	};
+
+	static bool MemoStillValid(const SourceEntry& entry, std::span<const uint32_t> user_data,
+	                           uint64_t base) {
+		if (!entry.memo_valid || entry.memo_base != base ||
+		    !std::ranges::equal(entry.memo_user_data, user_data)) {
+			return false;
+		}
+		for (const auto& [address, value]: entry.memo_reads) {
+			uint32_t current = 0;
+			if (!ReadShaderGuestMemoryImpl(address, &current) || current != value) {
+				return false;
+			}
+		}
+		return true;
+	}
+
+	static bool MaterializeRemembered(SourceEntry& entry, const ShaderRecompiler::IR::SrtRuntime& runtime,
+	                                  std::span<const uint32_t> user_data, uint64_t base) {
+		static const bool no_memo = std::getenv("KYTY_NO_MATERIALIZE_MEMO") != nullptr;
+		if (!no_memo && MemoStillValid(entry, user_data, base)) {
+			return true;
+		}
+		entry.memo_reads.clear();
+		g_shader_read_log    = &entry.memo_reads;
+		g_shader_read_failed = false;
+		const bool ok = ShaderRecompiler::IR::MaterializeResources(entry.resource_plan, runtime,
+		                                                         entry.resources, entry.specialization);
+		g_shader_read_log = nullptr;
+		entry.memo_valid  = ok && !g_shader_read_failed && entry.memo_reads.size() <= 4096;
+		entry.memo_user_data.assign(user_data.begin(), user_data.end());
+		entry.memo_base = base;
+		return ok;
+	}
 
 	struct ProgramKeyHash {
 		std::size_t operator()(const ProgramKey& key) const {
@@ -379,9 +435,7 @@ struct PipelineCache::ProgramCache {
 		};
 		ResetShaderGuestMemoryCache();
 		if (entry != programs.end()) {
-			if (!ShaderRecompiler::IR::MaterializeResources(entry->second.resource_plan, runtime,
-			                                                entry->second.resources,
-			                                                entry->second.specialization)) {
+			if (!MaterializeRemembered(entry->second, runtime, user_data, params.Base())) {
 				EXIT("shader resources could not be materialized: hash=0x%016" PRIx64 "\n",
 				     params.hash);
 			}

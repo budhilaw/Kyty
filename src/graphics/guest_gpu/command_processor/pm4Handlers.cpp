@@ -2060,8 +2060,13 @@ KYTY_CP_OP_PARSER(CpOpIndirectCxRegs) {
 	if (indirect_num_dw == 0) {
 		return KYTY_PM4_LEN(cmd_id) - 1u;
 	}
-	if (indirect_buffer == nullptr) {
-		EXIT("indirect CX registers have null address, num_regs = %" PRIu32 "\n", indirect_num_dw);
+	if (indirect_buffer == nullptr ||
+	    !Libs::LibKernel::Memory::IsCommittedRange(reinterpret_cast<uint64_t>(indirect_buffer),
+	                                               uint64_t {indirect_num_dw} * 8u)) {
+		// A damaged packet points the register table at unmapped memory; skip it.
+		LOGF("skipped indirect CX registers at %p, num_regs = %" PRIu32 "\n",
+		     static_cast<void*>(indirect_buffer), indirect_num_dw);
+		return KYTY_PM4_LEN(cmd_id) - 1u;
 	}
 	for (uint32_t i = 0; i < indirect_num_dw; i++, indirect_buffer += 2) {
 		// Keep the encoded offset for packet control values, and use the normalized offset
@@ -2145,8 +2150,13 @@ KYTY_CP_OP_PARSER(CpOpIndirectShRegs) {
 	if (indirect_num_dw == 0) {
 		return KYTY_PM4_LEN(cmd_id) - 1u;
 	}
-	if (indirect_buffer == nullptr) {
-		EXIT("indirect SH registers have null address, num_regs = %" PRIu32 "\n", indirect_num_dw);
+	if (indirect_buffer == nullptr ||
+	    !Libs::LibKernel::Memory::IsCommittedRange(reinterpret_cast<uint64_t>(indirect_buffer),
+	                                               uint64_t {indirect_num_dw} * 8u)) {
+		// A damaged packet points the register table at unmapped memory; skip it.
+		LOGF("skipped indirect SH registers at %p, num_regs = %" PRIu32 "\n",
+		     static_cast<void*>(indirect_buffer), indirect_num_dw);
+		return KYTY_PM4_LEN(cmd_id) - 1u;
 	}
 	const auto indirect_address = reinterpret_cast<uint64_t>(indirect_buffer);
 
@@ -2213,8 +2223,13 @@ KYTY_CP_OP_PARSER(CpOpIndirectUcRegs) {
 	if (indirect_num_dw == 0) {
 		return KYTY_PM4_LEN(cmd_id) - 1u;
 	}
-	if (indirect_buffer == nullptr) {
-		EXIT("indirect UC registers have null address, num_regs = %" PRIu32 "\n", indirect_num_dw);
+	if (indirect_buffer == nullptr ||
+	    !Libs::LibKernel::Memory::IsCommittedRange(reinterpret_cast<uint64_t>(indirect_buffer),
+	                                               uint64_t {indirect_num_dw} * 8u)) {
+		// A damaged packet points the register table at unmapped memory; skip it.
+		LOGF("skipped indirect UC registers at %p, num_regs = %" PRIu32 "\n",
+		     static_cast<void*>(indirect_buffer), indirect_num_dw);
+		return KYTY_PM4_LEN(cmd_id) - 1u;
 	}
 	for (uint32_t i = 0; i < indirect_num_dw; i++, indirect_buffer += 2) {
 		auto raw_cmd_offset = indirect_buffer[0];
