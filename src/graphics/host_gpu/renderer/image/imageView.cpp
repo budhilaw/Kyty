@@ -322,6 +322,22 @@ vk::ImageView Image::FindView(const ImageViewInfo& view_info) {
 		normalized.aspect = vk::ImageAspectFlagBits::eStencil;
 	}
 	normalized.usage = is_storage ? vk::ImageUsageFlagBits::eStorage : vk::ImageUsageFlags {};
+	// A view past the image's real range (an image reduced after a failed allocation, or a
+	// corrupt descriptor) is clamped into it instead of stopping the emulator.
+	if (image.mip_levels != 0 && (normalized.level_count == 0 ||
+	                              normalized.base_level >= image.mip_levels ||
+	                              normalized.level_count > image.mip_levels - normalized.base_level)) {
+		normalized.base_level  = std::min(normalized.base_level, image.mip_levels - 1u);
+		normalized.level_count = std::clamp(normalized.level_count, 1u,
+		                                    image.mip_levels - normalized.base_level);
+	}
+	if (image.image_type != vk::ImageType::e3D && image.layers != 0 &&
+	    (normalized.layer_count == 0 || normalized.base_layer >= image.layers ||
+	     normalized.layer_count > image.layers - normalized.base_layer)) {
+		normalized.base_layer  = std::min(normalized.base_layer, image.layers - 1u);
+		normalized.layer_count = std::clamp(normalized.layer_count, 1u,
+		                                    image.layers - normalized.base_layer);
+	}
 	for (const auto& cached: views) {
 		if (cached.info == normalized) {
 			return cached.view;
