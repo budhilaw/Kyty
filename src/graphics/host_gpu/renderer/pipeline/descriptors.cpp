@@ -725,6 +725,17 @@ TextureBinding RenderExecutor::ResolveTexture(const ShaderRecompiler::IR::ImageR
 			return NullTextureBinding(resource, storage, texture_cache);
 		}
 	}
+	if (size.size > (uint64_t {1} << 30u)) {
+		// Over 1 GiB is not a game texture but a descriptor read from reused memory; allocating
+		// it exhausted video memory in one step. Sample a null image instead.
+		static std::atomic<uint32_t> log_count {0};
+		if (log_count.fetch_add(1) < 16) {
+			LOGF("\t TEXDESC: implausible %" PRIu64 " MiB texture bound as null: addr=0x%016" PRIx64
+			     " extent=%ux%ux%u layers=%u\n",
+			     static_cast<uint64_t>(size.size) >> 20u, address, width, height, depth, image_layers);
+		}
+		return NullTextureBinding(resource, storage, texture_cache);
+	}
 	if (size.size == 0 || size.align == 0 ||
 	    (address & (static_cast<uint64_t>(size.align) - 1u)) != 0) {
 		// An empty or misaligned surface cannot be a real texture; sample a null image.

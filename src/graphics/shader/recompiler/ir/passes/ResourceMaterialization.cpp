@@ -483,15 +483,27 @@ static bool BuildResourceSpecialization(const ResourcePlan& program, Materialize
 	next_specialization.buffers.reserve(program.info.buffers.size());
 	size_t image_count   = program.info.images.size();
 	size_t mapping_words = 0;
+	// Candidates each table keeps. A table larger than the dense image limit keeps what fits and
+	// turns its last kept slot into a null image that every overflowing key maps to.
+	std::vector<uint32_t> table_keep;
 	for (const auto& table: snapshot.indirect_images) {
 		if (table.resource >= program.info.images.size() || table.descriptors.size() < 2u ||
-		    image_count + table.descriptors.size() - 1u > ShaderInfo::MaxImages) {
+		    image_count + 1u > ShaderInfo::MaxImages) {
 			return SpecializationFail(
 			    "indirect image candidates exceed the dense image resource limit");
 		}
-		image_count += table.descriptors.size() - 1u;
+		const auto room = ShaderInfo::MaxImages - image_count + 1u;
+		const auto keep = static_cast<uint32_t>(std::min<size_t>(table.descriptors.size(), room));
+		if (keep < 2u) {
+			return SpecializationFail(
+			    "indirect image candidates exceed the dense image resource limit");
+		}
+		table_keep.push_back(keep);
+		image_count += keep - 1u;
 		mapping_words += 1u + table.keys.size() * 2u;
 	}
+	// Room left for padding indirect tables to stable sizes (see below).
+	size_t padding_room = ShaderInfo::MaxImages - image_count;
 	next_snapshot.images.reserve(image_count);
 	next_snapshot.flattened_srt.reserve(next_snapshot.flattened_srt.size() + mapping_words);
 	next_specialization.images.reserve(image_count);
@@ -508,18 +520,41 @@ static bool BuildResourceSpecialization(const ResourcePlan& program, Materialize
 		    .cube                       = image.cube,
 		});
 	}
-	for (const auto& table: snapshot.indirect_images) {
-		const auto root_image = next_specialization.images[table.resource];
-		for (uint32_t candidate = 1; candidate < table.descriptors.size(); candidate++) {
+	for (size_t table_index = 0; table_index < snapshot.indirect_images.size(); table_index++) {
+		const auto& table      = snapshot.indirect_images[table_index];
+		const auto  keep       = table_keep[table_index];
+		const bool  truncated  = keep < table.descriptors.size();
+		const auto  root_image = next_specialization.images[table.resource];
+		// The table's size changes from frame to frame; every size would be another shader
+		// variant, compiled mid-frame. Candidates are padded to a power-of-two bucket with null
+		// images, and the search runs for the bucket's depth (extra steps are inactive).
+		// A truncated table's last kept slot is the overflow null image.
+		const auto real_candidates = truncated ? keep - 1u : keep;
+		const auto wanted          = std::max<uint32_t>(16u, std::bit_ceil(real_candidates));
+		const auto padding =
+		    static_cast<uint32_t>(std::min<size_t>(wanted - real_candidates, padding_room));
+		padding_room -= padding;
+		// A truncated table always keeps its overflow slot (counted in keep).
+		const auto bucket = std::max<uint32_t>(real_candidates + padding, keep);
+		for (uint32_t candidate = 1; candidate < bucket; candidate++) {
 			auto image          = root_image;
 			image.indirect_root = table.resource;
 			next_specialization.images.push_back(image);
-			next_snapshot.images.push_back(table.descriptors[candidate]);
+			if (candidate < real_candidates) {
+				next_snapshot.images.push_back(table.descriptors[candidate]);
+			} else {
+				DescriptorValue null_descriptor {};
+				null_descriptor.dwords.fill(0);
+				null_descriptor.dword_count = table.descriptors[0].dword_count;
+				next_snapshot.images.push_back(null_descriptor);
+			}
 		}
 		auto& root                      = next_specialization.images[table.resource];
 		root.indirect_root              = table.resource;
 		root.indirect_mapping_offset    = static_cast<uint32_t>(next_snapshot.flattened_srt.size());
-		root.indirect_search_iterations = std::bit_width(table.keys.size());
+		// Inactive search steps cost little; a fixed depth keeps the key count out of the key.
+		root.indirect_search_iterations =
+		    std::max<uint32_t>(12u, std::bit_width(table.keys.size()));
 		next_snapshot.flattened_srt.resize(next_snapshot.flattened_srt.size() + 1u +
 		                                   table.keys.size() * 2u);
 		std::vector<uint32_t> order(table.keys.size());
@@ -531,7 +566,9 @@ static bool BuildResourceSpecialization(const ResourcePlan& program, Materialize
 			const auto source                   = order[entry];
 			const auto offset                   = root.indirect_mapping_offset + 1u + entry * 2u;
 			next_snapshot.flattened_srt[offset] = table.keys[source];
-			next_snapshot.flattened_srt[offset + 1] = table.candidates[source];
+			const auto candidate                = table.candidates[source];
+			next_snapshot.flattened_srt[offset + 1] =
+			    candidate < real_candidates ? candidate : real_candidates;
 		}
 		next_snapshot.images[table.resource] = table.descriptors[0];
 	}

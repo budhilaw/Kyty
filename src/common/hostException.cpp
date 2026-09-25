@@ -133,6 +133,37 @@ static LONG WINAPI ExceptionFilter(PEXCEPTION_POINTERS exception) noexcept {
 			printf("Unhandled host exception code=0x%08lx address=%p thread=%lu\n",
 			       static_cast<unsigned long>(exception_record->ExceptionCode),
 			       exception_record->ExceptionAddress, GetCurrentThreadId());
+			if (exception_record->ExceptionCode == 0xE06D7363u &&
+			    exception_record->NumberParameters >= 4) {
+				// MSVC C++ exception: ThrowInfo -> CatchableTypeArray -> TypeDescriptor name.
+				const auto base = static_cast<uintptr_t>(exception_record->ExceptionInformation[3]);
+				const auto* throw_info =
+				    reinterpret_cast<const int32_t*>(exception_record->ExceptionInformation[2]);
+				if (base != 0 && throw_info != nullptr) {
+					const auto* types = reinterpret_cast<const int32_t*>(base + throw_info[3]);
+					const auto* first = reinterpret_cast<const int32_t*>(base + types[1]);
+					const auto* type  = reinterpret_cast<const char*>(base + first[1]);
+					printf("  C++ exception type: %s\n", type + 16);
+				}
+				// Values on the throwing thread's stack that point into the emulator image are
+				// likely return addresses; print them as image offsets for symbolization.
+				const auto module = reinterpret_cast<uintptr_t>(GetModuleHandleA(nullptr));
+				const auto* rsp   = reinterpret_cast<const uintptr_t*>(exception->ContextRecord->Rsp);
+				printf("  stack rva:");
+				for (int i = 0, found = 0; i < 4096 && found < 32; i++) {
+					MEMORY_BASIC_INFORMATION mbi {};
+					if ((i % 512) == 0 &&
+					    (VirtualQuery(rsp + i, &mbi, sizeof(mbi)) == 0 || mbi.State != MEM_COMMIT)) {
+						break;
+					}
+					const auto value = rsp[i];
+					if (value > module && value < module + 0x2000000u) {
+						printf(" %llx", static_cast<unsigned long long>(value - module));
+						found++;
+					}
+				}
+				printf("\n");
+			}
 			fflush(stdout);
 		}
 		return EXCEPTION_CONTINUE_SEARCH;

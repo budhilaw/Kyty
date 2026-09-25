@@ -157,7 +157,7 @@ private:
 	// Contents of GPU-owned pages at the moment the CPU first wrote to them. The upload of such
 	// a page sends only the bytes the CPU changed, so GPU writes elsewhere in the page survive.
 	std::unordered_map<uint64_t, std::vector<uint8_t>> m_write_snapshots;
-	std::mutex                                         m_snapshot_mutex;
+	std::recursive_mutex                               m_snapshot_mutex;
 	MemoryTracker                                     m_memory_tracker;
 	StreamBuffer                                      m_staging_buffer;
 	StreamBuffer                                      m_stream_buffer;

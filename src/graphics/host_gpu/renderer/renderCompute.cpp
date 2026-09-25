@@ -408,6 +408,41 @@ void RenderExecutor::Dispatch(uint64_t submit_id, CommandBuffer& buffer, uint32_
 	auto& bindings = m_compute_bindings;
 	PrepareBindings(input_info.stage, bindings);
 	FindBuffers(bindings);
+	if (program.shader_hash == 0x1d5918390613826eull) {
+		// Diagnostic: the shadow filter's tap count lives at user_data pointer + 1792.
+		static std::atomic<uint32_t> log_count {0};
+		const auto& user_data = bindings.runtime->resources->user_data;
+		if (user_data.size() >= 2 && log_count.fetch_add(1) < 48) {
+			const auto base = uint64_t {user_data[0]} | (uint64_t {user_data[1]} << 32u);
+			uint32_t   words[4] {};
+			const bool ok = Libs::LibKernel::Memory::TryReadBacking(base + 1792, words, sizeof(words));
+			LOGF("SHADOWTAPS base=0x%016" PRIx64 " ok=%d mask=0x%08x taps=0x%08x off=0x%08x,0x%08x\n",
+			     base, ok ? 1 : 0, words[0], words[1], words[2], words[3]);
+		}
+	}
+	if (program.shader_hash == 0xb3ade16b0485b3bdull) {
+		// Diagnostic: the copy shader reads count at +288, per-copy counts at +0x100, source
+		// V#s at +i*16 and destination V#s at +128+i*16 of the user_data table.
+		static std::atomic<uint32_t> log_count {0};
+		const auto& user_data = bindings.runtime->resources->user_data;
+		if (user_data.size() >= 2 && log_count.fetch_add(1) < 24) {
+			const auto base  = uint64_t {user_data[0]} | (uint64_t {user_data[1]} << 32u);
+			uint32_t   count = 0;
+			(void)Libs::LibKernel::Memory::TryReadBacking(base + 288, &count, 4);
+			LOGF("COPYSHADER base=0x%016" PRIx64 " copies=%u groups=%ux%ux%u\n", base, count,
+			     thread_group_x, thread_group_y, thread_group_z);
+			for (uint32_t i = 0; i < std::min(count, 8u); i++) {
+				uint32_t elements = 0;
+				uint32_t src[4] {};
+				uint32_t dst[4] {};
+				(void)Libs::LibKernel::Memory::TryReadBacking(base + 0x100 + i * 4, &elements, 4);
+				(void)Libs::LibKernel::Memory::TryReadBacking(base + i * 16, src, 16);
+				(void)Libs::LibKernel::Memory::TryReadBacking(base + 128 + i * 16, dst, 16);
+				LOGF("  copy %u n=%u src=%08x,%08x,%08x,%08x dst=%08x,%08x,%08x,%08x\n", i, elements,
+				     src[0], src[1], src[2], src[3], dst[0], dst[1], dst[2], dst[3]);
+			}
+		}
+	}
 	// Diagnostic: KYTY_SKIP_DMA_DISPATCH=1 skips every raw-pointer compute shader; a list of
 	// hex hashes skips only those.
 	static const std::string skip_dma = [] {
