@@ -12,6 +12,7 @@
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/renderer/cache/bufferCache.h"
 #include "graphics/host_gpu/renderer/commandScheduler.h"
+#include "graphics/host_gpu/renderer/frameCapture.h"
 #include "graphics/host_gpu/renderer/image/imageView.h"
 #include "graphics/host_gpu/renderer/image/textureCommon.h"
 #include "graphics/host_gpu/renderer/image/tiler.h"
@@ -36,6 +37,7 @@ static void WriteBackingIfMapped(uint64_t vaddr, const void* data, uint64_t size
 	if (Libs::Graphics::LabelTraceEnabled()) {
 		LOGF("DOWNLOAD image range=0x%010" PRIx64 "+0x%" PRIx64 "\n", vaddr, size);
 	}
+	Libs::LibKernel::Memory::CheckReadbackClobber(vaddr, data, size, "image");
 	if (!Libs::LibKernel::Memory::TryWriteBacking(vaddr, data, size)) {
 		LOGF("Memory: skipped readback into unmapped range addr=0x%016" PRIx64 " size=0x%016" PRIx64 "\n", vaddr, size);
 	}
@@ -1236,6 +1238,15 @@ void TextureCache::InitializeImage(ImageId id) {
 	}
 	const bool upload = image.IsBufferModified() || image.IsCpuDirty();
 	if (upload) {
+		if (image.depth_id && FrameCapture::Active()) {
+			char note[160];
+			std::snprintf(note, sizeof(note),
+			              "stencil plane 0x%010" PRIx64
+			              " re-uploaded from guest memory (buffer_modified=%d cpu_dirty=%d)",
+			              image.info.data.address, image.IsBufferModified() ? 1 : 0,
+			              image.IsCpuDirty() ? 1 : 0);
+			FrameCapture::NoteMarker(note);
+		}
 		const auto [source, source_offset] =
 		    m_buffer_cache.ObtainBufferForImage(image.info.data.address, image.info.data.size);
 		if (source == nullptr) {
@@ -1442,6 +1453,41 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_format) {
 				}
 			}
 		}
+		// Likewise an 8-bit view of a stencil plane: the lighting passes classify pixels by
+		// stencil bits the depth draws wrote, which a colour image of that memory never has.
+		// The association is returned; texture binding swaps it for the depth image's stencil.
+		bool stencil_resolved = false;
+		if ((!result || !m_slot_images[result].info.IsDepth()) &&
+		    desc.type == BindingType::Texture &&
+		    (desc.info.pixel_format == vk::Format::eR8Uint ||
+		     desc.info.pixel_format == vk::Format::eR8Unorm)) {
+			for (const auto id: candidates) {
+				const auto& association = m_slot_images[id];
+				if (!association.depth_id ||
+				    association.info.data.address != desc.info.data.address) {
+					continue;
+				}
+				const auto* depth = m_slot_images.try_get(association.depth_id);
+				if (depth == nullptr || !depth->info.IsDepth() || !depth->info.HasStencil() ||
+				    depth->backing.image == nullptr ||
+				    depth->info.stencil.address != desc.info.data.address ||
+				    depth->info.extent.width != desc.info.extent.width ||
+				    depth->info.extent.height != desc.info.extent.height ||
+				    (result && depth->gpu_write_serial <= m_slot_images[result].gpu_write_serial)) {
+					continue;
+				}
+				static std::atomic<uint32_t> log_count {0};
+				if (log_count.fetch_add(1) < 8) {
+					LOGF("TextureCache: %s view of 0x%016" PRIx64
+					     " resolved to the stencil of depth image 0x%016" PRIx64 "\n",
+					     vk::to_string(desc.info.pixel_format).c_str(), desc.info.data.address,
+					     depth->info.data.address);
+				}
+				result           = id;
+				stencil_resolved = true;
+				break;
+			}
+		}
 
 		int32_t view_mip   = -1;
 		int32_t view_layer = -1;
@@ -1466,7 +1512,7 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_format) {
 			}
 		}
 
-		if (result) {
+		if (result && !stencil_resolved) {
 			auto& resolved = m_slot_images[result];
 			if (exact_format && resolved.info.pixel_format != desc.info.pixel_format) {
 				result = {};

@@ -47,6 +47,17 @@ public:
 	void                   ReadMemory(uint64_t vaddr, uint64_t size, bool is_write = false);
 	// ReadMemory whose GPU waits give up after timeout_ns; false when the data is not there yet.
 	[[nodiscard]] bool     ReadMemoryBounded(uint64_t vaddr, uint64_t size, uint64_t timeout_ns);
+	// Copies the GPU's current bytes of a resident range into out without touching guest
+	// memory or tracking state. False when the range is not GPU-owned, resident, or in time.
+	[[nodiscard]] bool PeekGpuRange(uint64_t vaddr, uint64_t size, void* out, uint64_t timeout_ns);
+	// Drops peeked pages: called when GPU work that may write guest memory is recorded.
+	void InvalidatePeekCache() { m_peek_generation++; }
+	// Drops only peeked pages that overlap a range recorded GPU work writes.
+	void InvalidatePeekCache(uint64_t vaddr, uint64_t size) {
+		std::erase_if(m_peek_pages, [&](const PeekPage& p) {
+			return p.page < vaddr + size && vaddr < p.page + 4096;
+		});
+	}
 	[[nodiscard]] Buffer&  GetBuffer(BufferId id) { return m_slot_buffers[id]; }
 	[[nodiscard]] BufferId FindBuffer(uint64_t vaddr, uint64_t size);
 	[[nodiscard]] std::pair<Buffer*, uint64_t> ObtainBuffer(uint64_t vaddr, uint64_t size,
@@ -196,6 +207,15 @@ private:
 	StreamBuffer                                      m_device_buffer;
 	TextureCache&                                     m_texture_cache;
 	uint64_t                                          m_total_used_memory  = 0;
+	// Pages fetched from the GPU for the emulator's own descriptor reads (PeekGpuRange), valid
+	// until GPU work is recorded again.
+	struct PeekPage {
+		uint64_t                  page       = 0;
+		uint64_t                  generation = 0;
+		std::array<uint8_t, 4096> bytes {};
+	};
+	std::vector<PeekPage> m_peek_pages;
+	uint64_t              m_peek_generation = 1;
 	uint64_t m_trigger_gc_memory  = 1ull * 1024 * 1024 * 1024;
 	uint64_t m_critical_gc_memory = 2ull * 1024 * 1024 * 1024;
 	uint64_t m_gc_tick            = 0;

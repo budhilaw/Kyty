@@ -1,4 +1,5 @@
 #include "graphics/host_gpu/renderer/sync.h"
+#include "kernel/memory.h"
 
 #include "common/assert.h"
 #include "common/common.h"
@@ -101,10 +102,16 @@ static void RecordEndOfPipeWrite(uint64_t submit_id, CommandBuffer& buffer, uint
 	CheckGuestWatch(destination, static_cast<uint64_t>(size), "end_of_pipe");
 	const auto pending = NotePendingGuestGpuWrite(destination, value, width);
 	scheduler.DeferPriorityOperation([destination, value, size, pending] {
-		if (size == EndOfPipeWriteSize::Qword) {
-			*reinterpret_cast<uint64_t*>(destination) = value;
-		} else {
-			*reinterpret_cast<uint32_t*>(destination) = static_cast<uint32_t>(value);
+		// Through the backing alias first (GPU-owned pages), the direct mapping when committed;
+		// a damaged packet naming unmapped memory skips the store but the event still fires.
+		const auto     bytes = static_cast<uint64_t>(size);
+		const uint32_t low   = static_cast<uint32_t>(value);
+		const void*    data  = size == EndOfPipeWriteSize::Qword ? static_cast<const void*>(&value)
+		                                                          : static_cast<const void*>(&low);
+		if (!LibKernel::Memory::TryWriteBacking(destination, data, bytes)) {
+			if (LibKernel::Memory::IsCommittedRange(destination, bytes)) {
+				std::memcpy(reinterpret_cast<void*>(destination), data, bytes);
+			}
 		}
 		ResolvePendingGuestGpuWrite(pending);
 		// Only 32-bit writes are fences; 64-bit ones are timestamps that would flood the map.

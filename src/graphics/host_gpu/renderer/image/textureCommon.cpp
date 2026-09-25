@@ -136,8 +136,14 @@ RenderTargetFormatInfo TextureGetRenderTargetFormat(Prospero::ChannelLayout layo
 			return {host_format.format, bytes, host_format.host_to_storage.Then(order_mapping)};
 		}
 	}
-	EXIT("unsupported render-target format combination: layout=%u type=%u order=%u\n",
-	     static_cast<uint32_t>(layout), static_cast<uint32_t>(type), static_cast<uint32_t>(order));
+	// Damaged render-target registers (a stale table or packet); the caller skips the target.
+	static std::atomic<uint32_t> log_count {0};
+	if (log_count.fetch_add(1) < 16) {
+		LOGF("unsupported render-target format combination: layout=%u type=%u order=%u\n",
+		     static_cast<uint32_t>(layout), static_cast<uint32_t>(type),
+		     static_cast<uint32_t>(order));
+	}
+	return {vk::Format::eUndefined, 0, {}};
 }
 
 vk::ComponentMapping TextureGetComponentMapping(uint32_t                        swizzle,

@@ -153,6 +153,7 @@ NativeStorageBuffer(RenderContext& context, const PreparedBindings::BufferSource
 	buffer_offset = static_cast<uint32_t>(adjustment);
 	const vk::DescriptorBufferInfo result {buffer->Handle(), aligned_offset, size + adjustment};
 	FrameCapture::NoteBuffer("buffer", address, size, resource.written);
+	// The game's threads wait on results of GPU-driven dispatches (the load stalled without it).
 	if (resource.written && InGpuDrivenDispatch()) {
 		context.GetBufferCache().RequestWriteback(address, size);
 	}
@@ -954,10 +955,20 @@ TextureBinding RenderExecutor::ResolveTexture(const ShaderRecompiler::IR::ImageR
 	}
 	CheckSampledAlias(address, id.index, static_cast<uint32_t>(image->info.pixel_format),
 	                  image->info.extent.width, image->info.extent.height);
+	const bool stencil_view = image->info.IsDepth() && image->info.HasStencil() &&
+	                          address == image->info.stencil.address;
+	char capture_note[160];
+	std::snprintf(capture_note, sizeof(capture_note),
+	              "%s T#=%08x,%08x,%08x,%08x,%08x,%08x,%08x,%08x",
+	              stencil_view ? "[stencil of depth image]" : "", descriptor.fields[0],
+	              descriptor.fields[1], descriptor.fields[2], descriptor.fields[3],
+	              descriptor.fields[4], descriptor.fields[5], descriptor.fields[6],
+	              descriptor.fields[7]);
 	FrameCapture::NoteTexture(address, id.index, static_cast<uint32_t>(desc.view_info.format),
-	                          image->info.extent.width, image->info.extent.height, storage, nullptr);
+	                          image->info.extent.width, image->info.extent.height, storage,
+	                          FrameCapture::Active() ? capture_note : nullptr);
 	FrameCapture::NoteImageForDump((uint64_t {id.generation} << 32u) | id.index, address,
-	                               storage ? "storage" : "tex");
+	                               storage ? "storage" : (stencil_view ? "depth" : "tex"));
 	return {id, nullptr, std::move(desc)};
 }
 

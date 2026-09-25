@@ -568,14 +568,14 @@ RenderState RenderExecutor::AcquireRenderTargets(CommandBuffer& buffer, RenderCo
 			const auto* modes   = buffer.GetRegisters().GetShaderRegisters().target_output_mode;
 			const auto  mode    = target.target_slot < 8 ? modes[target.target_slot] : 0u;
 			const bool  int_out = mode == 7u || mode == 8u;
-			if (is_int != int_out) {
+			if (is_int || is_int != int_out) {
 				static std::mutex                   seen_mutex;
 				static std::unordered_set<uint64_t> seen;
 				std::lock_guard                     lock(seen_mutex);
 				if (seen.insert((uint64_t {mode} << 32u) | static_cast<uint32_t>(fmt)).second) {
-					LOGF("EXPORT MISMATCH slot=%u mode=%u format=%s rt=0x%016" PRIx64 "\n",
-					     target.target_slot, static_cast<uint32_t>(mode), name.c_str(),
-					     target.desc.info.data.address);
+					LOGF("EXPORT %s slot=%u mode=%u format=%s rt=0x%016" PRIx64 "\n",
+					     is_int != int_out ? "MISMATCH" : "INT", target.target_slot,
+					     static_cast<uint32_t>(mode), name.c_str(), target.desc.info.data.address);
 				}
 			}
 		}
@@ -1034,11 +1034,36 @@ bool RenderExecutor::PrepareDrawRenderState(CommandBuffer& buffer, const DrawCal
                                             uint32_t            render_target_slice_offset,
 	                                        DrawRenderState& state) {
 	state.ps_active = DrawHasActivePixelShader(buffer);
+	// A pixel shader whose colour exports are all masked can still store to images or buffers:
+	// Uncharted composes its lit primary buffer from such a fullscreen draw. It is compiled to
+	// find out, and stays active only when it has those side effects.
+	const bool masked_ps = !state.ps_active && buffer.GetShaders().GetPs().ps_regs.data_addr != 0;
+	if (masked_ps) {
+		state.ps_active = true;
+	}
 	Common::Timer prepare_timer;
 	prepare_timer.Start();
 	{
 		Common::WaitTrace::Scope scope(Common::WaitTrace::Kind::GpuPipeline);
 		RefreshShaders(buffer, draw, state);
+	}
+	if (masked_ps) {
+		const auto* program      = state.ps_input_info.stage.program;
+		bool        side_effects = false;
+		if (program != nullptr) {
+			for (const auto& image: program->info.images) {
+				side_effects |= image.written || image.atomic;
+			}
+			for (const auto& buffer_resource: program->info.buffers) {
+				side_effects |= buffer_resource.written || buffer_resource.atomic;
+			}
+		}
+		if (FrameCapture::Active()) {
+			FrameCapture::NoteMarker(fmt::format("masked-colour draw ps={:016x} side_effects={}",
+			                                     program != nullptr ? program->shader_hash : 0,
+			                                     side_effects ? 1 : 0));
+		}
+		state.ps_active = side_effects;
 	}
 	const auto shaders_ms = prepare_timer.GetTimeS() * 1000.0;
 	uint32_t mrt_mask = 0;
@@ -1438,7 +1463,38 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 			                      d.desc.info.data.address, d.depth_test_enable ? 1 : 0,
 			                      d.depth_write_enable ? 1 : 0, static_cast<int>(d.depth_compare_op),
 			                      d.depth_load_clear_enable ? 1 : 0, d.stencil_test_enable ? 1 : 0,
-			                      static_cast<int>(z.z_info.format), z.z_read_base_addr)
+			                      static_cast<int>(z.z_info.format), z.z_read_base_addr) +
+			              (d.stencil_test_enable
+			                   ? fmt::format(" sfront(ref={:02x} cmp={} cm={:02x} wm={:02x} "
+			                                 "ops={}/{}/{}) sback(ref={:02x} cmp={} wm={:02x} "
+			                                 "ops={}/{}/{}) sclear={}:{:02x}",
+			                                 d.stencil_front.reference,
+			                                 static_cast<int>(d.stencil_front.compareOp),
+			                                 d.stencil_front.compareMask, d.stencil_front.writeMask,
+			                                 static_cast<int>(d.stencil_front.failOp),
+			                                 static_cast<int>(d.stencil_front.passOp),
+			                                 static_cast<int>(d.stencil_front.depthFailOp),
+			                                 d.stencil_back.reference,
+			                                 static_cast<int>(d.stencil_back.compareOp),
+			                                 d.stencil_back.writeMask,
+			                                 static_cast<int>(d.stencil_back.failOp),
+			                                 static_cast<int>(d.stencil_back.passOp),
+			                                 static_cast<int>(d.stencil_back.depthFailOp),
+			                                 d.stencil_clear_enable ? 1 : 0, d.stencil_clear_value)
+			                   : std::string()) +
+			              fmt::format(" raw(sen={} sfmt={} tv={:02x} m={:02x} wm={:02x} ov={:02x} "
+			                          "ops={}/{}/{} func={} swd={})",
+			                          buffer.GetRegisters().GetDepthControl().stencil_enable ? 1 : 0,
+			                          static_cast<int>(z.stencil_info.format),
+			                          buffer.GetRegisters().GetStencilMask().stencil_testval,
+			                          buffer.GetRegisters().GetStencilMask().stencil_mask,
+			                          buffer.GetRegisters().GetStencilMask().stencil_writemask,
+			                          buffer.GetRegisters().GetStencilMask().stencil_opval,
+			                          buffer.GetRegisters().GetStencilControl().stencil_fail,
+			                          buffer.GetRegisters().GetStencilControl().stencil_zpass,
+			                          buffer.GetRegisters().GetStencilControl().stencil_zfail,
+			                          buffer.GetRegisters().GetDepthControl().stencilfunc,
+			                          z.depth_view.stencil_write_disable ? 1 : 0)
 			        : fmt::format("depth=none zfmt={} zread=0x{:010x} z_enable={}",
 			                      static_cast<int>(z.z_info.format), z.z_read_base_addr,
 			                      buffer.GetRegisters().GetDepthControl().z_enable ? 1 : 0));

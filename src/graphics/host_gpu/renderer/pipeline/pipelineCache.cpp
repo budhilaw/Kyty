@@ -525,7 +525,11 @@ struct PipelineCache::ProgramCache {
 		};
 		ResetShaderGuestMemoryCache();
 		if (entry != programs.end()) {
-			if (!MaterializeRemembered(entry->second, runtime, user_data, params.Base())) {
+			Libs::LibKernel::Memory::SetSyncShaderReads(stage == ShaderType::Compute);
+			const bool materialized =
+			    MaterializeRemembered(entry->second, runtime, user_data, params.Base());
+			Libs::LibKernel::Memory::SetSyncShaderReads(false);
+			if (!materialized) {
 				// Descriptor tables the guest is rewriting can fail to resolve; skipping this one
 				// draw or dispatch is better than ending the process.
 				static std::atomic<uint32_t> log_count {0};

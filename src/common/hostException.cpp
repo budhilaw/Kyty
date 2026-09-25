@@ -107,8 +107,42 @@ static LONG WINAPI ExceptionFilter(PEXCEPTION_POINTERS exception) noexcept {
 		put_hex(message + 46, exception->ContextRecord->Rsp);
 		DWORD written = 0;
 		WriteFile(GetStdHandle(STD_OUTPUT_HANDLE), message, sizeof(message) - 1, &written, nullptr);
+		// Return addresses into the emulator image, as RVAs, straight from the overflowed stack.
+		static char line[] = " 0000000000000000\n";
+		const auto  module = reinterpret_cast<uint64_t>(GetModuleHandleA(nullptr));
+		const auto* rsp    = reinterpret_cast<const uint64_t*>(exception->ContextRecord->Rsp);
+		for (int i = 0, found = 0; i < 2048 && found < 48; i++) {
+			const auto value = rsp[i];
+			if (value > module && value < module + 0x2000000u) {
+				put_hex(line + 1, value - module);
+				WriteFile(GetStdHandle(STD_OUTPUT_HANDLE), line, sizeof(line) - 1, &written, nullptr);
+				found++;
+			}
+		}
 		return EXCEPTION_CONTINUE_SEARCH;
 	}
+	// Return addresses into the emulator image found on the faulting thread's stack.
+	const auto print_stack_rvas = [&]() {
+		const auto  module = reinterpret_cast<uintptr_t>(GetModuleHandleA(nullptr));
+		const auto* rsp    = reinterpret_cast<const uintptr_t*>(exception->ContextRecord->Rsp);
+		printf("  pc rva=%llx stack rva:",
+		       static_cast<unsigned long long>(
+		           reinterpret_cast<uintptr_t>(exception_record->ExceptionAddress) - module));
+		for (int i = 0, found = 0; i < 4096 && found < 48; i++) {
+			MEMORY_BASIC_INFORMATION mbi {};
+			if ((i % 512) == 0 &&
+			    (VirtualQuery(rsp + i, &mbi, sizeof(mbi)) == 0 || mbi.State != MEM_COMMIT)) {
+				break;
+			}
+			const auto value = rsp[i];
+			if (value > module && value < module + 0x2000000u) {
+				printf(" %llx", static_cast<unsigned long long>(value - module));
+				found++;
+			}
+		}
+		printf("\n");
+		fflush(stdout);
+	};
 
 	ExceptionInfo info {};
 	info.exception_address = reinterpret_cast<uint64_t>(exception_record->ExceptionAddress);
@@ -198,6 +232,7 @@ static LONG WINAPI ExceptionFilter(PEXCEPTION_POINTERS exception) noexcept {
 		       static_cast<unsigned long long>(outer_fault_pc), GetCurrentThreadId(),
 		       static_cast<void*>(GetModuleHandleA(nullptr)));
 		fflush(stdout);
+		print_stack_rvas();
 	}
 	const auto saved_outer = outer_fault_pc;
 	outer_fault_pc         = info.exception_address;
@@ -223,6 +258,7 @@ static LONG WINAPI ExceptionFilter(PEXCEPTION_POINTERS exception) noexcept {
 	           reinterpret_cast<uint64_t>(module)),
 	       static_cast<unsigned long long>(info.access_violation_vaddr), GetCurrentThreadId());
 	fflush(stdout);
+	print_stack_rvas();
 	return EXCEPTION_CONTINUE_SEARCH;
 }
 

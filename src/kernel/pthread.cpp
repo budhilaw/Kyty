@@ -670,6 +670,7 @@ static int CreateGuestStack(PthreadAttr attr) {
 		attr->stack_user     = true;
 		attr->stack_map_addr = 0;
 		attr->stack_map_size = 0;
+		Memory::NoteGuestStackRange(reinterpret_cast<uint64_t>(attr->stack_addr), attr->stack_size);
 		return OK;
 	}
 

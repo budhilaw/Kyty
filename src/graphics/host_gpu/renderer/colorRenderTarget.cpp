@@ -179,7 +179,7 @@ void RenderExecutor::ResolveRenderColorTarget(CommandBuffer& buffer, RenderColor
 	    TextureGetRenderTargetFormat(rt.info.format, rt.info.channel_type, rt.info.channel_order);
 	const auto bytes_per_element = target_format.bytes_per_element;
 	if (bytes_per_element == 0) {
-		EXIT("render-target format has no valid element size\n");
+		return; // damaged registers: no color output from this slot
 	}
 	const auto transfer_format = ImageOps::RenderTargetTransferFormat(bytes_per_element);
 	TileTextureBlockLayout texture_tile_layout {};
@@ -268,16 +268,16 @@ void RenderExecutor::ResolveRenderColorTarget(CommandBuffer& buffer, RenderColor
 		mip_padded[0] = {pitch, height};
 	}
 	if (size == 0 || (!volume && size > UINT64_MAX / view.image_layers)) {
-		EXIT("render-target memory footprint is invalid\n");
+		return; // damaged registers: no color output from this slot
 	}
 	if (!volume) {
 		backing_size = size * view.image_layers;
 	}
 	if (backing_size == 0) {
-		EXIT("render-target backing is empty\n");
+		return; // damaged registers
 	}
 	if (!GuestRange {rt.base.addr, backing_size}.Valid()) {
-		EXIT("render-target backing range is invalid\n");
+		return; // damaged registers: address past guest memory
 	}
 
 	const vk::Extent2D view_extent = {std::max(width >> rt.view.current_mip_level, 1u),

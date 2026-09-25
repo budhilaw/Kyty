@@ -537,6 +537,22 @@ TranslateResult TranslateProgram(std::span<const uint32_t> code, const CompileOp
 		}
 		return {.skip_dispatch = true};
 	}
+	// Compute code that does not decode is not a shader: Uncharted occasionally dispatches from
+	// an address whose contents have not been written yet. Skipping it beats ending the run.
+	if (options.stage == ShaderType::Compute) {
+		for (const auto& inst: decoded.instructions) {
+			if (inst.opcode == Decoder::Opcode::UNSUPPORTED) {
+				static std::atomic<uint32_t> log_count {0};
+				if (log_count.fetch_add(1) < 16) {
+					Log::WriteToConsoleAndLog(fmt::format(
+					    "Warning: compute shader 0x{:016x} does not decode at pc 0x{:08x} ({}); its "
+					    "dispatches are skipped.\n",
+					    options.shader_hash, inst.pc, Decoder::InstructionToString(inst)));
+				}
+				return {.skip_dispatch = true};
+			}
+		}
+	}
 
 	std::string decoded_dump;
 	if (options.dump_ir) {

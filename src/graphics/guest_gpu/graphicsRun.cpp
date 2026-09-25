@@ -2234,11 +2234,10 @@ void CommandProcessor::DispatchIndirect(uint64_t args_addr, uint32_t mode) {
 	DispatchIndirectArgs args {};
 	// Group counts a GPU pass wrote are stale in the CPU copy; dispatch them from the GPU buffer
 	// through the clamped path (bad counts are clamped instead of hanging the device).
-	// KYTY_GPU_DISPATCH_INDIRECT=1 enables it.
-	// Off by default: it hung the GPU in Uncharted even with clamped counts.
-	// Opt-in (KYTY_GPU_DISPATCH_INDIRECT=1): as the default it washed the selector out white.
-	static const bool no_gpu_dispatch = std::getenv("KYTY_GPU_DISPATCH_INDIRECT") == nullptr;
-	if (!no_gpu_dispatch && (mode & Pm4::COMPUTE_DISPATCH_INITIATOR_USE_THREAD_DIMENSIONS) == 0 &&
+	// Opt-in (KYTY_GPU_DISPATCH_INDIRECT=1): in Uncharted it tripped the game's frame-marker
+	// assert, stalled loading for tens of seconds and ended in null-pointer crashes.
+	static const bool gpu_dispatch = std::getenv("KYTY_GPU_DISPATCH_INDIRECT") != nullptr;
+	if (gpu_dispatch && (mode & Pm4::COMPUTE_DISPATCH_INITIATOR_USE_THREAD_DIMENSIONS) == 0 &&
 	    Libs::LibKernel::Memory::IsGpuWrittenRange(args_addr, sizeof(args))) {
 		m_sh_ctx.SetCsWaveSize(Pm4::ComputeWaveSize(mode));
 		m_renderer.GetRenderExecutor().Dispatch(m_submit_id, CurrentBuffer(), 1, 1, 1, mode,
@@ -2329,17 +2328,33 @@ void CommandProcessor::WriteAtEndOfPipe(uint32_t cache_policy, uint32_t event_wr
 
 	EXIT_NOT_IMPLEMENTED(cache_policy != 0x00000000);
 	EXIT_NOT_IMPLEMENTED(event_write_dest != 0x00000000);
-	if (dst_gpu_addr != nullptr &&
-	    !Libs::LibKernel::Memory::IsCommittedRange(reinterpret_cast<uint64_t>(dst_gpu_addr),
-	                                               sizeof(T))) {
-		// A damaged packet named unmapped memory; the host write crashed the emulator.
+	// A damaged packet can name unmapped memory (the host store crashed the emulator). Only the
+	// store is skipped: the fence is still recorded and its interrupt still fires. Returning
+	// early here dropped completions the game waits on and left the intro at 1 fps.
+	// Fences live in memory the direct mapping may not show as committed (GPU-owned pages are
+	// read and written through the backing alias, as WaitRegMem does), so the store goes
+	// through the alias first and falls back to the direct mapping only when it is committed.
+	const auto dst_address  = reinterpret_cast<uint64_t>(dst_gpu_addr);
+	const auto store_fence  = [&](const void* data, size_t bytes) {
+		if (dst_gpu_addr == nullptr ||
+		    Libs::LibKernel::Memory::TryWriteBacking(dst_address, data, bytes)) {
+			return;
+		}
+		if (Libs::LibKernel::Memory::IsCommittedRange(dst_address, bytes)) {
+			std::memcpy(dst_gpu_addr, data, bytes);
+			return;
+		}
 		static std::atomic<uint32_t> log_count {0};
 		if (log_count.fetch_add(1) < 16) {
-			LOGF("WriteAtEndOfPipe: skipped write to unmapped 0x%016" PRIx64 "\n",
-			     reinterpret_cast<uint64_t>(dst_gpu_addr));
+			LOGF("WriteAtEndOfPipe: store to unmapped 0x%016" PRIx64 " skipped, event kept\n",
+			     dst_address);
 		}
-		return;
-	}
+	};
+	T probe {};
+	const bool dst_writable =
+	    dst_gpu_addr == nullptr ||
+	    Libs::LibKernel::Memory::TryReadBacking(dst_address, &probe, sizeof(T)) ||
+	    Libs::LibKernel::Memory::IsCommittedRange(dst_address, sizeof(T));
 
 	bool with_interrupt = false;
 	switch (interrupt_selector) {
@@ -2360,7 +2375,7 @@ void CommandProcessor::WriteAtEndOfPipe(uint32_t cache_policy, uint32_t event_wr
 	auto write32 = [&](bool with_writeback) {
 		auto* dst  = static_cast<uint32_t*>(dst_gpu_addr);
 		auto  data = static_cast<uint32_t>(value);
-		std::memcpy(dst, &data, sizeof(data));
+		store_fence(&data, sizeof(data));
 
 		if (with_interrupt) {
 			if (with_writeback) {
@@ -2383,11 +2398,13 @@ void CommandProcessor::WriteAtEndOfPipe(uint32_t cache_policy, uint32_t event_wr
 			if constexpr (sizeof(T) == sizeof(uint32_t)) {
 				if (eop_event_type == 0x2f && cache_action == 0x00 && event_index == 0x06) {
 					auto* dst = static_cast<uint32_t*>(dst_gpu_addr);
-					SynchronizeGpu();
-					Sync::ReadGds(*m_renderer.GetBufferCache().GetGdsBuffer(), dst, value & 0xffffu,
-					              value >> 16u);
-					Sync::WriteAtEndOfPipeGds32(m_submit_id, command, dst, value & 0xffffu,
-					                            value >> 16u);
+					if (dst_writable) {
+						SynchronizeGpu();
+						Sync::ReadGds(*m_renderer.GetBufferCache().GetGdsBuffer(), dst,
+						              value & 0xffffu, value >> 16u);
+						Sync::WriteAtEndOfPipeGds32(m_submit_id, command, dst, value & 0xffffu,
+						                            value >> 16u);
+					}
 					if (with_interrupt) {
 						m_renderer.TriggerInterrupt(m_interrupt_event_id, interrupt_context_id);
 					}
@@ -2414,7 +2431,7 @@ void CommandProcessor::WriteAtEndOfPipe(uint32_t cache_policy, uint32_t event_wr
 				}
 				auto write64 = [&](bool with_writeback) {
 					auto* dst = static_cast<uint64_t*>(dst_gpu_addr);
-					std::memcpy(dst, &value, sizeof(value));
+					store_fence(&value, sizeof(value));
 
 					if (with_interrupt) {
 						if (with_writeback) {

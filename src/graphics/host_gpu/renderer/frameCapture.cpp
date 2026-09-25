@@ -5,10 +5,13 @@
 #include "graphics/host_gpu/renderer/cache/streamBuffer.h"
 #include "graphics/host_gpu/renderer/cache/textureCache.h"
 #include "graphics/host_gpu/renderer/commandScheduler.h"
+#include "graphics/host_gpu/renderer/pipeline/pipelineCache.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
 
 #include <algorithm>
+#include <unordered_map>
 #include <atomic>
+#include <bit>
 #include <cinttypes>
 #include <cmath>
 #include <cstdio>
@@ -417,6 +420,21 @@ bool StartDownload(State& s, const CapturedImage& captured, std::vector<PendingD
 	copy.imageExtent                 = vk::Extent3D {width, height, 1};
 	image->Download(std::span(&copy, 1), buffer->Handle(), 0, size);
 	out.push_back({captured, std::move(buffer), format, width, height});
+	// The stencil plane of a depth/stencil image is saved too, as 8-bit unsigned.
+	if (depth32 && image->info.pixel_format == vk::Format::eD32SfloatS8Uint) {
+		const uint64_t stencil_size = static_cast<uint64_t>(width) * height;
+		auto stencil_buffer = std::make_unique<Buffer>(graphics, scheduler, MemoryUsage::Download, 0,
+		                                               vk::BufferUsageFlagBits::eTransferDst,
+		                                               stencil_size);
+		vk::BufferImageCopy stencil_copy {};
+		stencil_copy.imageSubresource.aspectMask = vk::ImageAspectFlagBits::eStencil;
+		stencil_copy.imageSubresource.layerCount = 1;
+		stencil_copy.imageExtent                 = vk::Extent3D {width, height, 1};
+		image->Download(std::span(&stencil_copy, 1), stencil_buffer->Handle(), 0, stencil_size);
+		out.push_back({{captured.key, image->info.stencil.address,
+		                captured.role == "depth" ? std::string("stencil") : captured.role + "_stencil"},
+		               std::move(stencil_buffer), vk::Format::eR8Uint, width, height});
+	}
 	return true;
 }
 
@@ -587,6 +605,50 @@ void NoteBuffer(const char* kind, uint64_t address, uint64_t size, bool written)
 	}
 	s.pending += fmt::format("    {} {} 0x{:010x}..0x{:010x} ({} bytes)\n", kind,
 	                         written ? "WRITE" : "read", address, address + size, size);
+	// Small constant blocks (exposure, focus, counters) are printed as words, as the GPU last
+	// left them: a capture drains the GPU before its draw list is written.
+	if (size <= 64 && size >= 4) {
+		uint32_t words[16] {};
+		if (Libs::LibKernel::Memory::ReadGpuBackingOrDownload(address, words, size & ~uint64_t {3})) {
+			s.pending += "      words:";
+			for (uint64_t i = 0; i < size / 4; i++) {
+				s.pending += fmt::format(" {:08x}({:g})", words[i], std::bit_cast<float>(words[i]));
+			}
+			s.pending += "\n";
+		}
+		return;
+	}
+	// KYTY_FRAME_DUMP_CS=hash: the larger buffers of that compute shader get a word histogram.
+	static const uint64_t histogram_cs = [] {
+		const char* value = std::getenv("KYTY_FRAME_DUMP_CS");
+		return value != nullptr ? std::strtoull(value, nullptr, 16) : 0ull;
+	}();
+	if (histogram_cs != 0 && CurrentWriterShader() == histogram_cs && size >= 4) {
+		const auto            bytes = std::min<uint64_t>(size & ~uint64_t {3}, 1u << 20u);
+		std::vector<uint32_t> words(bytes / 4);
+		if (Libs::LibKernel::Memory::ReadGpuBackingOrDownload(address, words.data(), bytes)) {
+			std::unordered_map<uint32_t, uint32_t> counts;
+			uint32_t                               max_value = 0;
+			for (const auto word: words) {
+				counts[word]++;
+				max_value = std::max(max_value, word);
+			}
+			std::vector<std::pair<uint32_t, uint32_t>> top(counts.begin(), counts.end());
+			std::sort(top.begin(), top.end(),
+			          [](const auto& a, const auto& b) { return a.second > b.second; });
+			s.pending += fmt::format("      histogram: words={} distinct={} max={:#x} zeros={:.1f}%:",
+			                         words.size(), counts.size(), max_value,
+			                         100.0 * counts[0] / static_cast<double>(words.size()));
+			for (size_t i = 0; i < std::min<size_t>(top.size(), 8); i++) {
+				s.pending += fmt::format(" {:#x}x{}", top[i].first, top[i].second);
+			}
+			s.pending += fmt::format("\n      first words:");
+			for (size_t i = 0; i < std::min<size_t>(words.size(), 16); i++) {
+				s.pending += fmt::format(" {:08x}", words[i]);
+			}
+			s.pending += "\n";
+		}
+	}
 }
 
 void NoteMarker(const std::string& text) {

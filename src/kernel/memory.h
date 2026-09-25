@@ -112,6 +112,8 @@ bool                   TryReadBacking(uint64_t vaddr, void* data, uint64_t size)
 bool                   ReadGpuBackingOrDownload(uint64_t vaddr, void* data, uint64_t size);
 // Called at each flip; KYTY_TABLE_SYNC refreshes GPU-built tables once per frame.
 void                   NoteGpuFrame();
+// While set on this thread, shader descriptor reads of GPU-written memory wait for the GPU.
+void                   SetSyncShaderReads(bool enabled);
 bool                   ReadGpuBackingOrPrefetch(uint64_t vaddr, void* data, uint64_t size);
 // Reads GPU-produced indirect arguments with the GPU's latest values (see ReadGpuArgs).
 bool                   ReadGpuArgs(uint64_t vaddr, void* data, uint64_t size);
@@ -196,6 +198,11 @@ bool     ProtectGuestMemory(uint64_t vaddr, uint64_t size, Common::VirtualMemory
                             Common::VirtualMemory::Mode* old_mode = nullptr);
 // Transient PageManager watch state; does not change the guest mapping's semantic protection.
 bool ProtectGuestHostMemory(uint64_t vaddr, uint64_t size, Common::VirtualMemory::Mode mode);
+// Guest thread and fiber stacks supplied by the game: access tracking never removes write
+// access from them, since a fault while pushing the exception frame ends the process silently.
+void NoteGuestStackRange(uint64_t vaddr, uint64_t size);
+// Diagnostic before a GPU readback overwrites guest memory: logs guest pointers it would zero.
+void CheckReadbackClobber(uint64_t vaddr, const void* data, uint64_t size, const char* who);
 bool FreeGuestMemory(uint64_t vaddr, uint64_t size);
 
 #if defined(KYTY_VIRTUAL_MEMORY_ALLOCATION_TESTS)

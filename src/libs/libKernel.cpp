@@ -2549,6 +2549,8 @@ int32_t KYTY_SYSV_ABI FiberInitialize(FiberObject* fiber, const char* name, Fibe
 
 	if (addr_context != nullptr) {
 		*static_cast<uint64_t*>(addr_context) = FIBER_STACK_MAGIC;
+		LibKernel::Memory::NoteGuestStackRange(reinterpret_cast<uint64_t>(addr_context),
+		                                       size_context);
 	}
 
 	LOGF("\t fiber init: %s, entry = 0x%016" PRIx64 ", context = 0x%016" PRIx64 ", size = %" PRIu64

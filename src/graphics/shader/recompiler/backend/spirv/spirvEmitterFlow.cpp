@@ -4,6 +4,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <cstdlib>
 
 namespace Libs::Graphics::ShaderRecompiler::Spirv::Emitter {
 namespace {
@@ -310,6 +311,15 @@ uint32_t ExportVector(ValueEmitContext& ctx, uint32_t data, const IR::ExportInfo
 		}
 	}
 	if (uint_output) {
+		// Experiment (KYTY_MRT2_HIGH_BIT=1): Uncharted's deferred lighting lights only pixels
+		// whose G-buffer class byte (MRT2) has bit 7 set, which no pixel shader export carries.
+		static const bool mrt2_high_bit = std::getenv("KYTY_MRT2_HIGH_BIT") != nullptr;
+		if (mrt2_high_bit && exp.index == 2u) {
+			const auto flagged = state.builder.AllocateId();
+			state.builder.AddFunction(spv::OpBitwiseOr, TypeU32(state), flagged, raw[0],
+			                          ConstantU32(state, 0x80u));
+			raw[0] = flagged;
+		}
 		const auto vector = state.builder.AllocateId();
 		state.builder.AddFunction(spv::OpCompositeConstruct, TypeU32Vector(state, 4), vector,
 		                          raw[0], raw[1], raw[2], raw[3]);

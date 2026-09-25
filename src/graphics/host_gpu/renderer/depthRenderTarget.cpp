@@ -23,6 +23,7 @@
 #include <mutex>
 #include <algorithm>
 #include <array>
+#include <cstdlib>
 #include <atomic>
 #include <cmath>
 #include <cstdarg>
@@ -405,6 +406,16 @@ void RenderExecutor::ResolveRenderDepthTarget(CommandBuffer& buffer, RenderDepth
 			                          .reference = sm.stencil_testval_bf});
 		} else {
 			r.stencil_back = r.stencil_front;
+		}
+		// Experiment (KYTY_STENCIL_HIGH_BIT=1): Uncharted's lighting pass lights only pixels whose
+		// stencil has bit 7 set, which no replacement in the captured register state writes.
+		static const bool high_bit = std::getenv("KYTY_STENCIL_HIGH_BIT") != nullptr;
+		if (high_bit) {
+			for (auto* face: {&r.stencil_front, &r.stencil_back}) {
+				if (face->passOp == vk::StencilOp::eReplace && (face->writeMask & 0x80u) != 0) {
+					face->reference |= 0x80u;
+				}
+			}
 		}
 	}
 	auto& cache = m_context.GetTextureCache();

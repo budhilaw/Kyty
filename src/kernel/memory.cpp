@@ -908,6 +908,11 @@ bool TryReadGpuCleanBacking(uint64_t vaddr, void* data, uint64_t size) {
 }
 
 std::atomic<uint64_t> g_gpu_frame_epoch {0};
+thread_local bool     g_sync_shader_reads = false;
+
+void SetSyncShaderReads(bool enabled) {
+	g_sync_shader_reads = enabled;
+}
 
 void NoteGpuFrame() {
 	g_gpu_frame_epoch.fetch_add(1, std::memory_order_acq_rel);
@@ -973,6 +978,17 @@ bool ReadGpuArgs(uint64_t vaddr, void* data, uint64_t size) {
 	if (TryReadGpuCleanBacking(vaddr, data, size)) {
 		return true;
 	}
+	// GPU-written arguments are fetched from the GPU's copy (page-cached, one drain per page and
+	// per recorded write). Uncharted's 19 tile-lighting dispatches per frame had zero counts in
+	// the stale CPU copy and never ran. KYTY_NO_ARGS_PEEK=1 disables.
+	static const bool args_peek = std::getenv("KYTY_NO_ARGS_PEEK") == nullptr;
+	// Dispatch triples only: draw arguments run from the GPU buffer through the clamp pass, and
+	// peeking them (a drain each) took the selector from 18 to 8 fps.
+	if (args_peek && size == 12 && g_gpu_resources != nullptr && Graphics::GuestGpu::IsGpuThread() &&
+	    IsGpuAddressRange(vaddr, size) && g_gpu_resources->IsMapped(vaddr, size) &&
+	    GetGpuResources().GetBufferCache().PeekGpuRange(vaddr, size, data, 100'000'000ull)) {
+		return true;
+	}
 	{
 		// How often the stale CPU copy is what the host ends up using, by argument size
 		// (12 = dispatch, 16 = draw, 20 = indexed draw, 4 = draw count).
@@ -1016,6 +1032,33 @@ bool ReadGpuBackingOrPrefetch(uint64_t vaddr, void* data, uint64_t size) {
 	if (sync) {
 		return ReadGpuBackingOrDownload(vaddr, data, size);
 	}
+	// KYTY_PEEK_VERIFY=1: every compute-stage descriptor read is also fetched from the GPU and
+	// compared with the CPU copy; differences name tables the GPU wrote behind the tracker.
+	static const bool verify = std::getenv("KYTY_PEEK_VERIFY") != nullptr;
+	if (verify && g_sync_shader_reads && g_gpu_resources != nullptr &&
+	    Graphics::GuestGpu::IsGpuThread() && size <= 64 && IsGpuAddressRange(vaddr, size) &&
+	    g_gpu_resources->IsMapped(vaddr, size)) {
+		uint8_t cpu[64] {};
+		uint8_t gpu[64] {};
+		const bool have_cpu = TryReadBacking(vaddr, cpu, size);
+		const bool have_gpu =
+		    GetGpuResources().GetBufferCache().PeekGpuRange(vaddr, size, gpu, 100'000'000ull);
+		if (have_cpu && have_gpu && std::memcmp(cpu, gpu, size) != 0) {
+			static std::atomic<uint32_t> log_count {0};
+			if (log_count.fetch_add(1) < 64) {
+				LOGF("PEEKVERIFY 0x%016" PRIx64 "+%u cpu=%08x %08x gpu=%08x %08x clean=%d\n", vaddr,
+				     static_cast<unsigned>(size), *reinterpret_cast<uint32_t*>(cpu),
+				     size >= 8 ? *reinterpret_cast<uint32_t*>(cpu + 4) : 0u,
+				     *reinterpret_cast<uint32_t*>(gpu),
+				     size >= 8 ? *reinterpret_cast<uint32_t*>(gpu + 4) : 0u,
+				     TryReadGpuCleanBacking(vaddr, cpu, size) ? 1 : 0);
+			}
+		}
+		if (have_gpu) {
+			std::memcpy(data, gpu, size);
+			return true;
+		}
+	}
 	if (TryReadGpuCleanBacking(vaddr, data, size)) {
 		return true;
 	}
@@ -1027,6 +1070,17 @@ bool ReadGpuBackingOrPrefetch(uint64_t vaddr, void* data, uint64_t size) {
 	// frame old, and passes resolved from it read garbage. KYTY_TABLE_SYNC=1 drains the GPU the
 	// first time each 1 MiB table region is read in a frame, so every resolution in that frame
 	// sees this frame's tables; later reads of the region reuse that copy without draining again.
+	// Compute passes resolve their descriptors from tables a GPU pass wrote moments earlier
+	// (Uncharted's tile lighting); every stale copy of a ring-allocated table is garbage, so
+	// those reads wait for the GPU. Draws read one stable dword each and use the last copy: a
+	// drain per draw ran at 1 fps. KYTY_NO_COMPUTE_SYNC=1 disables the waits.
+	static const bool compute_sync = std::getenv("KYTY_NO_COMPUTE_SYNC") == nullptr;
+	if (compute_sync && g_sync_shader_reads) {
+		if (GetGpuResources().GetBufferCache().PeekGpuRange(vaddr, size, data, 100'000'000ull)) {
+			return true;
+		}
+		return TryReadBacking(vaddr, data, size);
+	}
 	// Opt-in (KYTY_TABLE_SYNC=1). The wait is bounded: a
 	// submission can depend on async-compute work this thread has not processed yet, and an
 	// unbounded drain deadlocked the intro. On timeout the last copy is used for this frame.
@@ -3897,9 +3951,86 @@ bool ProtectGuestMemory(uint64_t vaddr, uint64_t size, VirtualMemory::Mode mode,
 	return true;
 }
 
+static std::mutex                                   g_guest_stack_mutex;
+static std::vector<std::pair<uint64_t, uint64_t>>   g_guest_stacks;
+
+void CheckReadbackClobber(uint64_t vaddr, const void* data, uint64_t size, const char* who) {
+	static const bool            enabled = std::getenv("KYTY_CLOBBER_CHECK") != nullptr;
+	static std::atomic<uint32_t> log_count {0};
+	if (!enabled || log_count.load(std::memory_order_relaxed) >= 64 || size < 8) {
+		return;
+	}
+	const auto first = (vaddr + 7u) & ~uint64_t {7};
+	for (auto address = first; address + 8 <= vaddr + size; address += 8) {
+		uint64_t current = 0;
+		if (!TryReadBacking(address, &current, 8)) {
+			return;
+		}
+		uint64_t incoming = 0;
+		std::memcpy(&incoming, static_cast<const uint8_t*>(data) + (address - vaddr), 8);
+		const bool pointer = current >= 0x0800000000ull && current < 0x2000000000ull;
+		if (pointer && incoming != current && (incoming < 0x0800000000ull ||
+		                                       incoming >= 0x2000000000ull)) {
+			if (log_count.fetch_add(1) < 64) {
+				LOGF("CLOBBER %s range=0x%016" PRIx64 "+0x%" PRIx64 " at 0x%016" PRIx64
+				     " guest=0x%016" PRIx64 " gpu=0x%016" PRIx64 "\n",
+				     who, vaddr, size, address, current, incoming);
+			}
+			return;
+		}
+	}
+}
+
+void NoteGuestStackRange(uint64_t vaddr, uint64_t size) {
+	if (vaddr == 0 || size == 0) {
+		return;
+	}
+	std::lock_guard lock(g_guest_stack_mutex);
+	for (const auto& [begin, end]: g_guest_stacks) {
+		if (begin == vaddr && end == vaddr + size) {
+			return;
+		}
+	}
+	g_guest_stacks.emplace_back(vaddr, vaddr + size);
+}
+
 bool ProtectGuestHostMemory(uint64_t vaddr, uint64_t size, VirtualMemory::Mode mode) {
 	if (g_guest_address_space == nullptr) {
 		return false;
+	}
+	// A stack that loses write access kills the process at the first push (the exception
+	// frame cannot be stored), so the stack parts of a tracked range keep their access.
+	if ((static_cast<uint32_t>(mode) & static_cast<uint32_t>(VirtualMemory::Mode::Write)) == 0) {
+		std::vector<std::pair<uint64_t, uint64_t>> stacks;
+		{
+			std::lock_guard lock(g_guest_stack_mutex);
+			for (const auto& [begin, end]: g_guest_stacks) {
+				if (begin < vaddr + size && end > vaddr) {
+					stacks.emplace_back(std::max(begin, vaddr), std::min(end, vaddr + size));
+				}
+			}
+		}
+		if (!stacks.empty()) {
+			std::sort(stacks.begin(), stacks.end());
+			static std::atomic<uint32_t> log_count {0};
+			if (log_count.fetch_add(1) < 8) {
+				LOGF("Memory: tracked range 0x%016" PRIx64 "+0x%" PRIx64
+				     " overlaps a guest stack at 0x%016" PRIx64 "; stack pages stay writable\n",
+				     vaddr, size, stacks.front().first);
+			}
+			auto cursor = vaddr;
+			bool ok     = true;
+			for (const auto& [begin, end]: stacks) {
+				if (begin > cursor) {
+					ok &= ProtectGuestHostMemory(cursor, begin - cursor, mode);
+				}
+				cursor = std::max(cursor, end);
+			}
+			if (cursor < vaddr + size) {
+				ok &= ProtectGuestHostMemory(cursor, vaddr + size - cursor, mode);
+			}
+			return ok;
+		}
 	}
 	// Access tracking must never remove execute rights from code that shares a tracked range.
 	std::vector<std::pair<uint64_t, uint64_t>> code;
