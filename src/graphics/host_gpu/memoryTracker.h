@@ -30,6 +30,10 @@ public:
 	void               MarkRegionAsGpuModified(uint64_t vaddr, uint64_t size);
 	void               UnmarkRegionAsGpuModified(uint64_t vaddr, uint64_t size);
 	void               UntrackMemory(uint64_t vaddr, uint64_t size);
+	// Moves whenever any page becomes CPU-modified; lets callers skip re-syncing when it has not.
+	[[nodiscard]] uint64_t CpuGeneration() const {
+		return m_cpu_generation.load(std::memory_order_acquire);
+	}
 	// Removes protection from a range and flushes GPU-owned data when required.
 	template <typename Flush>
 	void InvalidateRegion(uint64_t vaddr, uint64_t size, Flush&& on_flush) noexcept {
@@ -46,6 +50,7 @@ public:
 					return true;
 				}
 				manager->ChangeState<DirtySource::Cpu, true>(manager->GetCpuAddr() + offset, bytes);
+				m_cpu_generation.fetch_add(1, std::memory_order_acq_rel);
 				return false;
 			}();
 			if (should_flush) {
@@ -151,6 +156,7 @@ private:
 
 	std::unique_ptr<std::atomic<RegionManager*>[]> m_regions;
 	std::vector<std::unique_ptr<RegionManager>>    m_region_storage;
+	std::atomic<uint64_t>                          m_cpu_generation {0};
 	std::mutex                                     m_region_mutex;
 	PageManager&                                   m_page_manager;
 };

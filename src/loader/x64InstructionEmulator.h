@@ -10,6 +10,8 @@ namespace Loader::X64InstructionEmulator {
                                          const ZydisDecodedOperand* operands);
 uint64_t           PatchReciprocalSquareRoots(uint64_t address, uint64_t size);
 [[nodiscard]] bool TryEmulate(void* native_context);
+// Moves RIP past the instruction at RIP (decoded with Zydis); false if it cannot be decoded.
+[[nodiscard]] bool SkipFaultingInstruction(void* native_context);
 
 } // namespace Loader::X64InstructionEmulator
 

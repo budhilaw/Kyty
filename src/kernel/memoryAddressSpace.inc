@@ -105,6 +105,7 @@ public:
 			UnmapViewPreservePlaceholder(reinterpret_cast<void*>(entry.vaddr), entry.size);
 		}
 		m_maps.clear();
+		m_maps_generation.fetch_add(1, std::memory_order_acq_rel);
 		if (m_backing_base != nullptr) {
 			UnmapViewOfFile(m_backing_base);
 		}
@@ -117,6 +118,7 @@ public:
 			    !UnmapViewPreservePlaceholder(reinterpret_cast<void*>(entry.vaddr), entry.size));
 		}
 		m_maps.clear();
+		m_maps_generation.fetch_add(1, std::memory_order_acq_rel);
 		if (m_backing_base != nullptr) {
 			munmap(m_backing_base, m_size);
 		}
@@ -246,6 +248,7 @@ public:
 
 		{
 			std::lock_guard lock(m_mutex);
+			m_maps_generation.fetch_add(1, std::memory_order_acq_rel);
 			EXIT_IF(!m_maps.emplace(vaddr, MapEntry {vaddr, size, backing_offset, mode}).second);
 		}
 		SetFailure(failure_reason, FailureReason::None);
@@ -257,6 +260,7 @@ public:
 		}
 		{
 			std::lock_guard lock(m_mutex);
+			m_maps_generation.fetch_add(1, std::memory_order_acq_rel);
 			EXIT_IF(!m_maps.emplace(vaddr, MapEntry {vaddr, size, backing_offset, mode}).second);
 		}
 		SetFailure(failure_reason, FailureReason::None);
@@ -277,6 +281,7 @@ public:
 		std::vector<MapEntry> targets;
 		{
 			std::lock_guard lock(m_mutex);
+			m_maps_generation.fetch_add(1, std::memory_order_acq_rel);
 			auto            current = vaddr;
 			while (current < end) {
 				MapEntry entry {};
@@ -341,6 +346,7 @@ public:
 		MapEntry old {};
 		{
 			std::lock_guard lock(m_mutex);
+			m_maps_generation.fetch_add(1, std::memory_order_acq_rel);
 			auto            next = m_maps.upper_bound(vaddr);
 			if (next != m_maps.begin()) {
 				auto entry = std::prev(next);
@@ -369,6 +375,7 @@ public:
 			    UnmapViewPreservePlaceholder(reinterpret_cast<void*>(old.vaddr), old.size);
 			if (!unmapped) {
 				std::lock_guard lock(m_mutex);
+				m_maps_generation.fetch_add(1, std::memory_order_acq_rel);
 				m_maps.emplace(old.vaddr, old);
 				return false;
 			}
@@ -417,6 +424,7 @@ public:
 			return false;
 		}
 		std::lock_guard lock(m_mutex);
+		m_maps_generation.fetch_add(1, std::memory_order_acq_rel);
 		m_maps.emplace(old.vaddr, old);
 		return false;
 #else
@@ -427,6 +435,7 @@ public:
 		}
 
 		std::lock_guard lock(m_mutex);
+		m_maps_generation.fetch_add(1, std::memory_order_acq_rel);
 		m_maps.erase(old.vaddr);
 		if (left_size != 0) {
 			m_maps.emplace(old.vaddr,
@@ -484,6 +493,23 @@ private:
 			uint64_t data_offset;
 			uint64_t bytes;
 		};
+		// Shader resource materialization reads guest memory a dword at a time; the last
+		// mapping this thread used answers most of those without the lock and map lookup.
+		struct LastLookup {
+			const void* owner      = nullptr;
+			uint64_t    generation = 0;
+			MapEntry    entry {};
+		};
+		static thread_local LastLookup last;
+		if (last.owner == this &&
+		    last.generation == m_maps_generation.load(std::memory_order_acquire) &&
+		    vaddr >= last.entry.vaddr && vaddr + size <= last.entry.vaddr + last.entry.size) {
+			const auto offset = last.entry.backing_offset + vaddr - last.entry.vaddr;
+			if (RangeOk(offset, size)) {
+				transfer(m_backing_base + offset, 0, static_cast<size_t>(size));
+				return true;
+			}
+		}
 		std::array<Segment, 8> inline_segments {};
 		std::vector<Segment>   extra_segments;
 		size_t                 count = 0;
@@ -500,6 +526,9 @@ private:
 				const auto offset = entry.backing_offset + current - entry.vaddr;
 				if (!RangeOk(offset, bytes)) {
 					return false;
+				}
+				if (current == vaddr && bytes == size) {
+					last = {this, m_maps_generation.load(std::memory_order_acquire), entry};
 				}
 				const Segment segment {offset, current - vaddr, bytes};
 				if (count < inline_segments.size()) {
@@ -656,6 +685,8 @@ private:
 	uint64_t                     m_size         = 0;
 	std::mutex                   m_mutex;
 	std::map<uint64_t, MapEntry> m_maps;
+	// Bumped on every change to m_maps; validates the per-thread lookup cache.
+	std::atomic<uint64_t>        m_maps_generation {1};
 };
 
 class GuestAddressSpace {

@@ -205,7 +205,8 @@ bool IsSupportedDepthTextureEncoding(const ShaderTextureResource& descriptor, bo
 	       descriptor.TileMode() == Prospero::TileMode::kDepth;
 }
 
-static void ValidateSampledDepthBinding(const ShaderRecompiler::IR::ImageResource& resource,
+// False when the binding cannot be sampled; the caller binds a null texture instead.
+static bool ValidateSampledDepthBinding(const ShaderRecompiler::IR::ImageResource& resource,
                                         const ShaderTextureResource& descriptor, const Image& image,
                                         vk::Format view_format, uint64_t size) {
 	const bool resource_ok = IsSupportedSampledDepthResource(resource);
@@ -213,7 +214,7 @@ static void ValidateSampledDepthBinding(const ShaderRecompiler::IR::ImageResourc
 	const bool view_ok =
 	    IsSupportedSampledDepthView(image.info.pixel_format, view_format, descriptor.DstSelXYZW());
 	if (resource_ok && encoding_ok && view_ok) {
-		return;
+		return true;
 	}
 	if (resource_ok && view_ok) {
 		// Metadata controls the host does not model; the depth data itself is still sampled.
@@ -225,12 +226,17 @@ static void ValidateSampledDepthBinding(const ShaderRecompiler::IR::ImageResourc
 			     descriptor.fields[3], descriptor.fields[4], descriptor.fields[5],
 			     descriptor.fields[6], descriptor.fields[7]);
 		}
-		return;
+		return true;
+	}
+	// A damaged or racing descriptor (seen in Uncharted's menu) must not end the process.
+	static std::atomic<uint32_t> unsupported_log_count {0};
+	if (unsupported_log_count.fetch_add(1) >= 16) {
+		return false;
 	}
 	const auto descriptor_pitch =
 	    TileGetTexturePitch(descriptor.Format(), static_cast<uint32_t>(descriptor.Width5()) + 1u,
 	                        descriptor.TileMode());
-	EXIT("unsupported sampled depth image: resource=%d encoding=%d view=%d "
+	LOGF("unsupported sampled depth image, bound as null: resource=%d encoding=%d view=%d "
 	     "class=%u numeric=%u dimension=%u mip_mode=%u read=%d written=%d atomic=%d compare=%d "
 	     "guest_format=%u swizzle=0x%03x image_format=%d view_format=%d image_layers=%u "
 	     "descriptor_type=%u base_array=%u depth=%u descriptor_pitch=%u target_pitch=%u "
@@ -247,6 +253,7 @@ static void ValidateSampledDepthBinding(const ShaderRecompiler::IR::ImageResourc
 	     descriptor_pitch, image.info.pitch, descriptor.Base40(), size, descriptor.fields[0],
 	     descriptor.fields[1], descriptor.fields[2], descriptor.fields[3], descriptor.fields[4],
 	     descriptor.fields[5], descriptor.fields[6], descriptor.fields[7]);
+	return false;
 }
 
 static bool IsSupportedStorageTextureDescriptor(const ShaderRecompiler::IR::ImageResource& resource,
@@ -610,6 +617,27 @@ TextureBinding RenderExecutor::ResolveTexture(const ShaderRecompiler::IR::ImageR
 			     descriptor.fields[7]);
 		}
 		descriptor.fields[4] = descriptor.fields[5] = descriptor.fields[6] = descriptor.fields[7] = 0;
+	} else if (!resource.r128) {
+		// Descriptor tables indexed at run time mix 128-bit descriptors with other data, and the
+		// shader cannot tell us which. Uncharted's lighting passes (c18870abe4edd2fd, a874...)
+		// read 1280x720 inputs whose dwords 4-7 are floats (7680 "layers"); nulling them left the
+		// lighting without its occlusion terms and the scene burned out white. When the upper
+		// half makes an array or volume impossible, read the descriptor as 128-bit.
+		const auto upper_type = TextureType(descriptor);
+		const bool upper_layered = upper_type == Prospero::ImageType::kColor1DArray ||
+		                           upper_type == Prospero::ImageType::kColor2DArray ||
+		                           upper_type == Prospero::ImageType::kColor2DMsaaArray ||
+		                           upper_type == Prospero::ImageType::kColor3D;
+		if (upper_layered && static_cast<uint32_t>(descriptor.Depth()) + 1u > 2048u) {
+			static std::atomic<uint32_t> log_count {0};
+			if (log_count.fetch_add(1) < 8) {
+				LOGF("TEXDESC: impossible depth %u, reading as 128-bit: %08x,%08x,%08x,%08x\n",
+				     static_cast<uint32_t>(descriptor.Depth()) + 1u, descriptor.fields[4],
+				     descriptor.fields[5], descriptor.fields[6], descriptor.fields[7]);
+			}
+			descriptor.fields[4] = descriptor.fields[5] = descriptor.fields[6] =
+			    descriptor.fields[7] = 0;
+		}
 	}
 	const bool storage = resource.written;
 	if (storage) {
@@ -832,9 +860,16 @@ TextureBinding RenderExecutor::ResolveTexture(const ShaderRecompiler::IR::ImageR
 		image = &texture_cache.GetImage(id);
 	} else if (image->info.IsDepth()) {
 		if (storage) {
-			EXIT("depth target cannot be bound as a storage image\n");
+			static std::atomic<uint32_t> log_count {0};
+			if (log_count.fetch_add(1) < 16) {
+				LOGF("depth target bound as a storage image, bound as null: addr=0x%016" PRIx64 "\n",
+				     address);
+			}
+			return NullTextureBinding(resource, storage, texture_cache);
 		}
-		ValidateSampledDepthBinding(resource, descriptor, *image, pixel_format, size.size);
+		if (!ValidateSampledDepthBinding(resource, descriptor, *image, pixel_format, size.size)) {
+			return NullTextureBinding(resource, storage, texture_cache);
+		}
 	} else if (resource.depth_compare && !storage) {
 		// The guest compares against red; the host cannot compare a colour view, so a depth
 		// placeholder carries the texture's first red value instead.

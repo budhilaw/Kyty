@@ -1585,6 +1585,13 @@ void CommandProcessor::ProcessPm4(Pm4Execution& execution) {
 				valid = known_at(at + len0, len1);
 			}
 			if (!valid) {
+				if (static std::atomic<uint32_t> log_count {0};
+				    len0 != 0 && log_count.fetch_add(1) < 2000) {
+					LOGF("PM4DATA rejected header=0x%08" PRIx32 " op=0x%02" PRIx32 " len=%" PRIu32
+					     " at=0x%05" PRIx32 "/%" PRIu32 " next=0x%08" PRIx32 "\n",
+					     packet_header, opcode, len0, at, total_dw,
+					     at + len0 < total_dw ? cursor.commands[at + len0] : 0u);
+				}
 				Pm4TraceRecord(total_dw - remaining_dw, packet_header, 1);
 				cursor.offset_dw++;
 				execution.m_made_progress = true;

@@ -457,8 +457,15 @@ struct PipelineCache::ProgramCache {
 		ResetShaderGuestMemoryCache();
 		if (entry != programs.end()) {
 			if (!MaterializeRemembered(entry->second, runtime, user_data, params.Base())) {
-				EXIT("shader resources could not be materialized: hash=0x%016" PRIx64 "\n",
-				     params.hash);
+				// Descriptor tables the guest is rewriting can fail to resolve; skipping this one
+				// draw or dispatch is better than ending the process.
+				static std::atomic<uint32_t> log_count {0};
+				if (log_count.fetch_add(1) < 32) {
+					LOGF("shader resources could not be materialized, skipped: hash=0x%016" PRIx64
+					     "\n",
+					     params.hash);
+				}
+				return {};
 			}
 			if (const auto permutation = std::ranges::find_if(
 			        entry->second.permutations, [&](const Permutation& candidate) {

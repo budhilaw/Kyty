@@ -800,6 +800,20 @@ static bool KytyExceptionHandler(const Common::HostException::ExceptionInfo& exc
 			case CoreAccess::Execute: access = GpuAccess::Execute; break;
 			case CoreAccess::Unknown: return false;
 		}
+		// Naughty Dog titles crash on purpose after a failed assert by touching address -1.
+		// Uncharted's frame-marker check trips on emulator timing; step over the access so the
+		// assert is reported but not fatal.
+		if (access != GpuAccess::Execute && info->access_violation_vaddr >= 0xffff800000000000ull &&
+		    Loader::X64InstructionEmulator::SkipFaultingInstruction(info->native_context)) {
+			static std::atomic<uint32_t> skip_count {0};
+			if (skip_count.fetch_add(1) < 16) {
+				std::printf("guest store to 0x%016" PRIx64 " at rip=0x%016" PRIx64
+				            " (crash-on-assert access) skipped\n",
+				            info->access_violation_vaddr, info->exception_address);
+				std::fflush(stdout);
+			}
+			return true;
+		}
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 		{
 			// A page the host never reserved cannot be brought back by the GPU tracker; retrying

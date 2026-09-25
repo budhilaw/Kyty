@@ -78,6 +78,7 @@ public:
 	[[nodiscard]] bool IsRegionGpuModified(uint64_t vaddr, uint64_t size);
 	void               ProcessFaultBuffer();
 	void               SynchronizeBuffersInRange(uint64_t vaddr, uint64_t size);
+	[[nodiscard]] uint64_t CpuGeneration() const { return m_memory_tracker.CpuGeneration(); }
 	void               RunGarbageCollector();
 
 private:

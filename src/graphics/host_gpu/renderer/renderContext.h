@@ -117,6 +117,8 @@ private:
 	std::unique_ptr<GuestGpu> m_gpu;
 	VideoOut::VideoOutDriver* m_video_out = nullptr;
 	bool                      m_fault_process_pending = false;
+	// CPU-write generation at the last full BDA sync; UINT64_MAX forces the next one.
+	uint64_t                  m_bda_synced_generation = UINT64_MAX;
 
 	Common::Mutex                        m_interrupt_mutex;
 	std::vector<InterruptEqRegistration> m_interrupt_eqs;

@@ -41,6 +41,9 @@ struct State {
 	std::string              text;
 	std::vector<CapturedImage> images;
 	bool                     configured = false;
+	// KYTY_FRAME_DUMP_TRIGGER=path: when that file appears, the next frame is captured and the
+	// file is deleted (captures a screen without knowing its frame number).
+	std::string trigger;
 };
 
 State& S() {
@@ -61,6 +64,9 @@ State& S() {
 		}
 		if (const char* dir = std::getenv("KYTY_FRAME_DUMP_DIR"); dir != nullptr) {
 			state.dir = dir;
+		}
+		if (const char* trigger = std::getenv("KYTY_FRAME_DUMP_TRIGGER"); trigger != nullptr) {
+			state.trigger = trigger;
 		}
 	}
 	return state;
@@ -214,6 +220,36 @@ uint32_t TexelBytes(vk::Format format) {
 		case vk::Format::eR32G32B32A32Sfloat:
 		case vk::Format::eR32G32B32A32Uint: return 16;
 		default: return 0;
+	}
+}
+
+// Largest color channel of a float texel before any clamping; false for non-float formats.
+bool RawColorMax(vk::Format format, const uint8_t* src, float& out) {
+	uint16_t h[4] {};
+	float    f[4] {};
+	uint32_t u32 = 0;
+	switch (format) {
+		case vk::Format::eR16Sfloat: std::memcpy(h, src, 2); out = Half(h[0]); return true;
+		case vk::Format::eR16G16Sfloat:
+			std::memcpy(h, src, 4);
+			out = std::max(Half(h[0]), Half(h[1]));
+			return true;
+		case vk::Format::eR16G16B16A16Sfloat:
+			std::memcpy(h, src, 8);
+			out = std::max({Half(h[0]), Half(h[1]), Half(h[2])});
+			return true;
+		case vk::Format::eR32Sfloat: std::memcpy(f, src, 4); out = f[0]; return true;
+		case vk::Format::eR32G32Sfloat: std::memcpy(f, src, 8); out = std::max(f[0], f[1]); return true;
+		case vk::Format::eR32G32B32A32Sfloat:
+			std::memcpy(f, src, 16);
+			out = std::max({f[0], f[1], f[2]});
+			return true;
+		case vk::Format::eB10G11R11UfloatPack32:
+			std::memcpy(&u32, src, 4);
+			out = std::max({SmallFloat(u32 & 0x7ffu, 6), SmallFloat((u32 >> 11u) & 0x7ffu, 6),
+			                SmallFloat((u32 >> 22u) & 0x3ffu, 5)});
+			return true;
+		default: return false;
 	}
 }
 
@@ -371,6 +407,31 @@ void Finish(uint64_t presented_address) {
 			const auto  texel = TexelBytes(item.format);
 			const auto* data  = item.buffer->Mapped().data();
 			std::vector<uint8_t> rgba(static_cast<size_t>(item.width) * item.height * 4u);
+			std::string float_stats;
+			{
+				double   sum     = 0.0;
+				float    max     = 0.0f;
+				uint64_t bad     = 0;
+				uint64_t samples = 0;
+				float    value   = 0.0f;
+				for (size_t i = 0; i < static_cast<size_t>(item.width) * item.height; i++) {
+					if (!RawColorMax(item.format, data + i * texel, value)) {
+						break;
+					}
+					if (!std::isfinite(value)) {
+						bad++;
+						continue;
+					}
+					sum += value;
+					max = std::max(max, value);
+					samples++;
+				}
+				if (samples != 0 || bad != 0) {
+					float_stats = fmt::format(" float_max={:.4g} float_mean={:.4g} nan_inf={}", max,
+					                          samples != 0 ? sum / static_cast<double>(samples) : 0.0,
+					                          bad);
+				}
+			}
 			for (size_t i = 0; i < static_cast<size_t>(item.width) * item.height; i++) {
 				ToRgba(item.format, data + i * texel, rgba.data() + i * 4u);
 			}
@@ -402,10 +463,10 @@ void Finish(uint64_t presented_address) {
 			}
 			WritePng(dir / name, item.width, item.height, rgba);
 			s.text += fmt::format(
-			    "IMAGE {} addr=0x{:010x} {}x{} {} -> {} alpha={}..{} rgb_max={} lit={:.1f}%{}\n",
+			    "IMAGE {} addr=0x{:010x} {}x{} {} -> {} alpha={}..{} rgb_max={} lit={:.1f}%{}{}\n",
 			    item.image.role, item.image.address, item.width, item.height,
 			    vk::to_string(item.format), name, alpha_min, alpha_max, rgb_max,
-			    100.0 * static_cast<double>(lit) / static_cast<double>(rgba.size() / 4),
+			    100.0 * static_cast<double>(lit) / static_cast<double>(rgba.size() / 4), float_stats,
 			    item.image.address == presented_address ? "  [PRESENTED]" : "");
 		}
 	}
@@ -428,10 +489,17 @@ bool Active() {
 
 void OnFlip(uint64_t presented_address) {
 	auto& s = S();
-	if (s.frames.empty()) {
+	if (s.frames.empty() && s.trigger.empty()) {
 		return;
 	}
 	s.flips++;
+	if (!s.trigger.empty() && !s.active && (s.flips % 8) == 0) {
+		std::error_code error;
+		if (std::filesystem::exists(s.trigger, error)) {
+			std::filesystem::remove(s.trigger, error);
+			s.frames.insert(s.flips + 1);
+		}
+	}
 	if (s.active) {
 		Finish(presented_address);
 		s.active = false;
