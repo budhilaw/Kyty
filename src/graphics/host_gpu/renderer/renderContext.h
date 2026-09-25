@@ -88,8 +88,10 @@ public:
 	bool GpuTimerActive() const { return m_timer_enabled && m_timer_current >= 0; }
 	// Rewrites an indirect dispatch's argument triple into a scratch buffer with each count
 	// clamped to the device limit. Returns false when the source has no device address.
+	// Copies indirect arguments into a clamped scratch slot: a dispatch triple, or an indexed
+	// draw when max_indices (indices in the bound index buffer) is non-zero.
 	bool ClampIndirectArgs(vk::CommandBuffer command, const Buffer& source, uint64_t offset,
-	                       vk::Buffer& out_buffer, uint64_t& out_offset);
+	                       vk::Buffer& out_buffer, uint64_t& out_offset, uint32_t max_indices = 0);
 	void GpuTimerReport();
 
 	void AddInterruptEq(LibKernel::EventQueue::KernelEqueue eq, int event_id);

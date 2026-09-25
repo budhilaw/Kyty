@@ -61,13 +61,14 @@ struct ClampPush {
 	uint32_t limit_x;
 	uint32_t limit_y;
 	uint32_t limit_z;
+	uint32_t mode;
 };
 constexpr uint32_t ClampSlots = 4096;
 } // namespace
 
 bool RenderContext::ClampIndirectArgs(vk::CommandBuffer command, const Buffer& source,
                                       uint64_t offset, vk::Buffer& out_buffer,
-                                      uint64_t& out_offset) {
+                                      uint64_t& out_offset, uint32_t max_indices) {
 	if (!source.HasDeviceAddress()) {
 		return false;
 	}
@@ -101,7 +102,7 @@ bool RenderContext::ClampIndirectArgs(vk::CommandBuffer command, const Buffer& s
 		    m_graphics, m_command_scheduler, MemoryUsage::DeviceLocal, 0,
 		    vk::BufferUsageFlagBits::eIndirectBuffer | vk::BufferUsageFlagBits::eStorageBuffer |
 		        vk::BufferUsageFlagBits::eShaderDeviceAddress,
-		    uint64_t {ClampSlots} * 16u);
+		    uint64_t {ClampSlots} * 32u);
 		SetVulkanObjectNameF(m_graphics.device, m_clamp_scratch->Handle(),
 		                     "Kyty.IndirectArgsClamp");
 	}
@@ -109,16 +110,18 @@ bool RenderContext::ClampIndirectArgs(vk::CommandBuffer command, const Buffer& s
 		return false;
 	}
 	const auto  slot  = (m_clamp_slot++) % ClampSlots;
-	const auto  dst   = uint64_t {slot} * 16u;
+	const auto  dst   = uint64_t {slot} * 32u;
 	const auto& limit = m_graphics.physical_device_properties.limits.maxComputeWorkGroupCount;
+	// max_indices != 0 clamps an indexed draw (mode 1) instead of a dispatch.
 	const ClampPush push {source.BufferDeviceAddress() + offset,
-	                      m_clamp_scratch->BufferDeviceAddress() + dst, limit[0], limit[1],
-	                      limit[2]};
+	                      m_clamp_scratch->BufferDeviceAddress() + dst,
+	                      max_indices != 0 ? max_indices : limit[0],
+	                      max_indices != 0 ? (1u << 16u) : limit[1], limit[2],
+	                      max_indices != 0 ? 1u : 0u};
 
 	// The counts may come from a shader or a copy recorded just before this dispatch.
 	vk::MemoryBarrier2 before {};
-	before.srcStageMask = vk::PipelineStageFlagBits2::eComputeShader |
-	                      vk::PipelineStageFlagBits2::eAllTransfer;
+	before.srcStageMask = vk::PipelineStageFlagBits2::eAllCommands;
 	before.srcAccessMask = vk::AccessFlagBits2::eShaderWrite | vk::AccessFlagBits2::eTransferWrite;
 	before.dstStageMask  = vk::PipelineStageFlagBits2::eComputeShader;
 	before.dstAccessMask = vk::AccessFlagBits2::eShaderRead | vk::AccessFlagBits2::eShaderWrite;

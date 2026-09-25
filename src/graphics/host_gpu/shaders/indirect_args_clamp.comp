@@ -1,6 +1,8 @@
-// Copies an indirect dispatch argument triple, clamping each count to the device limit.
-// Guest memory can hold stale words next to the count the GPU wrote; an unbounded
-// dispatch from them stalls or loses the device.
+// Copies indirect arguments into a scratch slot, clamping them to safe values.
+// Mode 0: a dispatch triple, each count clamped to the device limit. Guest memory can hold stale
+// words next to the count the GPU wrote; an unbounded dispatch from them stalls or loses the device.
+// Mode 1: an indexed draw (VkDrawIndexedIndirectCommand). The index range is clamped to the bound
+// index buffer: GPU-culled draws in Uncharted fetched indices past it and lost the device.
 #version 450
 #extension GL_EXT_buffer_reference : require
 #extension GL_EXT_buffer_reference2 : require
@@ -9,7 +11,7 @@
 layout(local_size_x = 1, local_size_y = 1, local_size_z = 1) in;
 
 layout(buffer_reference, std430, buffer_reference_align = 4) buffer ArgsRef {
-    uint words[3];
+    uint words[5];
 };
 
 layout(push_constant) uniform Push {
@@ -18,6 +20,7 @@ layout(push_constant) uniform Push {
     uint     limit_x;
     uint     limit_y;
     uint     limit_z;
+    uint     mode;
 } push;
 
 // Per-dimension clamping alone still allowed 65535^2 groups, which hung the GPU in Uncharted.
@@ -27,6 +30,24 @@ const uint64_t kMaxTotalGroups = 131072ul;
 void main() {
     ArgsRef src = ArgsRef(push.src);
     ArgsRef dst = ArgsRef(push.dst);
+    if (push.mode == 1u) {
+        // limit_x: indices in the bound index buffer; limit_y: largest instance count.
+        uint index_count    = src.words[0];
+        uint instance_count = min(src.words[1], push.limit_y);
+        uint first_index    = src.words[2];
+        if (first_index >= push.limit_x) {
+            index_count = 0u;
+            first_index = 0u;
+        } else {
+            index_count = min(index_count, push.limit_x - first_index);
+        }
+        dst.words[0] = index_count;
+        dst.words[1] = instance_count;
+        dst.words[2] = first_index;
+        dst.words[3] = src.words[3];
+        dst.words[4] = src.words[4];
+        return;
+    }
     uint x = min(src.words[0], push.limit_x);
     uint y = min(src.words[1], push.limit_y);
     uint z = min(src.words[2], push.limit_z);

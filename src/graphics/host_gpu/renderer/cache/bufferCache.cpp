@@ -1297,9 +1297,14 @@ void BufferCache::CopyBuffer(uint64_t dst_vaddr, uint64_t src_vaddr, uint64_t si
 	    size > UINT64_MAX - dst_vaddr || size > UINT64_MAX - src_vaddr || (dst_gds && src_gds) ||
 	    (dst_gds && (dst_vaddr > m_gds_buffer.Size() || size > m_gds_buffer.Size() - dst_vaddr)) ||
 	    (src_gds && (src_vaddr > m_gds_buffer.Size() || size > m_gds_buffer.Size() - src_vaddr))) {
-		EXIT("BufferCache: invalid copy range, src=0x%016" PRIx64 " dst=0x%016" PRIx64
-		     " size=0x%016" PRIx64 " src_gds=%d dst_gds=%d\n",
-		     src_vaddr, dst_vaddr, size, static_cast<int>(src_gds), static_cast<int>(dst_gds));
+		// A damaged DMA packet (Uncharted: src=0, dst=0x1000000001); skip it.
+		static std::atomic<uint32_t> log_count {0};
+		if (log_count.fetch_add(1) < 16) {
+			LOGF("BufferCache: skipped invalid copy range, src=0x%016" PRIx64 " dst=0x%016" PRIx64
+			     " size=0x%016" PRIx64 " src_gds=%d dst_gds=%d\n",
+			     src_vaddr, dst_vaddr, size, static_cast<int>(src_gds), static_cast<int>(dst_gds));
+		}
+		return;
 	}
 	if (dst_memory) {
 		FrameCapture::NoteBuffer("copy-dst", dst_vaddr, size, true);

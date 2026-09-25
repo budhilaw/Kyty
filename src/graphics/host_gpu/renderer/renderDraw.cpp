@@ -1226,6 +1226,23 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 			if (args_buffer != nullptr && (args_offset & 3u) == 0) {
 				gpu_args_buffer = args_buffer->Handle();
 				gpu_args_offset = args_offset;
+				// Culled counts can name indices past the bound index buffer; NVIDIA does not
+				// bounds-check index fetch and lost the device when the Uncharted selector loaded
+				// (every crash stopped in a GPU-culled material draw). The arguments are clamped
+				// into a scratch slot on the GPU first.
+				static const bool no_clamp = std::getenv("KYTY_NO_DRAW_ARGS_CLAMP") != nullptr;
+				vk::Buffer        clamped_buffer;
+				uint64_t          clamped_offset = 0;
+				if (!no_clamp && draw.index_count != 0) {
+					m_context.GetCommandScheduler().EndRendering();
+					if (m_context.ClampIndirectArgs(buffer.Handle(), *args_buffer, args_offset,
+					                                clamped_buffer, clamped_offset,
+					                                draw.index_count)) {
+						gpu_args_buffer = clamped_buffer;
+						gpu_args_offset = clamped_offset;
+						g_indirect_args_written.store(false);
+					}
+				}
 			}
 			if (gpu_args_buffer && g_indirect_args_written.exchange(false)) {
 				m_context.GetCommandScheduler().EndRendering();

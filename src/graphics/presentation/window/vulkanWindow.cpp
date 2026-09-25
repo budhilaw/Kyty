@@ -140,6 +140,9 @@ static uint32_t VulkanFindQueueFamily(vk::PhysicalDevice device, vk::SurfaceKHR 
 	return static_cast<uint32_t>(-1);
 }
 
+// Set when VK_NV_device_diagnostics_config is enabled (KYTY_GPU_DIAG).
+static bool g_nv_diagnostics_config = false;
+
 // NOLINTNEXTLINE(readability-function-cognitive-complexity)
 static void VulkanFindPhysicalDevice(vk::Instance instance, vk::SurfaceKHR surface,
                                      const std::vector<const char*>& device_extensions,
@@ -694,6 +697,15 @@ static vk::Device VulkanCreateDevice(GraphicContext& graphics,
 		fault_features.pNext       = const_cast<void*>(create_info.pNext);
 		create_info.pNext          = &fault_features;
 	}
+	vk::DeviceDiagnosticsConfigCreateInfoNV diagnostics {};
+	if (g_nv_diagnostics_config) {
+		diagnostics.flags = vk::DeviceDiagnosticsConfigFlagBitsNV::eEnableShaderDebugInfo |
+		                    vk::DeviceDiagnosticsConfigFlagBitsNV::eEnableResourceTracking |
+		                    vk::DeviceDiagnosticsConfigFlagBitsNV::eEnableAutomaticCheckpoints |
+		                    vk::DeviceDiagnosticsConfigFlagBitsNV::eEnableShaderErrorReporting;
+		diagnostics.pNext = const_cast<void*>(create_info.pNext);
+		create_info.pNext = &diagnostics;
+	}
 	vk::PhysicalDevicePipelineExecutablePropertiesFeaturesKHR executable_properties {};
 	if (graphics.pipeline_stats_enabled) {
 		executable_properties.pipelineExecutableInfo = VK_TRUE;
@@ -1088,6 +1100,13 @@ void WindowContext::CreateVulkan() {
 		if (HasExtension(available_extensions, VK_EXT_DEVICE_FAULT_EXTENSION_NAME)) {
 			device_extensions.push_back(VK_EXT_DEVICE_FAULT_EXTENSION_NAME);
 			graphic_ctx.device_fault_enabled = true;
+		}
+		// KYTY_GPU_DIAG=1: NVIDIA resource tracking and shader error reporting, so a device
+		// loss reports the faulting address instead of bare instruction pointers.
+		if (std::getenv("KYTY_GPU_DIAG") != nullptr &&
+		    HasExtension(available_extensions, VK_NV_DEVICE_DIAGNOSTICS_CONFIG_EXTENSION_NAME)) {
+			device_extensions.push_back(VK_NV_DEVICE_DIAGNOSTICS_CONFIG_EXTENSION_NAME);
+			g_nv_diagnostics_config = true;
 		}
 		if (std::getenv("KYTY_PIPELINE_STATS") != nullptr &&
 		    HasExtension(available_extensions,
