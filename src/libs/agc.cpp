@@ -3502,13 +3502,7 @@ uint32_t* KYTY_SYSV_ABI AgcDcbDmaData(CommandBuffer* buf, uint8_t engine, uint8_
 
 uint32_t* KYTY_SYSV_ABI AgcDcbJump(CommandBuffer* buf, uint8_t mode, uint8_t cache_policy,
                                    const uint32_t* target, uint32_t size_in_dwords) {
-	PRINT_NAME();
-
-	LOGF("\t mode           = 0x%02" PRIx8 "\n"
-	     "\t cache_policy   = 0x%02" PRIx8 "\n"
-	     "\t target         = 0x%016" PRIx64 "\n"
-	     "\t size_in_dwords = %" PRIu32 "\n",
-	     mode, cache_policy, reinterpret_cast<uint64_t>(target), size_in_dwords);
+	// Called for every chained command buffer; not logged (it was ~20% of the log volume).
 
 	if (buf == nullptr) {
 		return nullptr;

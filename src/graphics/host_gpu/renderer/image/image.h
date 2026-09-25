@@ -155,6 +155,9 @@ public:
 	ImageId          depth_id {};
 	uint64_t         tick_accessed_last = 0;
 	size_t           lru_id             = 0;
+	// Order of the last GPU write among all images (0 = never); picks the newer of two images
+	// that alias the same memory.
+	uint64_t         gpu_write_serial   = 0;
 
 private:
 	friend struct ImageTestAccess;

@@ -932,14 +932,16 @@ void CommandProcessor::DmaData(uint8_t engine, uint8_t dst_sel, uint8_t dst_cach
 	};
 	if (dst_sel == 2) {
 		// kNowhere discards the GL2 prefetch destination without a guest-visible write.
-		if (src_sel != 3) {
-			EXIT("unsupported dmaData nowhere source selector 0x%02" PRIx8 "\n", src_sel);
-		}
 		return;
 	}
 	bool dst_gds = false;
 	if (!decode_gds(dst_sel, dst_gds)) {
-		EXIT("unsupported dmaData destination selector 0x%02" PRIx8 "\n", dst_sel);
+		// Selectors the hardware does not define come from damaged packets: skip the copy.
+		static std::atomic<uint32_t> log_count {0};
+		if (log_count.fetch_add(1) < 16) {
+			LOGF("dmaData with destination selector 0x%02" PRIx8 " skipped\n", dst_sel);
+		}
+		return;
 	}
 	auto& buffer_cache = m_renderer.GetBufferCache();
 	if (src_sel == 2 && !dst_gds &&
@@ -977,11 +979,13 @@ void CommandProcessor::DmaData(uint8_t engine, uint8_t dst_sel, uint8_t dst_cach
 		return;
 	}
 	bool src_gds = false;
-	if (!decode_gds(src_sel, src_gds)) {
-		EXIT("unsupported dmaData source selector 0x%02" PRIx8 "\n", src_sel);
-	}
-	if (src_gds && dst_gds) {
-		EXIT("unsupported dmaData GDS-to-GDS copy\n");
+	if (!decode_gds(src_sel, src_gds) || (src_gds && dst_gds)) {
+		static std::atomic<uint32_t> log_count {0};
+		if (log_count.fetch_add(1) < 16) {
+			LOGF("dmaData with source selector 0x%02" PRIx8 " (dst gds=%d) skipped\n", src_sel,
+			     dst_gds ? 1 : 0);
+		}
+		return;
 	}
 	buffer_cache.CopyBuffer(dst_address_or_offset, src_address_or_offset_or_immediate, num_bytes,
 	                        dst_gds, src_gds);
@@ -1584,6 +1588,23 @@ void CommandProcessor::ProcessPm4(Pm4Execution& execution) {
 			if (valid && at + len0 != total_dw) {
 				valid = known_at(at + len0, len1);
 			}
+			// Register writes decoded from data would corrupt render state; a real one names a
+			// small register offset (plus an index field in the top bits).
+			const auto op0 = opcode;
+			if (valid && (op0 == Pm4::IT_SET_CONTEXT_REG || op0 == Pm4::IT_SET_SH_REG ||
+			              op0 == Pm4::IT_SET_UCONFIG_REG || op0 == Pm4::IT_SET_UCONFIG_REG_INDEX ||
+			              op0 == Pm4::IT_SET_CONFIG_REG)) {
+				valid = len0 >= 3 && (cursor.commands[at + 1] & 0x0fff0000u) == 0 &&
+				        (cursor.commands[at + 1] & 0xffffu) < 0x1000u;
+			}
+			if (valid) {
+				if (static std::atomic<uint32_t> log_count {0}; log_count.fetch_add(1) < 400) {
+					LOGF("PM4DATA accepted header=0x%08" PRIx32 " op=0x%02" PRIx32 " len=%" PRIu32
+					     " body0=0x%08" PRIx32 " next=0x%08" PRIx32 "\n",
+					     packet_header, opcode, len0, len0 > 1 ? cursor.commands[at + 1] : 0u,
+					     at + len0 < total_dw ? cursor.commands[at + len0] : 0u);
+				}
+			}
 			if (!valid) {
 				if (static std::atomic<uint32_t> log_count {0};
 				    len0 != 0 && log_count.fetch_add(1) < 2000) {
@@ -1959,6 +1980,27 @@ void CommandProcessor::DrawIndirect(uint32_t data_offset, uint32_t draw_initiato
 	}
 
 	DrawIndexedIndirectArgs args {};
+	// Uncharted's GPU culling writes these counts every frame; the CPU copy is stale until a
+	// readback, so scene draws ran with old or zero counts (burned-out lighting, wasted work).
+	// Such draws read their counts on the GPU. KYTY_NO_GPU_DRAW_INDIRECT=1 restores host reads.
+	static const bool no_gpu_draw_indirect = std::getenv("KYTY_NO_GPU_DRAW_INDIRECT") != nullptr;
+	if (!no_gpu_draw_indirect && m_index_type_and_size != 2 && m_index_buffer_size != 0 &&
+	    m_ucfg.GetPrimType() != Prospero::PrimitiveType::kQuadListLegacy &&
+	    Libs::LibKernel::Memory::IsGpuWrittenRange(reinterpret_cast<uint64_t>(args_addr),
+	                                               sizeof(args))) {
+		static std::atomic<uint32_t> log_count {0};
+		if (log_count.fetch_add(1) < 8) {
+			LOGF("DrawIndexIndirect: GPU-written counts at %p, drawing from the GPU buffer\n",
+			     args_addr);
+		}
+		m_num_instances = 1;
+		DrawIndex({.index_count    = m_index_buffer_size,
+		           .index_addr     = reinterpret_cast<const void*>(m_index_base_addr),
+		           .instance_count = 1,
+		           .offset_source  = DrawOffsetSource::IndirectArgs,
+		           .gpu_args_addr  = reinterpret_cast<uint64_t>(args_addr)});
+		return;
+	}
 	if (!Libs::LibKernel::Memory::ReadGpuArgs(reinterpret_cast<uint64_t>(args_addr),
 	                                                     &args, sizeof(args))) {
 		if (!GuestRangeCommitted(args_addr, sizeof(args))) {
@@ -2162,7 +2204,23 @@ void CommandProcessor::DispatchIndirect(uint64_t args_addr, uint32_t mode) {
 	EXIT_NOT_IMPLEMENTED(args_addr == 0 || (args_addr & 3u) != 0);
 	NoteIndirectArgsAddress(args_addr);
 	DispatchIndirectArgs args {};
+	// Group counts a GPU pass wrote are stale in the CPU copy; dispatch them from the GPU buffer
+	// through the clamped path (bad counts are clamped instead of hanging the device).
+	// KYTY_GPU_DISPATCH_INDIRECT=1 enables it.
+	// Off by default: it hung the GPU in Uncharted even with clamped counts.
+	static const bool no_gpu_dispatch = std::getenv("KYTY_GPU_DISPATCH_INDIRECT") == nullptr;
+	if (!no_gpu_dispatch && (mode & Pm4::COMPUTE_DISPATCH_INITIATOR_USE_THREAD_DIMENSIONS) == 0 &&
+	    Libs::LibKernel::Memory::IsGpuWrittenRange(args_addr, sizeof(args))) {
+		m_sh_ctx.SetCsWaveSize(Pm4::ComputeWaveSize(mode));
+		m_renderer.GetRenderExecutor().Dispatch(m_submit_id, CurrentBuffer(), 1, 1, 1, mode,
+		                                        args_addr);
+		return;
+	}
 	if (Libs::LibKernel::Memory::ReadGpuArgs(args_addr, &args, sizeof(args))) {
+		if (uint64_t {args.thread_group_x} * args.thread_group_y * args.thread_group_z >
+		    (uint64_t {1} << 22u)) {
+			return; // garbage counts: a dispatch this large would hang the device
+		}
 		DispatchDirect(args.thread_group_x, args.thread_group_y, args.thread_group_z, mode);
 		return;
 	}

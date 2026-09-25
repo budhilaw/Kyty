@@ -63,7 +63,14 @@ struct DrawIndexArgs {
 	uint32_t         first_instance             = 0;
 	DrawOffsetSource offset_source              = DrawOffsetSource::DrawState;
 	uint32_t         render_target_slice_offset = 0;
+	// Nonzero: a VkDrawIndexedIndirectCommand the GPU wrote at this guest address supplies the
+	// counts; index_count is then only the bound index range.
+	uint64_t         gpu_args_addr              = 0;
 };
+
+// Set after GPU work that can write indirect-draw counts (dispatches, GPU copies and fills);
+// the next GPU-count draw then orders those writes before its indirect read.
+void MarkIndirectArgsWritten();
 
 struct DrawAutoArgs {
 	uint32_t         vertex_count               = 0;

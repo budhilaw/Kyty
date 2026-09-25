@@ -319,6 +319,57 @@ Emitter::SpirvRequirements Emitter::AnalyzeProgramRequirements(const IR::Program
 	return requirements;
 }
 
+// A wave64 shader runs as two 32-lane halves per host thread on 32-wide hosts (NVIDIA), which
+// multiplies its cost. Shaders whose lanes never observe each other can instead run one guest
+// lane per host thread: the name of any op that makes a lane see the wave is returned (the
+// shader then keeps the two-lane emulation); nullptr means it is safe to run natively.
+static const char* WaveEmulationReason(const IR::Program& program) {
+	const auto only_sets_exec = [](const IR::Inst& ballot) {
+		return std::ranges::all_of(ballot.Uses(), [](const IR::Use& use) {
+			if (use.user->GetOpcode() != IR::ValueOpcode::CompositeExtractU32x4) {
+				return false;
+			}
+			return std::ranges::all_of(use.user->Uses(), [](const IR::Use& inner) {
+				const auto op = inner.user->GetOpcode();
+				return op == IR::ValueOpcode::SetExecLo || op == IR::ValueOpcode::SetExecHi;
+			});
+		});
+	};
+	for (const auto* block: program.blocks) {
+		for (const auto& inst: *block) {
+			switch (inst.GetOpcode()) {
+				case IR::ValueOpcode::Ballot:
+					if (!only_sets_exec(inst)) {
+						return "Ballot";
+					}
+					break;
+				case IR::ValueOpcode::GetExecLo: return "GetExecLo";
+				case IR::ValueOpcode::GetExecHi: return "GetExecHi";
+				case IR::ValueOpcode::GetVccLo: return "GetVccLo";
+				case IR::ValueOpcode::GetVccHi: return "GetVccHi";
+				case IR::ValueOpcode::SetVccLo: return "SetVccLo";
+				case IR::ValueOpcode::SetVccHi: return "SetVccHi";
+				case IR::ValueOpcode::LaneId: return "LaneId";
+				case IR::ValueOpcode::ReadFirstLane: return "ReadFirstLane";
+				case IR::ValueOpcode::ReadLane: return "ReadLane";
+				case IR::ValueOpcode::WriteLane: return "WriteLane";
+				case IR::ValueOpcode::Permlane16U32: return "Permlane16";
+				case IR::ValueOpcode::BpermuteU32: return "Bpermute";
+				case IR::ValueOpcode::SwizzleU32: return "Swizzle";
+				case IR::ValueOpcode::DppMoveU32:
+				case IR::ValueOpcode::DppUpdateU32: return "Dpp";
+				case IR::ValueOpcode::DataAppend:
+				case IR::ValueOpcode::DataConsume: return "DataAppend";
+				case IR::ValueOpcode::WqmU64: return "Wqm";
+				case IR::ValueOpcode::BitCount64: return "BitCount64";
+				case IR::ValueOpcode::MeshAllocate: return "MeshAllocate";
+				default: break;
+			}
+		}
+	}
+	return nullptr;
+}
+
 std::vector<uint32_t> EmitProgram(const IR::Program& program,
                                   ShaderStageInputInfo input_info) {
 	using namespace Emitter;
@@ -341,6 +392,19 @@ std::vector<uint32_t> EmitProgram(const IR::Program& program,
 	    workgroup != nullptr && program.wave_size == 64u && workgroup->host_subgroup_size == 32u
 	        ? 2u
 	        : 1u;
+	if (state.lane_count == 2u && program.stage == ShaderType::Compute) {
+		// KYTY_NO_NATIVE_WAVE64=1 keeps every wave64 compute shader on the two-lane emulation.
+		static const bool disabled = std::getenv("KYTY_NO_NATIVE_WAVE64") != nullptr;
+		const char*       reason   = disabled ? "disabled" : WaveEmulationReason(program);
+		if (reason == nullptr) {
+			state.lane_count = 1u;
+		}
+		static std::atomic<uint32_t> log_count {0};
+		if (log_count.fetch_add(1) < 512) {
+			LOGF("WAVE64 shader=0x%016" PRIx64 " %s%s\n", program.shader_hash,
+			     reason == nullptr ? "native" : "emulated: ", reason == nullptr ? "" : reason);
+		}
+	}
 	DefineModule(state);
 	EmitProgram(state);
 	state.builder.AddEntryPoint(ExecutionModelForStage(state.program.stage), state.main_func,

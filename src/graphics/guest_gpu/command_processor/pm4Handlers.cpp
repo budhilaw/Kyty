@@ -1352,7 +1352,15 @@ KYTY_HW_UC_PARSER(HwUcSetGdsOaRegisters) {
 KYTY_CP_OP_PARSER(CpOpAcquireMem) {
 	KYTY_PROFILER_FUNCTION();
 
-	EXIT_NOT_IMPLEMENTED(cmd_id != 0xC0055800 && cmd_id != 0xc0061050);
+	if (cmd_id != 0xC0055800 && cmd_id != 0xc0061050) {
+		// Another length (or a misparsed header): acquires only order caches, which the host
+		// already does, so skip it by its declared length.
+		static std::atomic<uint32_t> log_count {0};
+		if (log_count.fetch_add(1) < 16) {
+			LOGF("ACQUIRE_MEM with header 0x%08" PRIx32 " skipped\n", cmd_id);
+		}
+		return KYTY_PM4_LEN(cmd_id) - 1u;
+	}
 	return (cmd_id == 0xc0061050 ? 7 : 6);
 }
 
@@ -1371,6 +1379,21 @@ KYTY_CP_OP_PARSER(CpOpDispatchDirect) {
 	uint32_t thread_group_z = buffer[2];
 	uint32_t mode           = buffer[3];
 
+	if (thread_group_x == 0 || thread_group_y == 0 || thread_group_z == 0) {
+		// Diagnostic: a zero-sized dispatch may be a GPU-patched packet the host read stale.
+		static std::atomic<uint32_t> log_count {0};
+		if (log_count.fetch_add(1) < 64) {
+			const auto address = reinterpret_cast<uint64_t>(buffer);
+			uint32_t   gpu[4] {};
+			uint32_t   clean[4] {};
+			const bool clean_ok = Libs::LibKernel::Memory::TryReadGpuCleanBacking(address, clean, 16);
+			const bool gpu_ok = Libs::LibKernel::Memory::ReadGpuBackingOrDownload(address, gpu, 16);
+			LOGF("ZERODISPATCH packet=0x%010" PRIx64 " cpu=%u,%u,%u mode=0x%x clean_ok=%d "
+			     "gpu_ok=%d gpu=%u,%u,%u,0x%x\n",
+			     address, thread_group_x, thread_group_y, thread_group_z, mode, clean_ok ? 1 : 0,
+			     gpu_ok ? 1 : 0, gpu[0], gpu[1], gpu[2], gpu[3]);
+		}
+	}
 	cp.DispatchDirect(thread_group_x, thread_group_y, thread_group_z, mode);
 
 	return KYTY_PM4_LEN(cmd_id) - 1;

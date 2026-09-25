@@ -224,6 +224,8 @@ void RenderExecutor::Dispatch(uint64_t submit_id, CommandBuffer& buffer, uint32_
 	                    sh_ctx.GetCs().cs_regs.data_addr);
 
 	if (thread_group_x == 0 || thread_group_y == 0 || thread_group_z == 0) {
+		FrameCapture::NoteMarker(fmt::format("SKIPPED zero-sized dispatch {}x{}x{}", thread_group_x,
+		                                     thread_group_y, thread_group_z));
 		static std::atomic<uint32_t> log_count {0};
 		if (log_count.fetch_add(1, std::memory_order_relaxed) < 32) {
 			LOGF("GraphicsRenderDispatchDirect: skipping zero-sized dispatch groups=%ux%ux%u "
@@ -425,6 +427,27 @@ void RenderExecutor::Dispatch(uint64_t submit_id, CommandBuffer& buffer, uint32_
 			     base, ok ? 1 : 0, words[0], words[1], words[2], words[3]);
 		}
 	}
+	if (program.shader_hash == 0xc18870abe4edd2fdull) {
+		// Diagnostic: where in the lighting table the scene targets' descriptors sit. The shader
+		// stores its result through the T# at user_data pointer + 0xBC00.
+		static std::atomic<uint32_t> log_count {0};
+		const auto& user_data = bindings.runtime->resources->user_data;
+		if (user_data.size() >= 2 && log_count.fetch_add(1) < 4) {
+			const auto            base = uint64_t {user_data[0]} | (uint64_t {user_data[1]} << 32u);
+			std::vector<uint32_t> table(0xC100 / 4);
+			const bool ok = Libs::LibKernel::Memory::TryReadBacking(base, table.data(), table.size() * 4);
+			LOGF("LIGHTTABLE base=0x%016" PRIx64 " ok=%d user_data=%zu out=%08x,%08x,%08x,%08x\n", base,
+			     ok ? 1 : 0, user_data.size(), table[0xBC00 / 4], table[0xBC00 / 4 + 1],
+			     table[0xBC00 / 4 + 2], table[0xBC00 / 4 + 3]);
+			for (size_t i = 0; ok && i < table.size(); i++) {
+				if (table[i] == 0x14676200u || table[i] == 0x143eb100u || table[i] == 0x143fa200u) {
+					LOGF("  +0x%05zx: %08x %08x %08x %08x\n", i * 4, table[i],
+					     i + 1 < table.size() ? table[i + 1] : 0u, i + 2 < table.size() ? table[i + 2] : 0u,
+					     i + 3 < table.size() ? table[i + 3] : 0u);
+				}
+			}
+		}
+	}
 	if (program.shader_hash == 0xb3ade16b0485b3bdull) {
 		// Diagnostic: the copy shader reads count at +288, per-copy counts at +0x100, source
 		// V#s at +i*16 and destination V#s at +128+i*16 of the user_data table.
@@ -546,6 +569,7 @@ void RenderExecutor::Dispatch(uint64_t submit_id, CommandBuffer& buffer, uint32_
 		vk_buffer.dispatch(thread_group_x, thread_group_y, thread_group_z);
 	}
 	m_context.GetCommandScheduler().NoteWork();
+	MarkIndirectArgsWritten();
 
 	// The removed host fence also ordered read-only dispatches before later writers.
 	if (!light_barriers) {

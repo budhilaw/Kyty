@@ -18,6 +18,7 @@
 #include <map>
 #include <span>
 #include <utility>
+#include <unordered_set>
 #include <vector>
 
 namespace Libs::Graphics {
@@ -128,6 +129,8 @@ private:
 	void RetirePendingDownloads(bool wait_all);
 	bool TryWaitPendingDownload(uint64_t vaddr, uint64_t size);
 	std::vector<PendingDownload> m_pending_downloads;
+	std::unordered_set<uint64_t> m_downloaded_pages;
+	void                         NoteDownloaded(uint64_t begin, uint64_t size);
 
 	// Tick of the last GPU write per 64 KiB block, and of the last write too large to record
 	// per block. A CPU read whose writers have all retired is served from a second queue
@@ -148,6 +151,8 @@ public:
 	// is already pending; the guest copy updates when the GPU reaches it. Returns true if the
 	// range is GPU-modified (the caller is reading data older than the GPU's).
 	bool PrefetchRange(uint64_t vaddr, uint64_t size);
+	// True when every 4 KiB page of the range has had a GPU download land in guest memory.
+	[[nodiscard]] bool WasDownloaded(uint64_t vaddr, uint64_t size) const;
 	// Marks [vaddr, vaddr+size) as needed by the host (indirect draw/dispatch arguments): its
 	// readbacks reach guest memory even though the game never polls it.
 	void RequestWriteback(uint64_t vaddr, uint64_t size);

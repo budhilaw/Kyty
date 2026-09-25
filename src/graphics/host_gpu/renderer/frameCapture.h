@@ -38,6 +38,9 @@ void NoteDispatch(uint64_t cs_hash, uint32_t x, uint32_t y, uint32_t z, bool ind
 
 void SetContext(RenderContext* context);
 
+// Counts every flip (captures or not); lets per-frame debug switches act once per frame.
+[[nodiscard]] uint64_t FlipSerial();
+
 // Registers an image (key = generation << 32 | index) to be saved as PNG at the frame's end.
 void NoteImageForDump(uint64_t key, uint64_t address, const char* role);
 

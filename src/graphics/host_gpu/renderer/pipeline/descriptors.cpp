@@ -443,9 +443,23 @@ static TextureCache::ImageDesc NullTextureDesc(const ShaderRecompiler::IR::Image
 
 // Binds a null texture shaped for the slot: a depth placeholder for comparison slots, since a
 // colour view there is invalid, otherwise a 1x1 colour image.
+// The descriptor being resolved, for the capture's NULL-BOUND notes.
+static thread_local const uint32_t* g_resolving_descriptor = nullptr;
+
 static TextureBinding NullTextureBinding(const ShaderRecompiler::IR::ImageResource& resource,
-                                         bool storage, TextureCache& texture_cache) {
-	FrameCapture::NoteTexture(0, 0, 0, 0, 0, storage, "NULL-BOUND (see TEXDESC log)");
+                                         bool storage, TextureCache& texture_cache,
+                                         const char* reason) {
+	if (FrameCapture::Active()) {
+		std::string note = std::string("NULL-BOUND: ") + reason;
+		if (g_resolving_descriptor != nullptr) {
+			note += fmt::format(" dwords={:08x},{:08x},{:08x},{:08x},{:08x},{:08x},{:08x},{:08x}",
+			                    g_resolving_descriptor[0], g_resolving_descriptor[1],
+			                    g_resolving_descriptor[2], g_resolving_descriptor[3],
+			                    g_resolving_descriptor[4], g_resolving_descriptor[5],
+			                    g_resolving_descriptor[6], g_resolving_descriptor[7]);
+		}
+		FrameCapture::NoteTexture(0, 0, 0, 0, 0, storage, note.c_str());
+	}
 	auto desc = NullTextureDesc(resource, storage ? TextureCache::BindingType::Storage
 	                                              : TextureCache::BindingType::Texture);
 	if (resource.depth_compare && !storage) {
@@ -604,7 +618,8 @@ static bool TextureViewPreservesMipLayout(const TileSurfaceDescription& descript
 
 TextureBinding RenderExecutor::ResolveTexture(const ShaderRecompiler::IR::ImageResource&   resource,
                                               const ShaderRecompiler::IR::DescriptorValue& value) {
-	auto descriptor = DecodeNativeDescriptor<ShaderTextureResource>(value);
+	auto descriptor          = DecodeNativeDescriptor<ShaderTextureResource>(value);
+	g_resolving_descriptor   = descriptor.fields;
 	if (resource.r128 && (descriptor.fields[4] | descriptor.fields[5] | descriptor.fields[6] |
 	                      descriptor.fields[7]) != 0) {
 		// A 128-bit descriptor has no dwords 4-7; the hardware reads them as zero. Whatever
@@ -650,7 +665,7 @@ TextureBinding RenderExecutor::ResolveTexture(const ShaderRecompiler::IR::ImageR
 
 	auto& texture_cache = m_context.GetTextureCache();
 	if (descriptor.IsNull()) {
-		return NullTextureBinding(resource, storage, texture_cache);
+		return NullTextureBinding(resource, storage, texture_cache, "null descriptor");
 	}
 
 	const auto address         = descriptor.Base40();
@@ -691,7 +706,7 @@ TextureBinding RenderExecutor::ResolveTexture(const ShaderRecompiler::IR::ImageR
 		     resource.read, resource.written, descriptor.fields[0], descriptor.fields[1],
 		     descriptor.fields[2], descriptor.fields[3], descriptor.fields[4], descriptor.fields[5],
 		     descriptor.fields[6], descriptor.fields[7]);
-		return NullTextureBinding(resource, storage, texture_cache);
+		return NullTextureBinding(resource, storage, texture_cache, "unsupported mip view");
 	}
 	const auto samples = multisampled ? 1u << last_level : 1u;
 	auto depth = static_cast<uint32_t>(descriptor.Depth()) + 1u;
@@ -734,7 +749,7 @@ TextureBinding RenderExecutor::ResolveTexture(const ShaderRecompiler::IR::ImageR
 			     descriptor.fields[3], descriptor.fields[4], descriptor.fields[5],
 			     descriptor.fields[6], descriptor.fields[7]);
 		}
-		return NullTextureBinding(resource, storage, texture_cache);
+		return NullTextureBinding(resource, storage, texture_cache, "layers exceed limits");
 	}
 	if (levels > physical_levels) {
 		const TileSurfaceDescription physical {
@@ -776,7 +791,7 @@ TextureBinding RenderExecutor::ResolveTexture(const ShaderRecompiler::IR::ImageR
 				     descriptor.fields[2], descriptor.fields[3], descriptor.fields[4],
 				     descriptor.fields[5], descriptor.fields[6], descriptor.fields[7]);
 			}
-			return NullTextureBinding(resource, storage, texture_cache);
+			return NullTextureBinding(resource, storage, texture_cache, "unsupported storage descriptor");
 		}
 	}
 	if (size.size > (uint64_t {1} << 30u)) {
@@ -788,7 +803,7 @@ TextureBinding RenderExecutor::ResolveTexture(const ShaderRecompiler::IR::ImageR
 			     " extent=%ux%ux%u layers=%u\n",
 			     static_cast<uint64_t>(size.size) >> 20u, address, width, height, depth, image_layers);
 		}
-		return NullTextureBinding(resource, storage, texture_cache);
+		return NullTextureBinding(resource, storage, texture_cache, "implausible size");
 	}
 	if (size.size == 0 || size.align == 0 ||
 	    (address & (static_cast<uint64_t>(size.align) - 1u)) != 0) {
@@ -799,10 +814,10 @@ TextureBinding RenderExecutor::ResolveTexture(const ShaderRecompiler::IR::ImageR
 			     " size=0x%" PRIx64 " align=0x%x\n",
 			     address, static_cast<uint64_t>(size.size), static_cast<uint32_t>(size.align));
 		}
-		return NullTextureBinding(resource, storage, texture_cache);
+		return NullTextureBinding(resource, storage, texture_cache, "unsupported address/size");
 	}
 	if (storage && !ValidateStorageTexture(resource, descriptor, size.size)) {
-		return NullTextureBinding(resource, storage, texture_cache);
+		return NullTextureBinding(resource, storage, texture_cache, "invalid storage texture");
 	}
 
 	auto pixel_format = surface_format.vk_format;
@@ -865,10 +880,10 @@ TextureBinding RenderExecutor::ResolveTexture(const ShaderRecompiler::IR::ImageR
 				LOGF("depth target bound as a storage image, bound as null: addr=0x%016" PRIx64 "\n",
 				     address);
 			}
-			return NullTextureBinding(resource, storage, texture_cache);
+			return NullTextureBinding(resource, storage, texture_cache, "depth as storage");
 		}
 		if (!ValidateSampledDepthBinding(resource, descriptor, *image, pixel_format, size.size)) {
-			return NullTextureBinding(resource, storage, texture_cache);
+			return NullTextureBinding(resource, storage, texture_cache, "unsupported sampled depth");
 		}
 	} else if (resource.depth_compare && !storage) {
 		// The guest compares against red; the host cannot compare a colour view, so a depth

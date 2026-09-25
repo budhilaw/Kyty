@@ -7,6 +7,7 @@
 #include "graphics/host_gpu/renderer/renderContext.h"
 
 #include <algorithm>
+#include <atomic>
 #include <cinttypes>
 #include <cmath>
 #include <cstdio>
@@ -29,6 +30,15 @@ struct CapturedImage {
 	std::string role;
 };
 
+// An image copy recorded into the GPU stream; converted after the frame's last flush.
+struct PendingDownload {
+	CapturedImage           image;
+	std::unique_ptr<Buffer> buffer;
+	vk::Format              format;
+	uint32_t                width;
+	uint32_t                height;
+};
+
 struct State {
 	RenderContext*           context = nullptr;
 	std::set<uint64_t>       frames;
@@ -44,6 +54,11 @@ struct State {
 	// KYTY_FRAME_DUMP_TRIGGER=path: when that file appears, the next frame is captured and the
 	// file is deleted (captures a screen without knowing its frame number).
 	std::string trigger;
+	// KYTY_FRAME_DUMP_TRACK=addr,...: after every dispatch that writes one of these images, a
+	// copy is taken at that point of the frame (shows which pass produced a bad value).
+	std::vector<uint64_t>                        track;
+	std::vector<std::pair<uint64_t, uint64_t>>   dispatch_storage; // key, address
+	std::vector<PendingDownload>                 snapshots;
 };
 
 State& S() {
@@ -67,6 +82,18 @@ State& S() {
 		}
 		if (const char* trigger = std::getenv("KYTY_FRAME_DUMP_TRIGGER"); trigger != nullptr) {
 			state.trigger = trigger;
+		}
+		if (const char* list = std::getenv("KYTY_FRAME_DUMP_TRACK"); list != nullptr) {
+			const char* cursor = list;
+			while (*cursor != '\0') {
+				char*      end   = nullptr;
+				const auto value = std::strtoull(cursor, &end, 16);
+				if (end == cursor) {
+					break;
+				}
+				state.track.push_back(value);
+				cursor = *end == ',' ? end + 1 : end;
+			}
 		}
 	}
 	return state;
@@ -352,6 +379,46 @@ void ToRgba(vk::Format format, const uint8_t* src, uint8_t* dst) {
 	}
 }
 
+// Records a copy of the image into the GPU stream at the current point; false with a reason
+// written to the frame text when the image cannot be converted.
+bool StartDownload(State& s, const CapturedImage& captured, std::vector<PendingDownload>& out) {
+	auto& cache     = s.context->GetTextureCache();
+	auto& scheduler = s.context->GetCommandScheduler();
+	auto& graphics  = s.context->GetGraphics();
+	const ImageId id(static_cast<uint32_t>(captured.key), static_cast<uint32_t>(captured.key >> 32u));
+	auto* image = cache.TryGetImage(id);
+	// 32-bit float depth is read through its depth aspect and reported as R32 float.
+	const bool depth32 = image != nullptr && image->info.IsDepth() &&
+	                     (image->info.pixel_format == vk::Format::eD32Sfloat ||
+	                      image->info.pixel_format == vk::Format::eD32SfloatS8Uint);
+	if (image == nullptr || image->backing.image == nullptr ||
+	    (image->info.IsDepth() && !depth32) || image->info.samples > 1) {
+		s.text += fmt::format("IMAGE {} addr=0x{:010x} skipped (gone, depth or msaa)\n",
+		                      captured.role, captured.address);
+		return false;
+	}
+	const auto format = depth32 ? vk::Format::eR32Sfloat : image->info.pixel_format;
+	const auto texel  = TexelBytes(format);
+	const auto width  = image->info.extent.width;
+	const auto height = image->info.extent.height;
+	if (texel == 0) {
+		s.text += fmt::format("IMAGE {} addr=0x{:010x} format={} not convertible\n", captured.role,
+		                      captured.address, vk::to_string(format));
+		return false;
+	}
+	const uint64_t size   = static_cast<uint64_t>(width) * height * texel;
+	auto           buffer = std::make_unique<Buffer>(graphics, scheduler, MemoryUsage::Download, 0,
+	                                                 vk::BufferUsageFlagBits::eTransferDst, size);
+	vk::BufferImageCopy copy {};
+	copy.imageSubresource.aspectMask =
+	    depth32 ? vk::ImageAspectFlagBits::eDepth : vk::ImageAspectFlagBits::eColor;
+	copy.imageSubresource.layerCount = 1;
+	copy.imageExtent                 = vk::Extent3D {width, height, 1};
+	image->Download(std::span(&copy, 1), buffer->Handle(), 0, size);
+	out.push_back({captured, std::move(buffer), format, width, height});
+	return true;
+}
+
 void Finish(uint64_t presented_address) {
 	auto& s   = S();
 	auto  dir = std::filesystem::path(s.dir) / ("frame_" + std::to_string(s.frame));
@@ -362,45 +429,11 @@ void Finish(uint64_t presented_address) {
 	// KYTY_FRAME_DUMP_NOIMG=1 writes only draws.txt, fast enough for runs of consecutive frames.
 	static const bool no_images = std::getenv("KYTY_FRAME_DUMP_NOIMG") != nullptr;
 	if (s.context != nullptr && !no_images) {
-		auto& cache     = s.context->GetTextureCache();
-		auto& scheduler = s.context->GetCommandScheduler();
-		auto& graphics  = s.context->GetGraphics();
-		struct Pending {
-			CapturedImage           image;
-			std::unique_ptr<Buffer> buffer;
-			vk::Format              format;
-			uint32_t                width;
-			uint32_t                height;
-		};
-		std::vector<Pending> pending;
+		auto&                        scheduler = s.context->GetCommandScheduler();
+		std::vector<PendingDownload> pending   = std::move(s.snapshots);
+		s.snapshots.clear();
 		for (const auto& captured: s.images) {
-			const ImageId id(static_cast<uint32_t>(captured.key),
-			                 static_cast<uint32_t>(captured.key >> 32u));
-			auto* image = cache.TryGetImage(id);
-			if (image == nullptr || image->backing.image == nullptr || image->info.IsDepth() ||
-			    image->info.samples > 1) {
-				s.text += fmt::format("IMAGE {} addr=0x{:010x} skipped (gone, depth or msaa)\n",
-				                      captured.role, captured.address);
-				continue;
-			}
-			const auto format = image->info.pixel_format;
-			const auto texel  = TexelBytes(format);
-			const auto width  = image->info.extent.width;
-			const auto height = image->info.extent.height;
-			if (texel == 0) {
-				s.text += fmt::format("IMAGE {} addr=0x{:010x} format={} not convertible\n",
-				                      captured.role, captured.address, vk::to_string(format));
-				continue;
-			}
-			const uint64_t size = static_cast<uint64_t>(width) * height * texel;
-			auto buffer = std::make_unique<Buffer>(graphics, scheduler, MemoryUsage::Download, 0,
-			                                       vk::BufferUsageFlagBits::eTransferDst, size);
-			vk::BufferImageCopy copy {};
-			copy.imageSubresource.aspectMask = vk::ImageAspectFlagBits::eColor;
-			copy.imageSubresource.layerCount = 1;
-			copy.imageExtent                 = vk::Extent3D {width, height, 1};
-			image->Download(std::span(&copy, 1), buffer->Handle(), 0, size);
-			pending.push_back({captured, std::move(buffer), format, width, height});
+			(void)StartDownload(s, captured, pending);
 		}
 		scheduler.FlushAndWait();
 		for (auto& item: pending) {
@@ -487,7 +520,14 @@ bool Active() {
 	return S().active;
 }
 
+std::atomic<uint64_t> g_flip_serial {0};
+
+uint64_t FlipSerial() {
+	return g_flip_serial.load(std::memory_order_acquire);
+}
+
 void OnFlip(uint64_t presented_address) {
+	g_flip_serial.fetch_add(1, std::memory_order_acq_rel);
 	auto& s = S();
 	if (s.frames.empty() && s.trigger.empty()) {
 		return;
@@ -563,6 +603,8 @@ void NoteDraw(const char* kind, uint64_t vs_hash, uint64_t ps_hash, const std::s
 	s.text += fmt::format("#{} {} vs={:016x} ps={:016x} {}\n{}", s.index++, kind, vs_hash, ps_hash,
 	                      detail, s.pending);
 	s.pending.clear();
+	// Targets written by draws stay listed; they are snapshotted at the next dispatch, where no
+	// render pass is open.
 }
 
 void NoteDispatch(uint64_t cs_hash, uint32_t x, uint32_t y, uint32_t z, bool indirect) {
@@ -570,15 +612,33 @@ void NoteDispatch(uint64_t cs_hash, uint32_t x, uint32_t y, uint32_t z, bool ind
 	if (!s.active) {
 		return;
 	}
+	const auto index = s.index;
 	s.text += fmt::format("#{} dispatch cs={:016x} groups={}x{}x{}{}\n{}", s.index++, cs_hash, x, y,
 	                      z, indirect ? " indirect" : "", s.pending);
 	s.pending.clear();
+	static const bool no_images = std::getenv("KYTY_FRAME_DUMP_NOIMG") != nullptr;
+	if (s.context != nullptr && !no_images) {
+		for (const auto& [key, address]: s.dispatch_storage) {
+			if (std::ranges::find(s.track, address) != s.track.end()) {
+				(void)StartDownload(s, {key, address, fmt::format("snap{:04}_{:016x}", index, cs_hash)},
+				                    s.snapshots);
+			}
+		}
+	}
+	s.dispatch_storage.clear();
 }
 
 // Images are recorded from these helpers so the frame's targets can be dumped at the flip.
 void NoteImageForDump(uint64_t key, uint64_t address, const char* role) {
-	if (S().active) {
+	auto& s = S();
+	if (s.active) {
 		AddImage(key, address, role);
+		const std::string_view kind(role);
+		if (!s.track.empty() && (kind == "storage" || kind == "rt" || kind == "depth") &&
+		    std::ranges::find(s.dispatch_storage, std::pair {key, address}) ==
+		        s.dispatch_storage.end()) {
+			s.dispatch_storage.emplace_back(key, address);
+		}
 	}
 }
 

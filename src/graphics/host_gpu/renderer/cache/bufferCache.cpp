@@ -627,6 +627,24 @@ void BufferCache::ReadMemory(uint64_t vaddr, uint64_t size, bool is_write) {
 	});
 }
 
+void BufferCache::NoteDownloaded(uint64_t begin, uint64_t size) {
+	if (m_downloaded_pages.size() > 262144) {
+		m_downloaded_pages.clear();
+	}
+	for (auto page = begin & ~uint64_t {4095}; page < begin + size; page += 4096) {
+		m_downloaded_pages.insert(page);
+	}
+}
+
+bool BufferCache::WasDownloaded(uint64_t vaddr, uint64_t size) const {
+	for (auto page = vaddr & ~uint64_t {4095}; page < vaddr + size; page += 4096) {
+		if (!m_downloaded_pages.contains(page)) {
+			return false;
+		}
+	}
+	return true;
+}
+
 void BufferCache::RetirePendingDownloads(bool wait_all) {
 	for (auto it = m_pending_downloads.begin(); it != m_pending_downloads.end();) {
 		if (!wait_all && !m_scheduler.IsFree(it->tick)) {
@@ -636,6 +654,7 @@ void BufferCache::RetirePendingDownloads(bool wait_all) {
 		m_scheduler.Wait(it->tick);
 		m_scheduler.WaitPriorityOperations(it->tick);
 		m_memory_tracker.UnmarkRegionAsGpuModified(it->begin, it->size);
+		NoteDownloaded(it->begin, it->size);
 		it = m_pending_downloads.erase(it);
 	}
 }
@@ -646,6 +665,7 @@ bool BufferCache::TryWaitPendingDownload(uint64_t vaddr, uint64_t size) {
 			m_scheduler.Wait(it->tick);
 			m_scheduler.WaitPriorityOperations(it->tick);
 			m_memory_tracker.UnmarkRegionAsGpuModified(it->begin, it->size);
+			NoteDownloaded(it->begin, it->size);
 			m_pending_downloads.erase(it);
 			return true;
 		}
@@ -1205,7 +1225,19 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBufferForImage(uint64_t vaddr, u
 
 	auto [staging, stage_offset] = m_staging_buffer.Map(size, 16);
 	if (staging == nullptr) {
-		EXIT("BufferCache: failed to map staging memory for guest image backing\n");
+		// The ring was busy or the upload is larger than it: wait once, then fall back to a
+		// cache buffer rather than ending the process (seen after ~110 s in Uncharted's menu).
+		m_scheduler.FlushAndWait();
+		std::tie(staging, stage_offset) = m_staging_buffer.Map(size, 16);
+		if (staging == nullptr) {
+			static std::atomic<uint32_t> log_count {0};
+			if (log_count.fetch_add(1) < 16) {
+				LOGF("BufferCache: staging full for a 0x%" PRIx64 "-byte image backing at 0x%016" PRIx64
+				     "; using a cache buffer\n",
+				     size, vaddr);
+			}
+			return ObtainBuffer(vaddr, size, false, false);
+		}
 	}
 	if (!Libs::LibKernel::Memory::TryReadBacking(vaddr, staging, size) &&
 	    !Libs::LibKernel::Memory::TryReadPrtBacking(vaddr, staging, size)) {
@@ -1248,6 +1280,7 @@ void BufferCache::FillBuffer(uint64_t vaddr, uint64_t size, uint32_t value, bool
 	m_texture_cache.InvalidateMemoryFromGPU(vaddr, size);
 	auto [dst, dst_offset] = ObtainBuffer(vaddr, size, true, true);
 	dst->Fill(dst_offset, size, value);
+	MarkIndirectArgsWritten();
 }
 
 void BufferCache::CopyBuffer(uint64_t dst_vaddr, uint64_t src_vaddr, uint64_t size, bool dst_gds,
@@ -1278,6 +1311,7 @@ void BufferCache::CopyBuffer(uint64_t dst_vaddr, uint64_t src_vaddr, uint64_t si
 	}
 
 	auto& command = m_scheduler.Current();
+	MarkIndirectArgsWritten();
 	if (dst_memory) {
 		m_texture_cache.InvalidateMemoryFromGPU(dst_vaddr, size);
 		if (uint64_t hit = dst_vaddr; src_gds && size == 4u && Libs::Graphics::LabelTraceEnabled()) {

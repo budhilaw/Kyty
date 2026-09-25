@@ -113,6 +113,9 @@ bool                   ReadGpuBackingOrDownload(uint64_t vaddr, void* data, uint
 bool                   ReadGpuBackingOrPrefetch(uint64_t vaddr, void* data, uint64_t size);
 // Reads GPU-produced indirect arguments with the GPU's latest values (see ReadGpuArgs).
 bool                   ReadGpuArgs(uint64_t vaddr, void* data, uint64_t size);
+// True when the range is mapped GPU memory whose latest bytes were written by the GPU (the CPU
+// copy is stale until a readback); such arguments are best consumed on the GPU.
+bool                   IsGpuWrittenRange(uint64_t vaddr, uint64_t size);
 // True when every byte of the range is committed host memory (safe to read directly).
 bool                   IsCommittedRange(uint64_t vaddr, uint64_t size);
 bool                   TryReadGpuCleanBacking(uint64_t vaddr, void* data, uint64_t size);

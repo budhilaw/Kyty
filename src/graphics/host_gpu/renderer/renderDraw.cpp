@@ -461,6 +461,7 @@ struct DrawCallInfo {
 	uint32_t             index_count    = 0;
 	uint32_t             instance_count = 0;
 	uint32_t             first_instance = 0;
+	uint64_t             gpu_args_addr  = 0;
 
 	[[nodiscard]] bool IsIndexed() const { return debug_op == CommandBufferDebugOp::DrawIndex; }
 	[[nodiscard]] const char* Name() const { return IsIndexed() ? "DrawIndex" : "DrawIndexAuto"; }
@@ -487,6 +488,26 @@ RenderState RenderExecutor::AcquireRenderTargets(CommandBuffer& buffer, RenderCo
 			EXIT("color target changed after render-state discovery\n");
 		}
 		NoteColorTargetWrite(target.desc.info.data.address);
+		{
+			// KYTY_CLEAR_RT=addr (hex): clears that color target to zero at its first use in each
+			// frame. Diagnostic for targets that should be reset but keep last frame's pixels.
+			static const uint64_t clear_address = [] {
+				const char* text = std::getenv("KYTY_CLEAR_RT");
+				return text != nullptr ? std::strtoull(text, nullptr, 16) : 0ull;
+			}();
+			static uint64_t cleared_serial = UINT64_MAX;
+			if (clear_address != 0 && target.desc.info.data.address == clear_address &&
+			    cleared_serial != FrameCapture::FlipSerial()) {
+				cleared_serial = FrameCapture::FlipSerial();
+				m_context.GetCommandScheduler().EndRendering();
+				auto& clear_image = cache.GetImage(target.image_id);
+				const vk::ImageSubresourceRange range {vk::ImageAspectFlagBits::eColor, 0,
+				                                       clear_image.info.resources.levels, 0,
+				                                       clear_image.backing.layers};
+				cache.ClearImage(buffer, target.image_id, clear_image.backing.format, range,
+				                 vk::ClearValue {vk::ClearColorValue {std::array<float, 4> {}}});
+			}
+		}
 		FrameCapture::NoteTarget("color", target.target_slot, target.image_id.index,
 		                         target.desc.info.data.address,
 		                         static_cast<uint32_t>(target.desc.view_info.format),
@@ -494,6 +515,17 @@ RenderState RenderExecutor::AcquireRenderTargets(CommandBuffer& buffer, RenderCo
 		FrameCapture::NoteImageForDump(
 		    (uint64_t {target.image_id.generation} << 32u) | target.image_id.index,
 		    target.desc.info.data.address, "rt");
+		if (FrameCapture::Active()) {
+			const auto& hw_rt = buffer.GetRegisters().GetRenderTarget(target.target_slot);
+			if (hw_rt.cmask.addr != 0 || hw_rt.info.cmask_fast_clear_enable) {
+				FrameCapture::NoteMarker(fmt::format(
+				    "rt 0x{:010x} cmask=0x{:010x} fast_clear={} clear={:08x}:{:08x} color_mode={}",
+				    target.desc.info.data.address, hw_rt.cmask.addr,
+				    hw_rt.info.cmask_fast_clear_enable ? 1 : 0, hw_rt.clear_word0.word0,
+				    hw_rt.clear_word1.word1,
+				    static_cast<int>(buffer.GetRegisters().GetColorControl().mode)));
+			}
+		}
 		NoteRenderTargetImage(target.desc.info.data.address, target.image_id.index,
 		                      static_cast<uint32_t>(target.desc.info.pixel_format),
 		                      target.desc.info.extent.width, target.desc.info.extent.height);
@@ -534,6 +566,9 @@ RenderState RenderExecutor::AcquireRenderTargets(CommandBuffer& buffer, RenderCo
 			EXIT("depth target changed after render-state discovery\n");
 		}
 		const auto  image_view = cache.FindDepthTarget(depth.image_id, depth.desc);
+		FrameCapture::NoteImageForDump(
+		    (uint64_t {depth.image_id.generation} << 32u) | depth.image_id.index,
+		    depth.desc.info.data.address, "depth");
 		const auto& metadata   = depth.desc.info.metadata;
 		if (metadata.kind == ImageMetadataKind::Htile && depth.depth_clear_enable &&
 		    !cache.ClearMeta(metadata.range.address)) {
@@ -986,6 +1021,16 @@ bool RenderExecutor::PrepareDrawRenderState(CommandBuffer& buffer, const DrawCal
 	if (state.color_count == 0 && !state.depth_info.image_id && !state.ps_active) {
 		LogFramebufferSkip(draw.Name(), state.color_info[0], state.depth_info, buffer,
 		                   draw.index_count, 0);
+		if (FrameCapture::Active()) {
+			const auto& regs = buffer.GetRegisters();
+			FrameCapture::NoteMarker(fmt::format(
+			    "SKIPPED draw without framebuffer: target_mask=0x{:08x} cb_shader_mask=0x{:08x} "
+			    "ps_addr=0x{:010x} rt0=0x{:010x} z_enable={} zread=0x{:010x} count={}",
+			    regs.GetRenderTargetMask(), regs.GetShaderRegisters().m_cbShaderMask,
+			    buffer.GetShaders().GetPs().ps_regs.data_addr, regs.GetRenderTarget(0).base.addr,
+			    regs.GetDepthControl().z_enable ? 1 : 0,
+			    regs.GetDepthRenderTarget().z_read_base_addr, draw.index_count));
+		}
 		return false;
 	}
 
@@ -1056,8 +1101,20 @@ static void LogDrawStateIfNeeded(const CommandBuffer& buffer, const DrawCallInfo
 	                  draw.index_count, index_addr);
 }
 
+static std::atomic<bool> g_indirect_args_written {true};
+
+void MarkIndirectArgsWritten() {
+	g_indirect_args_written.store(true, std::memory_order_release);
+}
+
 static void EmitDrawPrimitives(const HW::UserConfig& ucfg, vk::CommandBuffer vk_buffer,
-                               const DrawCallInfo& draw, const DrawEmitInfo& emit) {
+                               const DrawCallInfo& draw, const DrawEmitInfo& emit,
+                               vk::Buffer gpu_args_buffer = nullptr, uint64_t gpu_args_offset = 0) {
+	if (gpu_args_buffer) {
+		vk_buffer.drawIndexedIndirect(gpu_args_buffer, gpu_args_offset, 1,
+		                              sizeof(vk::DrawIndexedIndirectCommand));
+		return;
+	}
 	switch (ucfg.GetPrimType()) {
 		case Prospero::PrimitiveType::kPointList:
 		case Prospero::PrimitiveType::kLineList:
@@ -1155,10 +1212,35 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 	PrepareGraphicsBindings(stages, std::span {state.color_info, state.color_count});
 	PreparedVertexBuffers vertex_bindings;
 	PreparedIndexBuffer   index_binding;
+	vk::Buffer            gpu_args_buffer;
+	uint64_t              gpu_args_offset = 0;
 	if (!mesh_active) {
 		LogDrawPhase(draw.Name(), "PrepareVertexBuffers");
 		vertex_bindings = AcquireVertexBuffers(buffer, state.vertex_info[0]);
 		index_binding   = PrepareIndexBuffer(buffer, index_source);
+		if (draw.gpu_args_addr != 0) {
+			// Counts written by a GPU culling pass are consumed where they live. The barrier makes
+			// earlier shader and transfer writes visible to the indirect-command read.
+			const auto [args_buffer, args_offset] = m_context.GetBufferCache().ObtainBuffer(
+			    draw.gpu_args_addr, sizeof(vk::DrawIndexedIndirectCommand), false);
+			if (args_buffer != nullptr && (args_offset & 3u) == 0) {
+				gpu_args_buffer = args_buffer->Handle();
+				gpu_args_offset = args_offset;
+			}
+			if (gpu_args_buffer && g_indirect_args_written.exchange(false)) {
+				m_context.GetCommandScheduler().EndRendering();
+				vk::MemoryBarrier2 barrier {};
+				barrier.srcStageMask  = vk::PipelineStageFlagBits2::eAllCommands;
+				barrier.srcAccessMask = vk::AccessFlagBits2::eShaderWrite |
+				                        vk::AccessFlagBits2::eTransferWrite;
+				barrier.dstStageMask  = vk::PipelineStageFlagBits2::eDrawIndirect;
+				barrier.dstAccessMask = vk::AccessFlagBits2::eIndirectCommandRead;
+				vk::DependencyInfo dependency {};
+				dependency.memoryBarrierCount = 1;
+				dependency.pMemoryBarriers    = &barrier;
+				buffer.Handle().pipelineBarrier2(dependency);
+			}
+		}
 	}
 	if (draw.IsIndexed()) {
 		LogDrawPhase(draw.Name(), "CreatePipeline");
@@ -1227,7 +1309,7 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 	if (mesh_active) {
 		vk_buffer.drawMeshTasksEXT(mesh_groups, draw.instance_count, 1);
 	} else {
-		EmitDrawPrimitives(ucfg, vk_buffer, draw, emit);
+		EmitDrawPrimitives(ucfg, vk_buffer, draw, emit, gpu_args_buffer, gpu_args_offset);
 	}
 
 	if (!draw.IsIndexed()) {
@@ -1254,8 +1336,24 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 		if (FrameCapture::Active()) {
 			const auto* vs = state.vertex_info[0].stage.program;
 			const auto* ps = state.ps_active ? state.ps_input_info.stage.program : nullptr;
+			const auto& d  = state.depth_info;
+			const auto& z  = buffer.GetRegisters().GetDepthRenderTarget();
+			const auto& v0 = buffer.GetRegisters().GetScreenViewport().viewports[0];
+			const auto  detail =
+			    fmt::format("vpz scale={} offset={} min={} max={} ", v0.zscale, v0.zoffset,
+			                v0.zmin, v0.zmax) +
+			    (d.image_id
+			        ? fmt::format("depth=0x{:010x} test={} write={} op={} clear={} stencil={} "
+			                      "zfmt={} zread=0x{:010x}",
+			                      d.desc.info.data.address, d.depth_test_enable ? 1 : 0,
+			                      d.depth_write_enable ? 1 : 0, static_cast<int>(d.depth_compare_op),
+			                      d.depth_load_clear_enable ? 1 : 0, d.stencil_test_enable ? 1 : 0,
+			                      static_cast<int>(z.z_info.format), z.z_read_base_addr)
+			        : fmt::format("depth=none zfmt={} zread=0x{:010x} z_enable={}",
+			                      static_cast<int>(z.z_info.format), z.z_read_base_addr,
+			                      buffer.GetRegisters().GetDepthControl().z_enable ? 1 : 0));
 			FrameCapture::NoteDraw(draw.Name(), vs != nullptr ? vs->shader_hash : 0,
-			                       ps != nullptr ? ps->shader_hash : 0, "");
+			                       ps != nullptr ? ps->shader_hash : 0, detail);
 		}
 	}
 	LogDrawPhase(draw.Name(), "DrawComplete");
@@ -1288,11 +1386,16 @@ void RenderExecutor::DrawIndex(uint64_t submit_id, CommandBuffer& buffer,
 	if (ConsumeMetadataColorOperation(buffer) || DepthStencilCopy(buffer) ||
 	    DepthToColorCopy(buffer, args.render_target_slice_offset) ||
 	    ResolveColorTargets(buffer, args.render_target_slice_offset)) {
+		FrameCapture::NoteMarker(fmt::format(
+		    "SPECIAL draw (metadata/copy/resolve) color_mode={} rt0=0x{:010x}",
+		    static_cast<int>(buffer.GetRegisters().GetColorControl().mode),
+		    buffer.GetRegisters().GetRenderTarget(0).base.addr));
 		ResetBindings();
 		return;
 	}
 
 	if (!DrawHasValidVertexShader(sh_ctx)) {
+		FrameCapture::NoteMarker("SKIPPED draw without a valid vertex shader");
 		return;
 	}
 
@@ -1353,12 +1456,35 @@ void RenderExecutor::DrawIndex(uint64_t submit_id, CommandBuffer& buffer,
 		index_source.size      = expanded_indices.size() * sizeof(uint16_t);
 	}
 
-	const DrawCallInfo draw {CommandBufferDebugOp::DrawIndex, args.index_count,
-	                        args.instance_count, args.first_instance};
+	DrawCallInfo draw {CommandBufferDebugOp::DrawIndex, args.index_count, args.instance_count,
+	                   args.first_instance, args.gpu_args_addr};
 	DrawRenderState state {};
+	int32_t         host_base_vertex = 0;
 	if (!PrepareDrawRenderState(buffer, draw, args.render_target_slice_offset, state)) {
 		ResetBindings();
 		return;
+	}
+	if (draw.gpu_args_addr != 0 &&
+	    state.vertex_info[0].stage.program->stage == ShaderType::Mesh) {
+		// Mesh-emulated draws size their workgroups on the CPU: use the host copy of the counts.
+		struct {
+			uint32_t index_count, instance_count, first_index;
+			int32_t  base_vertex;
+			uint32_t first_instance;
+		} host {};
+		(void)Libs::LibKernel::Memory::ReadGpuArgs(draw.gpu_args_addr, &host, sizeof(host));
+		draw.index_count     = std::min(host.index_count, args.index_count);
+		draw.instance_count  = host.instance_count;
+		draw.first_instance  = host.first_instance;
+		draw.gpu_args_addr   = 0;
+		host_base_vertex     = host.base_vertex;
+		index_source.address += static_cast<uint64_t>(host.first_index) *
+		                        index_source.guest_element_size;
+		index_source.size = static_cast<uint64_t>(draw.index_count) * index_source.guest_element_size;
+		if (draw.index_count == 0 || draw.instance_count == 0) {
+			ResetBindings();
+			return;
+		}
 	}
 
 	LogDrawStateIfNeeded(buffer, draw, state, args.index_type_and_size,
@@ -1370,7 +1496,7 @@ void RenderExecutor::DrawIndex(uint64_t submit_id, CommandBuffer& buffer,
 	             : ResolveDrawOffsets(ucfg.GetIndexOffset(), state.vertex_info[0]);
 
 	DrawEmitInfo emit {};
-	emit.vertex_offset  = vertex_offset + args.base_vertex;
+	emit.vertex_offset  = vertex_offset + args.base_vertex + host_base_vertex;
 	emit.first_instance = instance_offset;
 
 	ExecutePreparedDraw(submit_id, buffer, draw, state, topology, emit, index_source,
@@ -1406,6 +1532,10 @@ void RenderExecutor::DrawAuto(uint64_t submit_id, CommandBuffer& buffer, const D
 	if (ConsumeMetadataColorOperation(buffer) || DepthStencilCopy(buffer) ||
 	    DepthToColorCopy(buffer, args.render_target_slice_offset) ||
 	    ResolveColorTargets(buffer, args.render_target_slice_offset)) {
+		FrameCapture::NoteMarker(fmt::format(
+		    "SPECIAL draw (metadata/copy/resolve) color_mode={} rt0=0x{:010x}",
+		    static_cast<int>(buffer.GetRegisters().GetColorControl().mode),
+		    buffer.GetRegisters().GetRenderTarget(0).base.addr));
 		const auto special_ms = phase_timer.GetTimeS() * 1000.0;
 		if (special_ms > 2.0) {
 			LOGF("\t DRAWPHASE: special-op draw pop=%.1f lock=%.1f total=%.1f\n", pop_ms, lock_ms,
@@ -1416,6 +1546,7 @@ void RenderExecutor::DrawAuto(uint64_t submit_id, CommandBuffer& buffer, const D
 	}
 
 	if (!DrawHasValidVertexShader(sh_ctx)) {
+		FrameCapture::NoteMarker("SKIPPED draw without a valid vertex shader");
 		return;
 	}
 

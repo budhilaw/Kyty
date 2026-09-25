@@ -3487,11 +3487,22 @@ int KYTY_SYSV_ABI PthreadGetprio(Pthread thread, int* prio) {
 }
 
 int KYTY_SYSV_ABI PthreadSetprio(Pthread thread, int prio) {
-	PRINT_NAME();
-
+	// Naughty Dog's job system calls this ~15000 times a second. It is not logged, and the host
+	// priority (three levels) is only changed when the level actually changes.
 	if (thread == nullptr) {
 		return KERNEL_ERROR_ESRCH;
 	}
+
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+	{
+		const auto host_level = [](int guest) { return guest <= 478 ? 2 : (guest >= 733 ? -2 : 0); };
+		const int  previous   = thread->attr->guest_priority;
+		if (previous != 0 && host_level(previous) == host_level(prio)) {
+			thread->attr->guest_priority = prio;
+			return OK;
+		}
+	}
+#endif
 
 	sched_param param {};
 	int         pol = 0;
@@ -3517,7 +3528,6 @@ int KYTY_SYSV_ABI PthreadSetprio(Pthread thread, int prio) {
 #endif
 
 	thread->attr->guest_priority = prio;
-	LOGF("\t PthreadSetprio: %d, %d\n", thread->unique_id, prio);
 	return OK;
 }
 

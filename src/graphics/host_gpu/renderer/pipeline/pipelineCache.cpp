@@ -1,4 +1,5 @@
 #include "graphics/host_gpu/renderer/pipeline/pipelineCache.h"
+#include "graphics/host_gpu/renderer/frameCapture.h"
 
 #include "common/assert.h"
 #include "common/emulatorConfig.h"
@@ -447,6 +448,7 @@ struct PipelineCache::ProgramCache {
 		BuildStageStaticKey(input_info, lookup_key.static_state);
 		auto                                         entry = programs.find(lookup_key);
 		if (entry != programs.end() && entry->second.skip_dispatch) {
+			FrameCapture::NoteMarker(fmt::format("SKIPPED program {:016x} (skip_dispatch)", params.hash));
 			return {};
 		}
 		const ShaderRecompiler::IR::SrtRuntime       runtime {
@@ -465,6 +467,8 @@ struct PipelineCache::ProgramCache {
 					     "\n",
 					     params.hash);
 				}
+				FrameCapture::NoteMarker(
+				    fmt::format("SKIPPED program {:016x} (materialization failed)", params.hash));
 				return {};
 			}
 			if (const auto permutation = std::ranges::find_if(

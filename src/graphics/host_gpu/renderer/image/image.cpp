@@ -126,7 +126,10 @@ Image::Barriers Image::GetBarriers(vk::ImageLayout                      destinat
 		for (uint32_t level = base_level; level < base_level + level_count; level++) {
 			for (uint32_t layer = base_layer; layer < base_layer + layer_count; layer++) {
 				const auto index = level * info.resources.layers + layer;
-				EXIT_IF(index >= subresource_states.size());
+				if (index >= subresource_states.size()) {
+					// A range from a damaged descriptor reaching past the image: nothing to transit.
+					continue;
+				}
 				auto& subresource_state = subresource_states[index];
 
 				constexpr auto write_access = vk::AccessFlagBits2::eTransferWrite |

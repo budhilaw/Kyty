@@ -951,11 +951,44 @@ bool IsCommittedRange(uint64_t vaddr, uint64_t size) {
 	return true;
 }
 
+bool IsGpuWrittenRange(uint64_t vaddr, uint64_t size) {
+	uint8_t scratch[64];
+	if (size > sizeof(scratch) || TryReadGpuCleanBacking(vaddr, scratch, size)) {
+		return false;
+	}
+	return g_gpu_resources != nullptr && IsGpuAddressRange(vaddr, size) &&
+	       g_gpu_resources->IsMapped(vaddr, size);
+}
+
 bool ReadGpuArgs(uint64_t vaddr, void* data, uint64_t size) {
 	// Indirect draw/dispatch arguments are often written by a compute shader just before; the
 	// host must see the GPU's values, so their readback always reaches guest memory.
 	if (TryReadGpuCleanBacking(vaddr, data, size)) {
 		return true;
+	}
+	{
+		// How often the stale CPU copy is what the host ends up using, by argument size
+		// (12 = dispatch, 16 = draw, 20 = indexed draw, 4 = draw count).
+		static std::atomic<uint32_t> stale_by_size[32] {};
+		static std::atomic<uint32_t> stale_total {0};
+		if (size < 32) {
+			stale_by_size[size].fetch_add(1);
+		}
+		if (const auto n = stale_total.fetch_add(1) + 1; (n % 512) == 0) {
+			LOGF("GPUARGS stale reads=%u (dispatch=%u draw=%u indexed=%u count=%u)\n", n,
+			     stale_by_size[12].load(), stale_by_size[16].load(), stale_by_size[20].load(),
+			     stale_by_size[4].load());
+		}
+	}
+	// Without a drain, the GPU's own copy is fetched in the background: this read still sees
+	// the CPU copy, and the following frame's read sees the GPU value from one frame earlier.
+	// GPU-culled dispatch counts had stayed at their initial zero forever, so Uncharted's
+	// tile lighting never ran. KYTY_ARGS_PREFETCH=1 enables it.
+	// Off by default: one-frame-old counts can overrun this frame's data (device lost).
+	static const bool no_prefetch = std::getenv("KYTY_ARGS_PREFETCH") == nullptr;
+	if (!no_prefetch && g_gpu_resources != nullptr && Graphics::GuestGpu::IsGpuThread() &&
+	    IsGpuAddressRange(vaddr, size) && g_gpu_resources->IsMapped(vaddr, size)) {
+		(void)GetGpuResources().GetBufferCache().PrefetchRange(vaddr, size);
 	}
 	// Experimental and slow (a GPU drain per stale read): KYTY_INDIRECT_READBACK=1.
 	static const bool enabled = std::getenv("KYTY_INDIRECT_READBACK") != nullptr;
@@ -983,7 +1016,16 @@ bool ReadGpuBackingOrPrefetch(uint64_t vaddr, void* data, uint64_t size) {
 	    !IsGpuAddressRange(vaddr, size) || !g_gpu_resources->IsMapped(vaddr, size)) {
 		return false;
 	}
-	(void)GetGpuResources().GetBufferCache().PrefetchRange(vaddr, size);
+	auto& cache = GetGpuResources().GetBufferCache();
+	(void)cache.PrefetchRange(vaddr, size);
+	// Only a copy the GPU has handed back at least once is usable: before that the guest
+	// memory holds whatever the CPU left there, and GPU-driven passes built from it read
+	// garbage descriptors (crashes, hangs). Those passes skip until the first copy lands.
+	// Opt-in (KYTY_GATE_TABLES=1): gating by default blanked the intro in the default path.
+	static const bool allow_unfetched = std::getenv("KYTY_GATE_TABLES") == nullptr;
+	if (!allow_unfetched && !cache.WasDownloaded(vaddr, size)) {
+		return false;
+	}
 	return TryReadBacking(vaddr, data, size);
 }
 

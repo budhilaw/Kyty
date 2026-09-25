@@ -1425,6 +1425,41 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_format) {
 				result = id;
 			}
 		}
+		// A float/unorm view of depth memory (R32F over D32, R16 over D16) finds a colour image
+		// of its own, which never sees what depth draws wrote there. Uncharted's tile passes
+		// read a depth buffer that way and got zeros, which lit the whole screen white. When
+		// a depth image at the same address holds newer GPU data, the view resolves to it.
+		if (result && !m_slot_images[result].info.IsDepth()) {
+			const auto& color = m_slot_images[result];
+			for (const auto id: candidates) {
+				const auto& depth = m_slot_images[id];
+				if (!depth.info.IsDepth() || depth.depth_id ||
+				    depth.info.data.address != desc.info.data.address ||
+				    depth.info.extent.width != desc.info.extent.width ||
+				    depth.info.extent.height != desc.info.extent.height ||
+				    depth.gpu_write_serial <= color.gpu_write_serial) {
+					continue;
+				}
+				const auto depth_format = depth.info.pixel_format;
+				const auto view_format  = desc.info.pixel_format;
+				const bool compatible =
+				    ((depth_format == vk::Format::eD32Sfloat ||
+				      depth_format == vk::Format::eD32SfloatS8Uint) &&
+				     view_format == vk::Format::eR32Sfloat) ||
+				    ((depth_format == vk::Format::eD16Unorm ||
+				      depth_format == vk::Format::eD16UnormS8Uint) &&
+				     view_format == vk::Format::eR16Unorm);
+				if (compatible) {
+					static std::atomic<uint32_t> log_count {0};
+					if (log_count.fetch_add(1) < 8) {
+						LOGF("TextureCache: %s view of 0x%016" PRIx64 " resolved to its depth image\n",
+						     vk::to_string(view_format).c_str(), desc.info.data.address);
+					}
+					result = id;
+					break;
+				}
+			}
+		}
 
 		int32_t view_mip   = -1;
 		int32_t view_layer = -1;
@@ -1670,6 +1705,8 @@ void TextureCache::CommitGpuWrite(Image& image) {
 	if (!image.depth_id && image.backing.image == nullptr) {
 		EXIT("TextureCache: GPU writes require a native image or stencil association\n");
 	}
+	static std::atomic<uint64_t> write_serial {0};
+	image.gpu_write_serial = write_serial.fetch_add(1, std::memory_order_relaxed) + 1;
 	image.ClearBufferModified();
 	if (image.IsCpuDirty()) {
 		image.RefreshComplete();
