@@ -194,11 +194,18 @@ TextureCache::TextureCache(GraphicContext& graphics, CommandScheduler& scheduler
 		constexpr int64_t GiB = 1024ll * 1024 * 1024;
 		const auto        budget =
 		    static_cast<int64_t>(std::min<uint64_t>(m_graphics.GetTotalMemoryBudget(), INT64_MAX));
+		// Pressure and critical levels sit near the budget: an 8 GB card reports ~6.5 GB, and
+		// collecting from 40% of it evicted live render targets every frame.
 		const auto threshold = std::min<int64_t>(budget, 8 * GiB);
-		m_pressure_gc_memory = static_cast<uint64_t>(
-		    std::max<int64_t>(std::min(budget - 6 * threshold / 10, budget - GiB), GiB + GiB / 2));
-		m_critical_gc_memory = static_cast<uint64_t>(
-		    std::max<int64_t>(std::min(budget - 2 * threshold / 10, budget - GiB / 2), 3 * GiB));
+		static const bool legacy = std::getenv("KYTY_GC_LEGACY") != nullptr;
+		m_pressure_gc_memory = static_cast<uint64_t>(std::max<int64_t>(
+		    legacy ? std::min(budget - 6 * threshold / 10, budget - GiB)
+		           : std::min(budget * 3 / 4, budget - GiB),
+		    GiB + GiB / 2));
+		m_critical_gc_memory = static_cast<uint64_t>(std::max<int64_t>(
+		    legacy ? std::min(budget - 2 * threshold / 10, budget - GiB / 2)
+		           : std::min(budget * 9 / 10, budget - GiB / 2),
+		    3 * GiB));
 		m_trigger_gc_memory = static_cast<uint64_t>(std::max<int64_t>((budget - threshold) / 2, 0));
 	}
 }
@@ -533,13 +540,18 @@ TextureCache::ImageIds TextureCache::FindImagesInRegion(uint64_t address, uint64
 
 ImageId TextureCache::GetNullImage(const ImageDesc& desc) {
 	const auto format = desc.info.pixel_format;
-	if (const auto found = m_null_images.find(format); found != m_null_images.end()) {
+	// 1D and 3D slots need a null image of their own dimension: a 2D view there is invalid.
+	const auto type = desc.info.type == Prospero::ImageType::kColor3D ||
+	                          desc.info.type == Prospero::ImageType::kColor1D
+	                      ? desc.info.type
+	                      : Prospero::ImageType::kColor2D;
+	if (const auto found = m_null_images.find({format, type}); found != m_null_images.end()) {
 		return found->second;
 	}
 	ImageInfo info {};
 	info.pixel_format    = desc.info.pixel_format;
 	info.guest_format    = desc.info.guest_format;
-	info.type            = Prospero::ImageType::kColor2D;
+	info.type            = type;
 	info.extent          = {1, 1, 1};
 	info.resources       = {1, 1};
 	info.pitch           = 1;
@@ -548,7 +560,7 @@ ImageId TextureCache::GetNullImage(const ImageDesc& desc) {
 	info.tile_mode       = Prospero::TileMode::kLinear;
 	info.mip_layout[0]   = {0, info.bytes_per_block, 1, 1};
 	const auto id        = InsertImage(info);
-	m_null_images.emplace(format, id);
+	m_null_images.emplace(std::make_pair(format, type), id);
 	return id;
 }
 
@@ -1600,7 +1612,15 @@ vk::ImageView TextureCache::FindTexture(ImageId id, const ImageDesc& desc) {
 	TouchImage(image);
 	if (!image.info.data.Empty()) {
 		if (!image.registered || image.depth_id || image.binding.needs_rebind) {
-			EXIT("TextureCache: texture requires rediscovery before final acquisition\n");
+			// Another binding of the same draw replaced it (descriptors from a table the GPU is
+			// rewriting). Its memory may be released before this draw runs, so bind nothing
+			// (robustness2 null descriptor) instead of a view that could dangle.
+			static std::atomic<uint32_t> log_count {0};
+			if (log_count.fetch_add(1) < 16) {
+				LOGF("TextureCache: texture 0x%016" PRIx64 " needs rediscovery, bound null\n",
+				     image.info.data.address);
+			}
+			return {};
 		}
 	}
 	if (desc.type == BindingType::Storage) {
@@ -2199,7 +2219,8 @@ void TextureCache::RunGarbageCollector() {
 	if (m_graphics.CanReportMemoryUsage()) {
 		m_total_used_memory = m_graphics.GetDeviceMemoryUsage();
 	}
-	if (m_total_used_memory < m_trigger_gc_memory) {
+	static const bool no_gc = std::getenv("KYTY_NO_GC") != nullptr;
+	if (no_gc || m_total_used_memory < m_trigger_gc_memory) {
 		return;
 	}
 	const auto collect = [&](bool allow_aggressive) {
@@ -2226,6 +2247,12 @@ void TextureCache::RunGarbageCollector() {
 			}
 			if (owner->IsGpuModified()) {
 				const bool safe = SafeToDownload(*owner);
+				// An image the GPU wrote that cannot be saved first loses its contents when freed:
+				// Uncharted's history and lookup targets came back as garbage (magenta or black
+				// selector scene). Only critical memory pressure may drop one.
+				if (!safe && !aggressive) {
+					continue;
+				}
 				if (safe && owner->info.IsTiled()) {
 					continue;
 				}

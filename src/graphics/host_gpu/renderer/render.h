@@ -71,6 +71,9 @@ struct DrawIndexArgs {
 // Set after GPU work that can write indirect-draw counts (dispatches, GPU copies and fills);
 // the next GPU-count draw then orders those writes before its indirect read.
 void MarkIndirectArgsWritten();
+// True while a GPU-driven (indirect) dispatch resolves its bindings: the buffers it writes are
+// read by the game's CPU afterwards, so they are made eligible for readback.
+[[nodiscard]] bool InGpuDrivenDispatch();
 
 struct DrawAutoArgs {
 	uint32_t         vertex_count               = 0;

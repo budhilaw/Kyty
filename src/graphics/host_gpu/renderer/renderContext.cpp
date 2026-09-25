@@ -380,9 +380,26 @@ void RenderContext::PrepareBda() {
 	// can need an upload unless some page became CPU-modified since the last full walk.
 	const auto generation = m_buffer_cache.CpuGeneration();
 	if (generation != m_bda_synced_generation) {
-		m_mapped_ranges.ForEach([this](uint64_t start, uint64_t end) {
-			m_buffer_cache.SynchronizeBuffersInRange(start, end - start);
-		});
+		// The game writes some page every frame, so the generation nearly always moved and the
+		// full walk still cost ~16% of the GPU thread. Only the ranges written since the last
+		// sync are walked now; a full walk remains for new mappings and log overflow.
+		static const bool full_walk = std::getenv("KYTY_BDA_FULL_WALK") != nullptr;
+		bool full = full_walk || m_bda_synced_generation == UINT64_MAX;
+		thread_local std::vector<std::pair<uint64_t, uint64_t>> dirty;
+		bool                                                    log_full = false;
+		m_buffer_cache.TakeCpuDirtyLog(dirty, log_full);
+		full = full || log_full;
+		if (full) {
+			m_mapped_ranges.ForEach([this](uint64_t start, uint64_t end) {
+				m_buffer_cache.SynchronizeBuffersInRange(start, end - start);
+			});
+		} else {
+			for (const auto& [address, size]: dirty) {
+				m_mapped_ranges.ForEachInRange(address, size, [this](uint64_t start, uint64_t end) {
+					m_buffer_cache.SynchronizeBuffersInRange(start, end - start);
+				});
+			}
+		}
 		m_bda_synced_generation = generation;
 	}
 	m_fault_process_pending = true;

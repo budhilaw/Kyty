@@ -179,7 +179,7 @@ private:
 	BufferCache&                                      m_buffer_cache;
 	Common::SlotVector<Image>                         m_slot_images;
 	ImagePageTable                                    m_image_page_table;
-	std::unordered_map<vk::Format, ImageId>           m_null_images;
+	std::map<std::pair<vk::Format, Prospero::ImageType>, ImageId> m_null_images;
 	std::map<std::tuple<uint32_t, uint32_t, int>, ImageId> m_compare_placeholders;
 	Common::LeastRecentlyUsedCache<ImageId, uint64_t> m_lru_cache;
 	std::unordered_set<ImageId>                       m_download_images;

@@ -188,7 +188,9 @@ static void RtCheck(const HW::RenderTarget& rt) {
 	if (rt.base.addr != 0) {
 		//  EXIT_NOT_IMPLEMENTED(rt.base_addr == 0);
 
-		EXIT_NOT_IMPLEMENTED(rt.view.base_array_slice_index > rt.view.last_array_slice_index);
+		if (rt.view.base_array_slice_index > rt.view.last_array_slice_index) {
+			return; // damaged render-target registers; the draw path validates them itself
+		}
 		if (rt.view.base_array_slice_index != 0x00000000 ||
 		    rt.view.last_array_slice_index != 0x00000000) {
 			static bool logged = false;

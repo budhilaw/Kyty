@@ -41,6 +41,7 @@
 #include <mutex>
 #include <span>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 namespace Libs::Graphics {
@@ -200,6 +201,12 @@ bool RenderExecutor::TryConsumeComputeImageClear(const ShaderComputeInputInfo& i
 		     input.stage.program->shader_hash, descriptor.Base48(), size, packed_clear);
 	}
 	return true;
+}
+
+static thread_local bool g_gpu_driven_dispatch = false;
+
+bool InGpuDrivenDispatch() {
+	return g_gpu_driven_dispatch;
 }
 
 void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
@@ -406,6 +413,39 @@ void RenderExecutor::Dispatch(uint64_t submit_id, CommandBuffer& buffer, uint32_
 		}
 	}
 
+	if (indirect) {
+		// Diagnostic: names every GPU-driven dispatch once; KYTY_GPU_DISPATCH_SKIP lists hex
+		// hashes whose indirect dispatches are dropped (bisecting device-lost faults).
+		static std::mutex                   seen_mutex;
+		static std::unordered_set<uint64_t> seen;
+		static const std::string            skip_list = [] {
+			const char* text = std::getenv("KYTY_GPU_DISPATCH_SKIP");
+			return std::string(text != nullptr ? text : "");
+		}();
+		{
+			std::lock_guard lock(seen_mutex);
+			if (seen.insert(program.shader_hash).second) {
+				printf("GPUDISPATCH first cs=%016" PRIx64 " args=0x%016" PRIx64 "\n",
+				       program.shader_hash, indirect_args_vaddr);
+			}
+		}
+		if (!skip_list.empty() &&
+		    skip_list.find(fmt::format("{:016x}", program.shader_hash)) != std::string::npos) {
+			return;
+		}
+	}
+	{
+		// Diagnostic: KYTY_DISPATCH_SKIP drops every dispatch of the listed hex hashes.
+		static const std::string skip_all = [] {
+			const char* text = std::getenv("KYTY_DISPATCH_SKIP");
+			return std::string(text != nullptr ? text : "");
+		}();
+		if (!skip_all.empty() &&
+		    skip_all.find(fmt::format("{:016x}", program.shader_hash)) != std::string::npos) {
+			return;
+		}
+	}
+
 	buffer.EndRendering();
 	auto& pipeline = [&]() -> decltype(auto) {
 		Common::WaitTrace::Scope scope(Common::WaitTrace::Kind::GpuPipeline);
@@ -413,8 +453,10 @@ void RenderExecutor::Dispatch(uint64_t submit_id, CommandBuffer& buffer, uint32_
 	}();
 	auto bind_scope = std::make_unique<Common::WaitTrace::Scope>(Common::WaitTrace::Kind::GpuBindings);
 	auto& bindings = m_compute_bindings;
+	g_gpu_driven_dispatch = indirect;
 	PrepareBindings(input_info.stage, bindings);
 	FindBuffers(bindings);
+	g_gpu_driven_dispatch = false;
 	if (program.shader_hash == 0x1d5918390613826eull) {
 		// Diagnostic: the shadow filter's tap count lives at user_data pointer + 1792.
 		static std::atomic<uint32_t> log_count {0};
@@ -488,7 +530,9 @@ void RenderExecutor::Dispatch(uint64_t submit_id, CommandBuffer& buffer, uint32_
 		m_context.PrepareBda();
 	}
 	RebindImages(bindings);
+	g_gpu_driven_dispatch = indirect;
 	RebindBuffers(bindings);
+	g_gpu_driven_dispatch = false;
 	bind_scope.reset();
 
 	Buffer*  args_buffer = nullptr;
@@ -500,8 +544,9 @@ void RenderExecutor::Dispatch(uint64_t submit_id, CommandBuffer& buffer, uint32_
 		NoteIndirectArgsAddress(indirect_args_vaddr);
 		if (ShaderDumpRequested(program.shader_hash) && dump_count.fetch_add(1) < (1u << 20u)) {
 			uint32_t args[3] = {0, 0, 0};
-			const bool ok = Libs::LibKernel::Memory::ReadGpuBackingOrDownload(indirect_args_vaddr,
-			                                                                  args, sizeof(args));
+			// Diagnostic only: a download here would write GPU data back over guest memory.
+			const bool ok =
+			    Libs::LibKernel::Memory::TryReadBacking(indirect_args_vaddr, args, sizeof(args));
 			auto& cache = m_context.GetBufferCache();
 			LOGF("SHADERDUMP indirect dispatch hash=0x%016" PRIx64 " args=0x%016" PRIx64
 			     " groups=%ux%ux%u read=%d threads=%ux%ux%u cpu_dirty=%d gpu_dirty=%d buffer=0x%016" PRIx64

@@ -34,6 +34,20 @@ public:
 	[[nodiscard]] uint64_t CpuGeneration() const {
 		return m_cpu_generation.load(std::memory_order_acquire);
 	}
+	// Ranges that became CPU-modified since the last call. full is set when the log overflowed or
+	// a new region appeared: the caller must then walk everything.
+	void TakeCpuDirtyLog(std::vector<std::pair<uint64_t, uint64_t>>& out, bool& full) {
+		std::lock_guard lock(m_dirty_log_mutex);
+		out.swap(m_dirty_log);
+		m_dirty_log.clear();
+		full             = m_dirty_log_full;
+		m_dirty_log_full = false;
+	}
+	void RequestFullCpuSync() {
+		std::lock_guard lock(m_dirty_log_mutex);
+		m_dirty_log.clear();
+		m_dirty_log_full = true;
+	}
 	// Removes protection from a range and flushes GPU-owned data when required.
 	template <typename Flush>
 	void InvalidateRegion(uint64_t vaddr, uint64_t size, Flush&& on_flush) noexcept {
@@ -55,6 +69,8 @@ public:
 			}();
 			if (should_flush) {
 				on_flush();
+			} else {
+				NoteCpuDirty(manager->GetCpuAddr() + offset, bytes);
 			}
 		});
 	}
@@ -151,6 +167,19 @@ private:
 		return false;
 	}
 
+	void NoteCpuDirty(uint64_t vaddr, uint64_t size) {
+		std::lock_guard lock(m_dirty_log_mutex);
+		if (m_dirty_log_full) {
+			return;
+		}
+		if (m_dirty_log.size() >= 8192) {
+			m_dirty_log.clear();
+			m_dirty_log_full = true;
+			return;
+		}
+		m_dirty_log.emplace_back(vaddr, size);
+	}
+
 	static void    ValidateRange(uint64_t vaddr, uint64_t size);
 	RegionManager* GetOrCreateRegion(uint64_t index);
 
@@ -158,6 +187,9 @@ private:
 	std::vector<std::unique_ptr<RegionManager>>    m_region_storage;
 	std::atomic<uint64_t>                          m_cpu_generation {0};
 	std::mutex                                     m_region_mutex;
+	std::mutex                                     m_dirty_log_mutex;
+	std::vector<std::pair<uint64_t, uint64_t>>     m_dirty_log;
+	bool                                           m_dirty_log_full = true;
 	PageManager&                                   m_page_manager;
 };
 

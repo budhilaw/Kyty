@@ -80,6 +80,9 @@ public:
 	void               ProcessFaultBuffer();
 	void               SynchronizeBuffersInRange(uint64_t vaddr, uint64_t size);
 	[[nodiscard]] uint64_t CpuGeneration() const { return m_memory_tracker.CpuGeneration(); }
+	void TakeCpuDirtyLog(std::vector<std::pair<uint64_t, uint64_t>>& out, bool& full) {
+		m_memory_tracker.TakeCpuDirtyLog(out, full);
+	}
 	void               RunGarbageCollector();
 
 private:

@@ -66,6 +66,7 @@ RegionManager* MemoryTracker::GetOrCreateRegion(uint64_t index) {
 	}
 	auto  manager = std::make_unique<RegionManager>(m_page_manager, index * TRACKER_REGION_SIZE);
 	m_cpu_generation.fetch_add(1, std::memory_order_acq_rel);
+	RequestFullCpuSync();
 	auto* ptr     = manager.get();
 	m_region_storage.push_back(std::move(manager));
 	m_regions[index].store(ptr, std::memory_order_release);
@@ -95,6 +96,7 @@ void MemoryTracker::MarkRegionAsCpuModified(uint64_t vaddr, uint64_t size) {
 		std::scoped_lock lock(manager->lock);
 		manager->ChangeState<DirtySource::Cpu, true>(manager->GetCpuAddr() + offset, bytes);
 	});
+	NoteCpuDirty(vaddr, size);
 }
 
 void MemoryTracker::MarkRegionAsGpuModified(uint64_t vaddr, uint64_t size) {
@@ -137,6 +139,7 @@ void MemoryTracker::UntrackMemory(uint64_t vaddr, uint64_t size) {
 		manager->ChangeState<DirtySource::Cpu, true>(manager->GetCpuAddr() + offset, bytes);
 	});
 	m_cpu_generation.fetch_add(1, std::memory_order_acq_rel);
+	NoteCpuDirty(vaddr, size);
 }
 
 } // namespace Libs::Graphics

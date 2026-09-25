@@ -128,6 +128,8 @@ public:
 		}
 		return evaluation_index;
 	}
+	// UINT32_MAX until the owning plan numbered its values.
+	[[nodiscard]] uint32_t AssignedEvaluationIndex() const { return evaluation_index; }
 
 	void SetParent(Block* block);
 	void SetArg(size_t index, Value value);

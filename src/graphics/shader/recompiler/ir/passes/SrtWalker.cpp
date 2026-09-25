@@ -462,13 +462,38 @@ private:
 
 thread_local std::string t_srt_failure;
 
+// Evaluated values of every live evaluator on this thread, stamped with the owning evaluator's
+// epoch. Zeroing two plan-sized arrays per evaluator (several per draw) and a hash lookup per
+// value were a large part of per-draw resource setup; a stale stamp now simply means "absent".
+struct EvaluationSlots {
+	std::vector<uint64_t> values;
+	std::vector<uint32_t> stamps;
+	uint32_t              epoch = 0;
+
+	uint32_t NextEpoch() {
+		if (++epoch == 0) {
+			std::fill(stamps.begin(), stamps.end(), 0u);
+			epoch = 1;
+		}
+		return epoch;
+	}
+	void Reserve(size_t count) {
+		if (values.size() < count) {
+			values.resize(count);
+			stamps.resize(count, 0u);
+		}
+	}
+};
+thread_local EvaluationSlots t_evaluation_slots;
+
 class Evaluator {
 public:
 	Evaluator(const ResourcePlan& program, const SrtRuntime& runtime,
 	          std::span<const uint8_t> clean_flat_slots = {}, Evaluator* clean_evaluator = nullptr,
 	          Value active_mask = {})
 	    : m_program(program), m_runtime(runtime), m_clean_flat_slots(clean_flat_slots),
-	      m_clean_evaluator(clean_evaluator), m_active_mask(active_mask.Resolve()) {}
+	      m_clean_evaluator(clean_evaluator), m_active_mask(active_mask.Resolve()),
+	      m_epoch(t_evaluation_slots.NextEpoch()) {}
 
 	bool Evaluate(Value value, uint32_t& result) {
 		uint64_t wide = 0;
@@ -503,30 +528,32 @@ private:
 		}
 		if (!m_reserved) {
 			// One flat slot per plan value instead of a hash node per evaluated value: this
-			// evaluation runs for hundreds of draws per frame.
-			if (m_program.value_index.size() != m_program.value_storage.size()) {
-				m_program.value_index.clear();
-				m_program.value_index.reserve(m_program.value_storage.size());
-				uint32_t next = 0;
+			// evaluation runs for hundreds of draws per frame. Plan values carry their slot.
+			if (m_program.evaluation_numbered != m_program.value_storage.size()) {
+				uint32_t count = 0;
 				for (const auto& stored: m_program.value_storage) {
-					m_program.value_index.emplace(&stored, next++);
+					const auto index = stored.AssignedEvaluationIndex();
+					if (index != UINT32_MAX) {
+						count = std::max(count, index + 1u);
+					}
 				}
+				for (const auto& stored: m_program.value_storage) {
+					(void)stored.EvaluationIndex(count);
+				}
+				m_program.evaluation_numbered = m_program.value_storage.size();
 			}
-			m_slots.assign(m_program.value_storage.size(), 0);
-			m_have.assign(m_program.value_storage.size(), 0);
-			m_visiting.reserve(64);
 			m_reserved = true;
 		}
 		if (!m_active_mask.IsEmpty() && IsRuntimeSelect(inst->GetOpcode()) &&
 		    inst->NumArgs() == 3 && inst->Arg(0).Resolve() == m_active_mask) {
 			return EvaluateWide(inst->Arg(1), result);
 		}
-		uint32_t slot = UINT32_MAX;
-		if (const auto indexed = m_program.value_index.find(inst);
-		    indexed != m_program.value_index.end()) {
-			slot = indexed->second;
-			if (m_have[slot] != 0) {
-				result = m_slots[slot];
+		auto&      slots = t_evaluation_slots;
+		const auto slot  = inst->AssignedEvaluationIndex();
+		if (slot != UINT32_MAX) {
+			slots.Reserve(size_t {slot} + 1u);
+			if (slots.stamps[slot] == m_epoch) {
+				result = slots.values[slot];
 				return true;
 			}
 		} else if (const auto found = m_cache.find(inst); found != m_cache.end()) {
@@ -548,8 +575,8 @@ private:
 			return false;
 		}
 		if (slot != UINT32_MAX) {
-			m_slots[slot] = out;
-			m_have[slot]  = 1;
+			slots.values[slot] = out;
+			slots.stamps[slot] = m_epoch;
 		} else {
 			m_cache.emplace(inst, out);
 		}
@@ -1016,9 +1043,8 @@ private:
 	std::span<const uint8_t>                  m_clean_flat_slots;
 	Evaluator*                                m_clean_evaluator = nullptr;
 	Value                                     m_active_mask;
+	uint32_t                                  m_epoch = 0;
 	std::unordered_map<const Inst*, uint64_t> m_cache;
-	std::vector<uint64_t>                     m_slots;
-	std::vector<uint8_t>                      m_have;
 	std::vector<const Inst*>                  m_visiting;
 	bool                                      m_reserved = false;
 };

@@ -539,6 +539,8 @@ struct ResourcePlan {
 	// Dense index of value_storage, built on first evaluation; list nodes never move, so it
 	// stays valid across moves of the plan.
 	mutable std::unordered_map<const Inst*, uint32_t> value_index;
+	// value_storage size when its instructions were last numbered for evaluation.
+	mutable size_t evaluation_numbered = SIZE_MAX;
 	std::vector<MemoryInfo>             memory_info;
 	std::vector<DescriptorSource>       descriptor_sources;
 	std::vector<ResourceBlock>          control_flow;

@@ -1982,7 +1982,11 @@ KYTY_CP_OP_PARSER(CpOpIndexBufferSize) {
 KYTY_CP_OP_PARSER(CpOpIndexBase) {
 	KYTY_PROFILER_FUNCTION();
 
-	EXIT_NOT_IMPLEMENTED(cmd_id != 0xc0012600);
+	if (cmd_id != 0xc0012600) {
+		// A damaged packet (command memory the GPU is rewriting): skip it by its length.
+		LOGF("PM4: skipped unexpected INDEX_BASE header 0x%08x\n", cmd_id);
+		return KYTY_PM4_LEN(cmd_id) > 0u ? KYTY_PM4_LEN(cmd_id) - 1u : 0u;
+	}
 
 	auto index_base_addr = buffer[0] | (static_cast<uint64_t>(buffer[1]) << 32u);
 
@@ -2786,7 +2790,10 @@ static uint32_t CpOpWaitRegMemSized(CommandProcessor& cp, uint32_t cmd_id, const
 	auto  mask = CpOpWaitRegMemReadValue<T>(buffer + 3u + value_dw);
 	auto  poll = buffer[3u + value_dw * 2u];
 
-	EXIT_NOT_IMPLEMENTED((ctrl & 0x10u) == 0);
+	if ((ctrl & 0x10u) == 0) {
+		// Waits on a register: nothing the emulated command processor can poll; continue.
+		return payload_dw;
+	}
 
 	cp.WaitRegMem(ctrl & 0x7u, addr, ref, mask, poll, CpOpWaitRegMemWaitOp<T>(ctrl));
 

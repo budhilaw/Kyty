@@ -1942,6 +1942,21 @@ void CommandProcessor::DrawIndexOffset(uint32_t index_offset, uint32_t index_cou
 	DrawIndex({.index_count = index_count, .index_addr = index_addr});
 }
 
+// Stale CPU copies of GPU-written draw arguments can hold any value; a draw of billions of
+// vertices ran for seconds and tripped the driver timeout (device lost).
+static bool PlausibleIndirectDraw(uint64_t count, uint64_t instances, const char* what) {
+	if (instances <= (uint64_t {1} << 16u) &&
+	    count * std::max<uint64_t>(instances, 1u) <= (uint64_t {1} << 26u)) {
+		return true;
+	}
+	static std::atomic<uint32_t> log_count {0};
+	if (log_count.fetch_add(1) < 32) {
+		LOGF("%s: skipped implausible draw count=%" PRIu64 " instances=%" PRIu64 "\n", what, count,
+		     instances);
+	}
+	return false;
+}
+
 void CommandProcessor::DrawIndirect(uint32_t data_offset, uint32_t draw_initiator, bool indexed) {
 	EXIT_NOT_IMPLEMENTED((draw_initiator & ~0x20u) != 2u);
 	EXIT_NOT_IMPLEMENTED(m_draw_indirect_args_base_addr == 0);
@@ -1969,6 +1984,9 @@ void CommandProcessor::DrawIndirect(uint32_t data_offset, uint32_t draw_initiato
 				     args.vertex_count_per_instance, args.instance_count,
 				     args.start_vertex_location, args.start_instance_location);
 			}
+		}
+		if (!PlausibleIndirectDraw(args.vertex_count_per_instance, args.instance_count, "DrawIndirect")) {
+			return;
 		}
 		m_num_instances = args.instance_count;
 		DrawIndexAuto({.vertex_count   = args.vertex_count_per_instance,
@@ -2043,6 +2061,9 @@ void CommandProcessor::DrawIndirect(uint32_t data_offset, uint32_t draw_initiato
 		}
 	}
 
+	if (!PlausibleIndirectDraw(index_count, args.instance_count, "DrawIndexIndirect")) {
+		return;
+	}
 	m_num_instances = args.instance_count;
 	DrawIndex({.index_count    = index_count,
 	           .index_addr     = index_addr,
@@ -2095,6 +2116,10 @@ void CommandProcessor::DrawIndirectMulti(uint32_t data_offset, uint32_t max_coun
 			DrawIndirectArgs args_value {};
 			(void)Libs::LibKernel::Memory::ReadGpuArgs(args_addr, &args_value, sizeof(args_value));
 			const auto* args = &args_value;
+			if (!PlausibleIndirectDraw(args->vertex_count_per_instance, args->instance_count,
+			                           "DrawIndirectMulti")) {
+				continue;
+			}
 			m_num_instances = args->instance_count;
 			DrawIndexAuto({.vertex_count   = args->vertex_count_per_instance,
 			               .instance_count = args->instance_count,
@@ -2124,6 +2149,9 @@ void CommandProcessor::DrawIndirectMulti(uint32_t data_offset, uint32_t max_coun
 			}
 		}
 
+		if (!PlausibleIndirectDraw(index_count, args->instance_count, "DrawIndexIndirectMulti")) {
+			continue;
+		}
 		m_num_instances = args->instance_count;
 		DrawIndex({.index_count    = index_count,
 		           .index_addr     = index_addr,
@@ -2217,9 +2245,18 @@ void CommandProcessor::DispatchIndirect(uint64_t args_addr, uint32_t mode) {
 		return;
 	}
 	if (Libs::LibKernel::Memory::ReadGpuArgs(args_addr, &args, sizeof(args))) {
-		if (uint64_t {args.thread_group_x} * args.thread_group_y * args.thread_group_z >
-		    (uint64_t {1} << 22u)) {
-			return; // garbage counts: a dispatch this large would hang the device
+		const auto groups =
+		    uint64_t {args.thread_group_x} * args.thread_group_y * args.thread_group_z;
+		// Garbage counts: the clamped GPU path allows 131072 groups; a stale CPU copy with
+		// millions of groups ran for seconds and tripped the driver timeout (device lost when
+		// the Uncharted selector loads).
+		if (groups > (uint64_t {1} << 17u)) {
+			static std::atomic<uint32_t> log_count {0};
+			if (log_count.fetch_add(1) < 32) {
+				LOGF("DispatchIndirect: skipped implausible %ux%ux%u groups at 0x%016" PRIx64 "\n",
+				     args.thread_group_x, args.thread_group_y, args.thread_group_z, args_addr);
+			}
+			return;
 		}
 		DispatchDirect(args.thread_group_x, args.thread_group_y, args.thread_group_z, mode);
 		return;

@@ -303,9 +303,14 @@ BufferCache::BufferCache(GraphicContext& graphics, CommandScheduler& scheduler,
 	constexpr int64_t target_threshold = 8 * GiB;
 	const auto        budget =
 	    static_cast<int64_t>(std::min<uint64_t>(m_graphics.GetTotalMemoryBudget(), INT64_MAX));
-	const auto threshold = std::min(budget, target_threshold);
-	const auto expected  = std::min(budget - 6 * threshold / 10, budget - GiB);
-	const auto critical  = std::min(budget - 2 * threshold / 10, budget - GiB / 2);
+	// Collect near the budget, not from 40% of it: at the Uncharted selector (5 GB of 6.5 GB)
+	// the old levels ran the collector every frame.
+	static const bool legacy   = std::getenv("KYTY_GC_LEGACY") != nullptr;
+	const auto        threshold = std::min(budget, target_threshold);
+	const auto expected = legacy ? std::min(budget - 6 * threshold / 10, budget - GiB)
+	                             : std::min(budget * 3 / 4, budget - GiB);
+	const auto critical = legacy ? std::min(budget - 2 * threshold / 10, budget - GiB / 2)
+	                             : std::min(budget * 9 / 10, budget - GiB / 2);
 	m_trigger_gc_memory  = static_cast<uint64_t>(std::max<int64_t>(expected, GiB));
 	m_critical_gc_memory = static_cast<uint64_t>(std::max<int64_t>(critical, 2 * GiB));
 }
@@ -1368,7 +1373,13 @@ void BufferCache::RunGarbageCollector() {
 	if (m_graphics.CanReportMemoryUsage()) {
 		m_total_used_memory = m_graphics.GetDeviceMemoryUsage();
 	}
-	if (m_total_used_memory < m_trigger_gc_memory) {
+	if (tick % 600 == 0) {
+		printf("VRAM used=%" PRIu64 "MB trigger=%" PRIu64 "MB critical=%" PRIu64 "MB pending=%zu\n",
+		       m_total_used_memory >> 20u, m_trigger_gc_memory >> 20u, m_critical_gc_memory >> 20u,
+		       m_pending_downloads.size());
+	}
+	static const bool no_gc = std::getenv("KYTY_NO_GC") != nullptr;
+	if (no_gc || m_total_used_memory < m_trigger_gc_memory) {
 		return;
 	}
 
@@ -1376,14 +1387,25 @@ void BufferCache::RunGarbageCollector() {
 	const uint64_t age        = std::min<uint64_t>(aggressive ? 80 : 160, tick);
 	const size_t   limit      = aggressive ? 64 : 32;
 
-	// Ownership validation below expects no download to be in flight.
-	RetirePendingDownloads(true);
+	// Waiting for every in-flight download here drained the GPU each frame once memory use
+	// passed the trigger (2 fps at the Uncharted selector). Retire only finished downloads and
+	// leave buffers that still have one in flight for a later pass.
+	RetirePendingDownloads(false);
+	const auto download_in_flight = [&](const Buffer& buffer) {
+		return std::any_of(m_pending_downloads.begin(), m_pending_downloads.end(), [&](const auto& d) {
+			return d.begin < buffer.CpuAddress() + buffer.Size() &&
+			       d.begin + d.size > buffer.CpuAddress();
+		});
+	};
 
 	std::vector<BufferId> dirty_buffers;
 	size_t                retire_count = 0;
 	m_lru_cache.ForEachItemBelow(tick - age, [&](BufferId id) {
 		auto& buffer = m_slot_buffers[id];
 		EXIT_IF(buffer.is_deleted);
+		if (download_in_flight(buffer)) {
+			return false;
+		}
 		m_memory_tracker.ValidateGpuDirtyOwnership(m_gpu_modified_ranges, buffer.CpuAddress(),
 		                                           buffer.Size(), "garbage collection");
 		const bool dirty = m_memory_tracker.IsRegionGpuModified(buffer.CpuAddress(), buffer.Size());
@@ -1413,7 +1435,13 @@ void BufferCache::RunGarbageCollector() {
 		m_memory_tracker.UnmarkRegionAsGpuModified(buffer.CpuAddress(), buffer.Size());
 		if (m_memory_tracker.IsRegionGpuModified(buffer.CpuAddress(), buffer.Size()) ||
 		    m_gpu_modified_ranges.Intersects(buffer.CpuAddress(), buffer.Size())) {
-			EXIT("BufferCache: garbage collection retained GPU ownership\n");
+			// The GPU wrote into it again meanwhile: keep the buffer, a later pass retires it.
+			static std::atomic<uint32_t> log_count {0};
+			if (log_count.fetch_add(1) < 16) {
+				LOGF("BufferCache: garbage collection kept re-dirtied buffer 0x%016" PRIx64 "\n",
+				     buffer.CpuAddress());
+			}
+			continue;
 		}
 		m_memory_tracker.UntrackMemory(buffer.CpuAddress(), buffer.Size());
 		Unregister(id);

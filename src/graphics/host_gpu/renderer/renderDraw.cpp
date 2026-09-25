@@ -1306,7 +1306,18 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 	if (!draw.IsIndexed()) {
 		SetDrawDebugPhase(buffer, submit_id, draw, 0x500u);
 	}
-	if (mesh_active) {
+	static const std::string skip_ps = [] {
+		// Diagnostic: KYTY_DRAW_SKIP_PS lists hex pixel-shader hashes whose draws are dropped.
+		const char* text = std::getenv("KYTY_DRAW_SKIP_PS");
+		return std::string(text != nullptr ? text : "");
+	}();
+	const bool skip_draw =
+	    !skip_ps.empty() && state.ps_active && state.ps_input_info.stage.program != nullptr &&
+	    skip_ps.find(fmt::format("{:016x}", state.ps_input_info.stage.program->shader_hash)) !=
+	        std::string::npos;
+	if (skip_draw) {
+		// dropped
+	} else if (mesh_active) {
 		vk_buffer.drawMeshTasksEXT(mesh_groups, draw.instance_count, 1);
 	} else {
 		EmitDrawPrimitives(ucfg, vk_buffer, draw, emit, gpu_args_buffer, gpu_args_offset);

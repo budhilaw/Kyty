@@ -153,6 +153,9 @@ NativeStorageBuffer(RenderContext& context, const PreparedBindings::BufferSource
 	buffer_offset = static_cast<uint32_t>(adjustment);
 	const vk::DescriptorBufferInfo result {buffer->Handle(), aligned_offset, size + adjustment};
 	FrameCapture::NoteBuffer("buffer", address, size, resource.written);
+	if (resource.written && InGpuDrivenDispatch()) {
+		context.GetBufferCache().RequestWriteback(address, size);
+	}
 	if (resource.written) {
 		context.GetTextureCache().InvalidateMemoryFromGPU(address, size);
 	}
@@ -430,10 +433,23 @@ static TextureCache::ImageDesc NullTextureDesc(const ShaderRecompiler::IR::Image
 	// The placeholder must match the shader's image dimension; a 2D view in a 3D or array slot
 	// is invalid and can fault the GPU.
 	using Dim = ShaderRecompiler::Decoder::ImageDimension;
-	if (!resource.cube) {
+	// Cube slots are declared by their dimension too (a 2D array), so they follow the same rule.
+	{
 		switch (resource.dimension) {
 			case Dim::Dim2DArray:
 				desc.view_info.type = vk::ImageViewType::e2DArray;
+				break;
+			case Dim::Dim3D:
+				desc.info.type      = Prospero::ImageType::kColor3D;
+				desc.view_info.type = vk::ImageViewType::e3D;
+				break;
+			case Dim::Dim1D:
+				desc.info.type      = Prospero::ImageType::kColor1D;
+				desc.view_info.type = vk::ImageViewType::e1D;
+				break;
+			case Dim::Dim1DArray:
+				desc.info.type      = Prospero::ImageType::kColor1D;
+				desc.view_info.type = vk::ImageViewType::e1DArray;
 				break;
 			default: break;
 		}
@@ -794,7 +810,9 @@ TextureBinding RenderExecutor::ResolveTexture(const ShaderRecompiler::IR::ImageR
 			return NullTextureBinding(resource, storage, texture_cache, "unsupported storage descriptor");
 		}
 	}
-	if (size.size > (uint64_t {1} << 30u)) {
+	// Layered full-screen "arrays" of 100+ layers come from stale descriptor tables; honouring
+	// them expanded existing targets into 470 MB images (100+ ms stalls, VRAM exhaustion).
+	if (size.size > (uint64_t {1} << 30u) || (image_layers > 1u && size.size > (uint64_t {128} << 20u))) {
 		// Over 1 GiB is not a game texture but a descriptor read from reused memory; allocating
 		// it exhausted video memory in one step. Sample a null image instead.
 		static std::atomic<uint32_t> log_count {0};
@@ -818,6 +836,21 @@ TextureBinding RenderExecutor::ResolveTexture(const ShaderRecompiler::IR::ImageR
 	}
 	if (storage && !ValidateStorageTexture(resource, descriptor, size.size)) {
 		return NullTextureBinding(resource, storage, texture_cache, "invalid storage texture");
+	}
+	{
+		// More levels than the extent allows (10 for 32x32) is a stale descriptor; Vulkan cannot
+		// create such an image.
+		uint32_t largest = std::max(width, height);
+		if (volume) {
+			largest = std::max(largest, depth);
+		}
+		uint32_t max_levels = 1;
+		while ((largest >> max_levels) != 0u) {
+			max_levels++;
+		}
+		if (levels > max_levels) {
+			return NullTextureBinding(resource, storage, texture_cache, "impossible mip count");
+		}
 	}
 
 	auto pixel_format = surface_format.vk_format;

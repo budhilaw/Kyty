@@ -403,13 +403,13 @@ static void StartGpuSampler() {
 			}
 			// Nothing may allocate while the thread is suspended: it can be holding the heap
 			// lock, and the sampler would then wait on it forever.
-			uint64_t frames[8] {};
+			uint64_t frames[16] {};
 			int      frame_count = 0;
 			if (SuspendThread(gpu) != static_cast<DWORD>(-1)) {
 				CONTEXT context {};
 				context.ContextFlags = CONTEXT_FULL;
 				if (GetThreadContext(gpu, &context) != 0) {
-					for (; frame_count < 8 && context.Rip != 0; frame_count++) {
+					for (; frame_count < 16 && context.Rip != 0; frame_count++) {
 						frames[frame_count] = context.Rip;
 						DWORD64 image_base = 0;
 						auto*   function   = RtlLookupFunctionEntry(context.Rip, &image_base, nullptr);
@@ -450,7 +450,7 @@ static void StartGpuSampler() {
 					std::vector<std::pair<uint64_t, uint32_t>> rows(table.begin(), table.end());
 					std::sort(rows.begin(), rows.end(),
 					          [](const auto& a, const auto& b) { return a.second > b.second; });
-					std::string line = fmt::format("GPUSAMPLE {} n={}:", name, samples);
+					std::string line = fmt::format("GPUSAMPLE {} tid={} n={}:", name, tid, samples);
 					for (size_t i = 0; i < rows.size() && i < 30; i++) {
 						line += fmt::format(" {:x}={:.1f}%", rows[i].first,
 						                    100.0 * rows[i].second / samples);
