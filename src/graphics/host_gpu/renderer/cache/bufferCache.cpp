@@ -1676,7 +1676,11 @@ void BufferCache::RunGarbageCollector() {
 		m_memory_tracker.ValidateGpuDirtyOwnership(m_gpu_modified_ranges, buffer.CpuAddress(),
 		                                           buffer.Size(), "garbage collection");
 		const bool dirty = m_memory_tracker.IsRegionGpuModified(buffer.CpuAddress(), buffer.Size());
-		if (dirty && !aggressive) {
+		// A GPU-written buffer is the only current copy of its data: its download reaches guest
+		// memory only for pages the game polls, so evicting it at 90% of the budget lost the
+		// selector's GPU-built scene data (no geometry, an over-exposed blob). Only past the
+		// whole budget.
+		if (dirty && (!aggressive || m_total_used_memory < m_critical_gc_memory / 9 * 10)) {
 			return false;
 		}
 		if (dirty) {

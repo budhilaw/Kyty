@@ -43,6 +43,9 @@ public:
 		full             = m_dirty_log_full;
 		m_dirty_log_full = false;
 	}
+	// A newly created buffer: its pages are synchronized by the next raw-pointer sync, which
+	// otherwise walks only pages the CPU wrote since the last one.
+	void LogRangeForSync(uint64_t vaddr, uint64_t size) { NoteCpuDirty(vaddr, size); }
 	void RequestFullCpuSync() {
 		std::lock_guard lock(m_dirty_log_mutex);
 		m_dirty_log.clear();

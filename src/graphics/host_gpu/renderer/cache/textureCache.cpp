@@ -2272,7 +2272,9 @@ void TextureCache::RunGarbageCollector() {
 				// An image the GPU wrote that cannot be saved first loses its contents when freed:
 				// Uncharted's history and lookup targets came back as garbage (magenta or black
 				// selector scene). Only critical memory pressure may drop one.
-				if (!safe && !aggressive) {
+				// Critical pressure (90% of the budget) alone is not enough: at 6.1 of 6.5 GB the
+				// selector's sky and history targets were freed and came back magenta.
+				if (!safe && (!aggressive || m_total_used_memory < m_critical_gc_memory / 9 * 10)) {
 					continue;
 				}
 				if (safe && owner->info.IsTiled()) {
