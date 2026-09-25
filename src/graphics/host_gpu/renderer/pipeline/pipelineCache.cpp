@@ -129,9 +129,57 @@ void PipelineCacheLog(fmt::format_string<Args...> format, Args&&... args) {
 	Log::WriteToConsoleAndLog(message);
 }
 
+// Resource materialization reads shader tables one dword at a time, thousands of times per
+// frame, and every read took the buffer cache, texture cache and mapping locks. Within one
+// materialization the tables are read in 256-byte blocks instead; the cache is reset before
+// each materialization so values never outlive the dispatch they were read for.
+namespace {
+struct ShaderReadCache {
+	static constexpr uint64_t BlockBytes = 256;
+	static constexpr size_t   Slots      = 16;
+	struct Block {
+		uint64_t                                base  = UINT64_MAX;
+		std::array<uint32_t, BlockBytes / 4u> words {};
+	};
+	std::array<Block, Slots> blocks {};
+	size_t                   next = 0;
+	void                     Reset() {
+		for (auto& block: blocks) {
+			block.base = UINT64_MAX;
+		}
+		next = 0;
+	}
+};
+thread_local ShaderReadCache g_shader_read_cache;
+} // namespace
+
+void ResetShaderGuestMemoryCache() {
+	g_shader_read_cache.Reset();
+}
+
 bool ReadShaderGuestMemory(void*, uint64_t address, uint32_t* value) {
-	return value != nullptr &&
-	       Libs::LibKernel::Memory::ReadGpuBackingOrDownload(address, value, sizeof(*value));
+	if (value == nullptr) {
+		return false;
+	}
+	auto&      cache = g_shader_read_cache;
+	const auto base  = address & ~(ShaderReadCache::BlockBytes - 1u);
+	if ((address & 3u) == 0) {
+		for (const auto& block: cache.blocks) {
+			if (block.base == base) {
+				*value = block.words[(address - base) / 4u];
+				return true;
+			}
+		}
+		auto& block = cache.blocks[cache.next];
+		if (Libs::LibKernel::Memory::ReadGpuBackingOrDownload(base, block.words.data(),
+		                                                      ShaderReadCache::BlockBytes)) {
+			block.base = base;
+			cache.next = (cache.next + 1u) % ShaderReadCache::Slots;
+			*value     = block.words[(address - base) / 4u];
+			return true;
+		}
+	}
+	return Libs::LibKernel::Memory::ReadGpuBackingOrDownload(address, value, sizeof(*value));
 }
 
 void DumpShaderSpirv(const char* stage_name, uint64_t shader_hash,
@@ -325,6 +373,7 @@ struct PipelineCache::ProgramCache {
 		    .shader_base                = params.Base(),
 		    .read_specialization_memory = ReadShaderGuestMemory,
 		};
+		ResetShaderGuestMemoryCache();
 		if (entry != programs.end()) {
 			if (!ShaderRecompiler::IR::MaterializeResources(entry->second.resource_plan, runtime,
 			                                                entry->second.resources,
