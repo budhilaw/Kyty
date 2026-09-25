@@ -66,12 +66,130 @@ struct ClampPush {
 constexpr uint32_t ClampSlots = 4096;
 } // namespace
 
+void RenderContext::RecordClamp(vk::CommandBuffer command, uint64_t src, uint64_t dst,
+                                uint32_t limit_x, uint32_t limit_y, uint32_t limit_z,
+                                uint32_t mode, uint32_t groups) {
+	const ClampPush push {src, dst, limit_x, limit_y, limit_z, mode};
+
+	// The counts may come from a shader, a copy or a table upload recorded just before.
+	vk::MemoryBarrier2 before {};
+	before.srcStageMask  = vk::PipelineStageFlagBits2::eAllCommands;
+	before.srcAccessMask = vk::AccessFlagBits2::eShaderWrite | vk::AccessFlagBits2::eTransferWrite;
+	before.dstStageMask  = vk::PipelineStageFlagBits2::eComputeShader;
+	before.dstAccessMask = vk::AccessFlagBits2::eShaderRead | vk::AccessFlagBits2::eShaderWrite;
+	vk::DependencyInfo dependency {};
+	dependency.memoryBarrierCount = 1;
+	dependency.pMemoryBarriers    = &before;
+	command.pipelineBarrier2(dependency);
+
+	command.bindPipeline(vk::PipelineBindPoint::eCompute, m_clamp_pipeline);
+	command.pushConstants(m_clamp_layout, vk::ShaderStageFlagBits::eCompute, 0, sizeof(push),
+	                      &push);
+	GpuCheckpoint(command, 0xF000000000000003ull);
+	command.dispatch(groups, 1, 1);
+
+	vk::MemoryBarrier2 after {};
+	after.srcStageMask  = vk::PipelineStageFlagBits2::eComputeShader;
+	after.srcAccessMask = vk::AccessFlagBits2::eShaderWrite;
+	after.dstStageMask  = vk::PipelineStageFlagBits2::eDrawIndirect;
+	after.dstAccessMask = vk::AccessFlagBits2::eIndirectCommandRead;
+	dependency.pMemoryBarriers = &after;
+	command.pipelineBarrier2(dependency);
+}
+
+bool RenderContext::ClampDrawArgs(vk::CommandBuffer command, uint64_t vaddr, const Buffer& source,
+                                  uint64_t offset, uint32_t max_indices, vk::Buffer& out_buffer,
+                                  uint64_t& out_offset) {
+	// Persistent slots take the low half of the scratch buffer; the dispatch ring the high half.
+	constexpr uint32_t BulkSlots = ClampSlots / 2;
+	if (!source.HasDeviceAddress() || !EnsureClampPipeline()) {
+		return false;
+	}
+	auto&    scheduler = GetCommandScheduler();
+	uint32_t slot      = UINT32_MAX;
+	bool     single    = false;
+	if (const auto found = m_draw_clamp_index.find(vaddr); found != m_draw_clamp_index.end()) {
+		slot        = found->second;
+		auto& entry = m_draw_clamp_entries[slot];
+		if (max_indices < entry.max_indices) {
+			// A smaller index buffer than the slot was clamped for: clamp this draw on its own.
+			entry.max_indices = max_indices;
+			single            = true;
+		} else if (max_indices > entry.max_indices) {
+			entry.max_indices  = max_indices;
+			m_draw_clamp_stale = true;
+		}
+	} else if (m_draw_clamp_entries.size() < BulkSlots) {
+		slot = static_cast<uint32_t>(m_draw_clamp_entries.size());
+		m_draw_clamp_entries.push_back({vaddr, max_indices});
+		m_draw_clamp_index.emplace(vaddr, slot);
+		single = true;
+	} else {
+		scheduler.EndRendering();
+		return ClampIndirectArgs(command, source, offset, out_buffer, out_offset, max_indices);
+	}
+	const auto dst = m_clamp_scratch->BufferDeviceAddress() + uint64_t {slot} * 32u;
+	if (single) {
+		scheduler.EndRendering();
+		RecordClamp(command, source.BufferDeviceAddress() + offset, dst, max_indices, 1u << 16u,
+		            0, 1u, 1);
+	} else if (TakeDrawClampStale() || m_draw_clamp_stale) {
+		m_draw_clamp_stale = false;
+		scheduler.EndRendering();
+		// One dispatch refreshes every slot from the arguments' current buffers.
+		struct Entry {
+			uint64_t src;
+			uint32_t max_indices;
+			uint32_t pad;
+		};
+		std::vector<Entry> table(m_draw_clamp_entries.size());
+		for (size_t i = 0; i < table.size(); i++) {
+			const auto& entry = m_draw_clamp_entries[i];
+			auto [buffer, buffer_offset] =
+			    m_buffer_cache.ObtainBuffer(entry.vaddr, sizeof(vk::DrawIndexedIndirectCommand), false);
+			const bool ok = buffer != nullptr && (buffer_offset & 3u) == 0 && buffer->HasDeviceAddress();
+			table[i] = {ok ? buffer->BufferDeviceAddress() + buffer_offset : 0u, entry.max_indices, 0u};
+		}
+		const auto table_bytes = table.size() * sizeof(Entry);
+		if (m_draw_clamp_table == nullptr || m_draw_clamp_table->Size() < table_bytes) {
+			m_draw_clamp_table = std::make_unique<Buffer>(
+			    m_graphics, m_command_scheduler, MemoryUsage::DeviceLocal, 0,
+			    vk::BufferUsageFlagBits::eStorageBuffer | vk::BufferUsageFlagBits::eTransferDst |
+			        vk::BufferUsageFlagBits::eShaderDeviceAddress,
+			    uint64_t {BulkSlots} * sizeof(Entry));
+			SetVulkanObjectNameF(m_graphics.device, m_draw_clamp_table->Handle(),
+			                     "Kyty.DrawArgsClampTable");
+		}
+		m_buffer_cache.WriteDataBuffer(*m_draw_clamp_table, 0, table.data(), table_bytes);
+		RecordClamp(command, m_draw_clamp_table->BufferDeviceAddress(),
+		            m_clamp_scratch->BufferDeviceAddress(), static_cast<uint32_t>(table.size()), 0,
+		            0, 2u, static_cast<uint32_t>((table.size() + 63u) / 64u));
+	}
+	out_buffer = m_clamp_scratch->Handle();
+	out_offset = uint64_t {slot} * 32u;
+	return true;
+}
+
 bool RenderContext::ClampIndirectArgs(vk::CommandBuffer command, const Buffer& source,
                                       uint64_t offset, vk::Buffer& out_buffer,
                                       uint64_t& out_offset, uint32_t max_indices) {
-	if (!source.HasDeviceAddress()) {
+	if (!source.HasDeviceAddress() || !EnsureClampPipeline()) {
 		return false;
 	}
+	// Dispatch clamps use the ring in the high half; draw slots own the low half.
+	const auto  slot  = ClampSlots / 2 + (m_clamp_slot++) % (ClampSlots / 2);
+	const auto  dst   = uint64_t {slot} * 32u;
+	const auto& limit = m_graphics.physical_device_properties.limits.maxComputeWorkGroupCount;
+	RecordClamp(command, source.BufferDeviceAddress() + offset,
+	            m_clamp_scratch->BufferDeviceAddress() + dst,
+	            max_indices != 0 ? max_indices : limit[0],
+	            max_indices != 0 ? (1u << 16u) : limit[1], limit[2], max_indices != 0 ? 1u : 0u, 1);
+	out_buffer = m_clamp_scratch->Handle();
+	out_offset = dst;
+	return true;
+}
+
+bool RenderContext::EnsureClampPipeline() {
 	if (!m_clamp_initialized) {
 		m_clamp_initialized = true;
 		const vk::PushConstantRange  push_range {vk::ShaderStageFlagBits::eCompute, 0,
@@ -106,47 +224,7 @@ bool RenderContext::ClampIndirectArgs(vk::CommandBuffer command, const Buffer& s
 		SetVulkanObjectNameF(m_graphics.device, m_clamp_scratch->Handle(),
 		                     "Kyty.IndirectArgsClamp");
 	}
-	if (m_clamp_pipeline == nullptr) {
-		return false;
-	}
-	const auto  slot  = (m_clamp_slot++) % ClampSlots;
-	const auto  dst   = uint64_t {slot} * 32u;
-	const auto& limit = m_graphics.physical_device_properties.limits.maxComputeWorkGroupCount;
-	// max_indices != 0 clamps an indexed draw (mode 1) instead of a dispatch.
-	const ClampPush push {source.BufferDeviceAddress() + offset,
-	                      m_clamp_scratch->BufferDeviceAddress() + dst,
-	                      max_indices != 0 ? max_indices : limit[0],
-	                      max_indices != 0 ? (1u << 16u) : limit[1], limit[2],
-	                      max_indices != 0 ? 1u : 0u};
-
-	// The counts may come from a shader or a copy recorded just before this dispatch.
-	vk::MemoryBarrier2 before {};
-	before.srcStageMask = vk::PipelineStageFlagBits2::eAllCommands;
-	before.srcAccessMask = vk::AccessFlagBits2::eShaderWrite | vk::AccessFlagBits2::eTransferWrite;
-	before.dstStageMask  = vk::PipelineStageFlagBits2::eComputeShader;
-	before.dstAccessMask = vk::AccessFlagBits2::eShaderRead | vk::AccessFlagBits2::eShaderWrite;
-	vk::DependencyInfo dependency {};
-	dependency.memoryBarrierCount = 1;
-	dependency.pMemoryBarriers    = &before;
-	command.pipelineBarrier2(dependency);
-
-	command.bindPipeline(vk::PipelineBindPoint::eCompute, m_clamp_pipeline);
-	command.pushConstants(m_clamp_layout, vk::ShaderStageFlagBits::eCompute, 0, sizeof(push),
-	                      &push);
-	GpuCheckpoint(command, 0xF000000000000003ull);
-	command.dispatch(1, 1, 1);
-
-	vk::MemoryBarrier2 after {};
-	after.srcStageMask  = vk::PipelineStageFlagBits2::eComputeShader;
-	after.srcAccessMask = vk::AccessFlagBits2::eShaderWrite;
-	after.dstStageMask  = vk::PipelineStageFlagBits2::eDrawIndirect;
-	after.dstAccessMask = vk::AccessFlagBits2::eIndirectCommandRead;
-	dependency.pMemoryBarriers = &after;
-	command.pipelineBarrier2(dependency);
-
-	out_buffer = m_clamp_scratch->Handle();
-	out_offset = dst;
-	return true;
+	return m_clamp_pipeline != nullptr;
 }
 
 static std::atomic<RenderContext*> g_debug_context {nullptr};

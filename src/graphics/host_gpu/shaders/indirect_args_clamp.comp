@@ -1,17 +1,25 @@
-// Copies indirect arguments into a scratch slot, clamping them to safe values.
+// Copies indirect arguments into scratch slots, clamping them to safe values.
 // Mode 0: a dispatch triple, each count clamped to the device limit. Guest memory can hold stale
 // words next to the count the GPU wrote; an unbounded dispatch from them stalls or loses the device.
 // Mode 1: an indexed draw (VkDrawIndexedIndirectCommand). The index range is clamped to the bound
 // index buffer: GPU-culled draws in Uncharted fetched indices past it and lost the device.
+// Mode 2: a table of limit_x indexed draws (Entry each), one thread per entry, into consecutive
+// 32-byte slots from dst. A zero source address yields an empty draw.
 #version 450
 #extension GL_EXT_buffer_reference : require
 #extension GL_EXT_buffer_reference2 : require
 #extension GL_ARB_gpu_shader_int64 : require
 
-layout(local_size_x = 1, local_size_y = 1, local_size_z = 1) in;
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
 
 layout(buffer_reference, std430, buffer_reference_align = 4) buffer ArgsRef {
     uint words[5];
+};
+
+layout(buffer_reference, std430, buffer_reference_align = 8) buffer EntryRef {
+    uint64_t src;
+    uint     max_indices;
+    uint     pad;
 };
 
 layout(push_constant) uniform Push {
@@ -27,27 +35,53 @@ layout(push_constant) uniform Push {
 // A total beyond this is garbage (the largest real dispatch seen is 61440 groups): skip it.
 const uint64_t kMaxTotalGroups = 131072ul;
 
-void main() {
-    ArgsRef src = ArgsRef(push.src);
-    ArgsRef dst = ArgsRef(push.dst);
-    if (push.mode == 1u) {
-        // limit_x: indices in the bound index buffer; limit_y: largest instance count.
-        uint index_count    = src.words[0];
-        uint instance_count = min(src.words[1], push.limit_y);
-        uint first_index    = src.words[2];
-        if (first_index >= push.limit_x) {
-            index_count = 0u;
-            first_index = 0u;
-        } else {
-            index_count = min(index_count, push.limit_x - first_index);
-        }
-        dst.words[0] = index_count;
-        dst.words[1] = instance_count;
-        dst.words[2] = first_index;
-        dst.words[3] = src.words[3];
-        dst.words[4] = src.words[4];
+void clamp_draw(uint64_t src_address, uint64_t dst_address, uint max_indices, uint max_instances) {
+    ArgsRef dst = ArgsRef(dst_address);
+    if (src_address == 0ul) {
+        dst.words[0] = 0u;
+        dst.words[1] = 0u;
+        dst.words[2] = 0u;
+        dst.words[3] = 0u;
+        dst.words[4] = 0u;
         return;
     }
+    ArgsRef src            = ArgsRef(src_address);
+    uint    index_count    = src.words[0];
+    uint    instance_count = min(src.words[1], max_instances);
+    uint    first_index    = src.words[2];
+    if (first_index >= max_indices) {
+        index_count = 0u;
+        first_index = 0u;
+    } else {
+        index_count = min(index_count, max_indices - first_index);
+    }
+    dst.words[0] = index_count;
+    dst.words[1] = instance_count;
+    dst.words[2] = first_index;
+    dst.words[3] = src.words[3];
+    dst.words[4] = src.words[4];
+}
+
+void main() {
+    uint gid = gl_GlobalInvocationID.x;
+    if (push.mode == 2u) {
+        if (gid >= push.limit_x) {
+            return;
+        }
+        EntryRef entry = EntryRef(push.src + uint64_t(gid) * 16ul);
+        clamp_draw(entry.src, push.dst + uint64_t(gid) * 32ul, entry.max_indices, 65536u);
+        return;
+    }
+    if (gid != 0u) {
+        return;
+    }
+    if (push.mode == 1u) {
+        // limit_x: indices in the bound index buffer; limit_y: largest instance count.
+        clamp_draw(push.src, push.dst, push.limit_x, push.limit_y);
+        return;
+    }
+    ArgsRef src = ArgsRef(push.src);
+    ArgsRef dst = ArgsRef(push.dst);
     uint x = min(src.words[0], push.limit_x);
     uint y = min(src.words[1], push.limit_y);
     uint z = min(src.words[2], push.limit_z);

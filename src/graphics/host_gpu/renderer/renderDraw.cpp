@@ -1156,9 +1156,15 @@ static void LogDrawStateIfNeeded(const CommandBuffer& buffer, const DrawCallInfo
 }
 
 static std::atomic<bool> g_indirect_args_written {true};
+static std::atomic<bool> g_draw_clamp_stale {true};
+
+bool TakeDrawClampStale() {
+	return g_draw_clamp_stale.exchange(false, std::memory_order_acq_rel);
+}
 
 void MarkIndirectArgsWritten() {
 	g_indirect_args_written.store(true, std::memory_order_release);
+	g_draw_clamp_stale.store(true, std::memory_order_release);
 }
 
 static void EmitDrawPrimitives(const HW::UserConfig& ucfg, vk::CommandBuffer vk_buffer,
@@ -1291,10 +1297,9 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 				vk::Buffer        clamped_buffer;
 				uint64_t          clamped_offset = 0;
 				if (!no_clamp && draw.index_count != 0) {
-					m_context.GetCommandScheduler().EndRendering();
-					if (m_context.ClampIndirectArgs(buffer.Handle(), *args_buffer, args_offset,
-					                                clamped_buffer, clamped_offset,
-					                                draw.index_count)) {
+					if (m_context.ClampDrawArgs(buffer.Handle(), draw.gpu_args_addr, *args_buffer,
+					                            args_offset, draw.index_count, clamped_buffer,
+					                            clamped_offset)) {
 						gpu_args_buffer = clamped_buffer;
 						gpu_args_offset = clamped_offset;
 						g_indirect_args_written.store(false);

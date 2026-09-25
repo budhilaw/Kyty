@@ -2329,7 +2329,9 @@ void CommandProcessor::WriteAtEndOfPipe(uint32_t cache_policy, uint32_t event_wr
 
 	EXIT_NOT_IMPLEMENTED(cache_policy != 0x00000000);
 	EXIT_NOT_IMPLEMENTED(event_write_dest != 0x00000000);
-	if (dst_gpu_addr != nullptr && !GuestRangeCommitted(dst_gpu_addr, sizeof(T))) {
+	if (dst_gpu_addr != nullptr &&
+	    !Libs::LibKernel::Memory::IsCommittedRange(reinterpret_cast<uint64_t>(dst_gpu_addr),
+	                                               sizeof(T))) {
 		// A damaged packet named unmapped memory; the host write crashed the emulator.
 		static std::atomic<uint32_t> log_count {0};
 		if (log_count.fetch_add(1) < 16) {

@@ -86,6 +86,8 @@ public:
 		m_memory_tracker.TakeCpuDirtyLog(out, full);
 	}
 	void               RunGarbageCollector();
+	// Records a staged upload of host data into a device buffer.
+	void WriteDataBuffer(Buffer& buffer, uint64_t address, const void* source, uint64_t size);
 	bool               WaitForReadback(uint64_t tick);
 
 private:
@@ -107,7 +109,6 @@ private:
 
 	using PageTable = MultiLevelPageTable<BufferId, CACHING_PAGEBITS, 40, 16>;
 	static_assert(CACHING_PAGESIZE == (uint64_t {1} << PageTable::kPageBits));
-	void WriteDataBuffer(Buffer& buffer, uint64_t address, const void* source, uint64_t size);
 	void TouchBuffer(const Buffer& buffer);
 	[[nodiscard]] OverlapResult ResolveOverlaps(uint64_t vaddr, uint64_t size);
 	void JoinOverlap(BufferId new_id, BufferId overlap_id, bool accumulate_stream_score);

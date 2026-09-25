@@ -92,6 +92,12 @@ public:
 	// draw when max_indices (indices in the bound index buffer) is non-zero.
 	bool ClampIndirectArgs(vk::CommandBuffer command, const Buffer& source, uint64_t offset,
 	                       vk::Buffer& out_buffer, uint64_t& out_offset, uint32_t max_indices = 0);
+	// Clamped arguments for a GPU-culled indexed draw. Every such draw keeps a scratch slot; all
+	// slots are refreshed by one dispatch when any indirect arguments were rewritten, instead of
+	// a pipeline bubble per draw. A draw seen for the first time is clamped on its own.
+	bool ClampDrawArgs(vk::CommandBuffer command, uint64_t vaddr, const Buffer& source,
+	                   uint64_t offset, uint32_t max_indices, vk::Buffer& out_buffer,
+	                   uint64_t& out_offset);
 	void GpuTimerReport();
 
 	void AddInterruptEq(LibKernel::EventQueue::KernelEqueue eq, int event_id);
@@ -161,6 +167,17 @@ private:
 	std::unique_ptr<Buffer>    m_clamp_scratch;
 	uint32_t                   m_clamp_slot        = 0;
 	bool                       m_clamp_initialized = false;
+	struct DrawClampEntry {
+		uint64_t vaddr       = 0;
+		uint32_t max_indices = 0;
+	};
+	std::unordered_map<uint64_t, uint32_t> m_draw_clamp_index;
+	std::vector<DrawClampEntry>            m_draw_clamp_entries;
+	std::unique_ptr<Buffer>                m_draw_clamp_table;
+	bool                                   m_draw_clamp_stale = true;
+	bool EnsureClampPipeline();
+	void RecordClamp(vk::CommandBuffer command, uint64_t src, uint64_t dst, uint32_t limit_x,
+	                 uint32_t limit_y, uint32_t limit_z, uint32_t mode, uint32_t groups);
 	uint64_t                   m_timer_pending_vaddr = 0;
 	int                        m_timer_current = -1;
 	std::unordered_map<uint64_t, GpuTimerStat> m_timer_stats;

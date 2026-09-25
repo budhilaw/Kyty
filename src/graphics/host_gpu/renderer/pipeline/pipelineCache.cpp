@@ -386,9 +386,9 @@ struct PipelineCache::ProgramCache {
 
 	static bool MaterializeRemembered(SourceEntry& entry, const ShaderRecompiler::IR::SrtRuntime& runtime,
 	                                  std::span<const uint32_t> user_data, uint64_t base) {
-		// Off by default: UI draws pass unique user data per draw, so the memo never hit on the
-		// Language screen and only added copies. KYTY_MATERIALIZE_MEMO=1 enables it.
-		static const bool no_memo = std::getenv("KYTY_MATERIALIZE_MEMO") == nullptr;
+		// Scene draws repeat the same user data and tables every frame, so a hit skips the
+		// whole evaluation (the largest CPU cost per draw). KYTY_NO_MATERIALIZE_MEMO=1 disables.
+		static const bool no_memo = std::getenv("KYTY_NO_MATERIALIZE_MEMO") != nullptr;
 		constexpr size_t  MemoSlots = 16;
 		if (!no_memo) {
 			for (const auto& memo: entry.memos) {
@@ -443,8 +443,12 @@ struct PipelineCache::ProgramCache {
 			PipelineKeyHash::Mix(hash, key.user_data_count);
 			PipelineKeyHash::Mix(hash, key.code_size);
 			PipelineKeyHash::Mix(hash, key.static_state.size());
-			// Bucket same-shape static variants by source. ProgramKey equality performs the one
-			// exact state comparison needed on a stable hit without hashing up to 429 words first.
+			// Every variant of a shader shared one bucket when only sizes were hashed, and each
+			// lookup then compared up to 429 words against each variant; the words are cheap to
+			// mix once per lookup.
+			for (const auto word: key.static_state) {
+				PipelineKeyHash::Mix(hash, word);
+			}
 			return hash;
 		}
 	};
