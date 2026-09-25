@@ -317,6 +317,11 @@ void RenderExecutor::ResolveRenderColorTarget(CommandBuffer& buffer, RenderColor
 		desc.info.metadata.dcc_clear_register_valid = true;
 		desc.info.metadata.dcc_alpha_msb            = DccAlphaOnMsb(rt.info);
 	}
+	if (rt.info.cmask_fast_clear_enable && rt.cmask.addr != 0) {
+		desc.cmask_address  = rt.cmask.addr;
+		desc.clear_words[0] = rt.clear_word0.word0;
+		desc.clear_words[1] = rt.clear_word1.word1;
+	}
 	for (uint32_t level = 0; level < levels; level++) {
 		if (volume) {
 			const auto& mip             = volume_layout.mips[level];

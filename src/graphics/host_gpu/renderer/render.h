@@ -212,6 +212,10 @@ private:
 	                              uint32_t render_target_slice_offset, uint32_t render_target_slot,
 	                              bool ignore_target_mask = false, bool exact_format = false);
 	void ResolveRenderDepthTarget(CommandBuffer& buffer, RenderDepthInfo& target);
+	// Writes the fast-clear color into a color target whose CMASK was cleared since last use.
+	void ApplyColorFastClear(CommandBuffer& buffer, const RenderColorInfo& target);
+	// Eliminate-fast-clear pass: materializes a pending CMASK clear of render target 0.
+	void EliminateFastClear(CommandBuffer& buffer, uint32_t render_target_slice_offset);
 	[[nodiscard]] bool DepthStencilCopy(CommandBuffer& buffer);
 	[[nodiscard]] bool DepthToColorCopy(CommandBuffer& buffer,
 	                                    uint32_t       render_target_slice_offset);

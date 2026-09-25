@@ -467,6 +467,56 @@ struct DrawCallInfo {
 	[[nodiscard]] const char* Name() const { return IsIndexed() ? "DrawIndex" : "DrawIndexAuto"; }
 };
 
+void RenderExecutor::ApplyColorFastClear(CommandBuffer& buffer, const RenderColorInfo& target) {
+	// The game fast-clears color targets by filling their CMASK (a compute fill or DMA, which the
+	// texture cache records) and relies on the hardware reading those tiles as the clear color.
+	// Kyty keeps plain images, so the clear is written into the image the first time the target
+	// is used afterwards. Ignoring it left Uncharted's depth-of-field focus mask at zero (the
+	// whole selector scene blurred) and other targets carrying last frame's contents.
+	auto& cache = m_context.GetTextureCache();
+	if (target.desc.cmask_address == 0 || !target.image_id ||
+	    !cache.TakeColorFastClear(target.desc.cmask_address, target.desc.view_info.base_layer)) {
+		return;
+	}
+	vk::ClearColorValue color {};
+	if (!DecodeColorClearWords(target.desc.view_info.format, target.desc.clear_words[0],
+	                           target.desc.clear_words[1], color)) {
+		static std::atomic<uint32_t> log_count {0};
+		if (log_count.fetch_add(1) < 16) {
+			LOGF("fast clear: unsupported format %d at 0x%016" PRIx64 "\n",
+			     static_cast<int>(target.desc.view_info.format), target.desc.info.data.address);
+		}
+		return;
+	}
+	m_context.GetCommandScheduler().EndRendering();
+	const vk::ImageSubresourceRange range {vk::ImageAspectFlagBits::eColor,
+	                                       target.desc.view_info.base_level, 1,
+	                                       target.desc.view_info.base_layer,
+	                                       std::max(target.desc.view_info.layer_count, 1u)};
+	cache.ClearImage(buffer, target.image_id, target.desc.view_info.format, range,
+	                 vk::ClearValue {color});
+	static std::atomic<uint32_t> applied_log {0};
+	if (applied_log.fetch_add(1) < 24) {
+		LOGF("fast clear applied: rt=0x%016" PRIx64 " format=%d words=%08x:%08x\n",
+		     target.desc.info.data.address, static_cast<int>(target.desc.view_info.format),
+		     target.desc.clear_words[0], target.desc.clear_words[1]);
+	}
+	FrameCapture::NoteMarker(fmt::format("FAST-CLEAR rt=0x{:010x} words={:08x}:{:08x}",
+	                                     target.desc.info.data.address, target.desc.clear_words[0],
+	                                     target.desc.clear_words[1]));
+}
+
+void RenderExecutor::EliminateFastClear(CommandBuffer& buffer, uint32_t render_target_slice_offset) {
+	if (buffer.GetRegisters().GetColorControl().mode != 2u) {
+		return;
+	}
+	RenderColorInfo target {};
+	ResolveRenderColorTarget(buffer, target, render_target_slice_offset, 0, true, false);
+	if (target.image_id) {
+		ApplyColorFastClear(buffer, target);
+	}
+}
+
 RenderState RenderExecutor::AcquireRenderTargets(CommandBuffer& buffer, RenderColorInfo* colors,
                                                  uint32_t color_count, RenderDepthInfo& depth,
                                                  vk::ImageAspectFlags& feedback_aspects,
@@ -508,6 +558,7 @@ RenderState RenderExecutor::AcquireRenderTargets(CommandBuffer& buffer, RenderCo
 				                 vk::ClearValue {vk::ClearColorValue {std::array<float, 4> {}}});
 			}
 		}
+		ApplyColorFastClear(buffer, target);
 		FrameCapture::NoteTarget("color", target.target_slot, target.image_id.index,
 		                         target.desc.info.data.address,
 		                         static_cast<uint32_t>(target.desc.view_info.format),
@@ -1411,6 +1462,7 @@ void RenderExecutor::DrawIndex(uint64_t submit_id, CommandBuffer& buffer,
 		return;
 	}
 
+	EliminateFastClear(buffer, args.render_target_slice_offset);
 	if (ConsumeMetadataColorOperation(buffer) || DepthStencilCopy(buffer) ||
 	    DepthToColorCopy(buffer, args.render_target_slice_offset) ||
 	    ResolveColorTargets(buffer, args.render_target_slice_offset)) {
@@ -1557,6 +1609,7 @@ void RenderExecutor::DrawAuto(uint64_t submit_id, CommandBuffer& buffer, const D
 		return;
 	}
 
+	EliminateFastClear(buffer, args.render_target_slice_offset);
 	if (ConsumeMetadataColorOperation(buffer) || DepthStencilCopy(buffer) ||
 	    DepthToColorCopy(buffer, args.render_target_slice_offset) ||
 	    ResolveColorTargets(buffer, args.render_target_slice_offset)) {

@@ -2176,6 +2176,18 @@ bool TextureCache::ClearMeta(uint64_t address) {
 	return true;
 }
 
+bool TextureCache::TakeColorFastClear(uint64_t cmask_address, uint32_t slice) {
+	std::scoped_lock lock {m_lock};
+	const auto [found, inserted] = m_surface_metas.try_emplace(
+	    cmask_address, MetaDataInfo {.type = MetaDataInfo::Type::CMask, .clear_mask = 0});
+	if (inserted || found->second.type != MetaDataInfo::Type::CMask || slice >= 32) {
+		return false;
+	}
+	const bool cleared = (found->second.clear_mask & (1u << slice)) != 0;
+	found->second.clear_mask &= ~(1u << slice);
+	return cleared;
+}
+
 bool TextureCache::TouchMeta(uint64_t address, uint32_t slice, bool is_clear) {
 	std::scoped_lock lock {m_lock};
 	const auto       found = m_surface_metas.find(address);

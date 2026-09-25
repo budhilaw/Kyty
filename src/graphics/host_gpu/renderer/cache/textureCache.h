@@ -39,6 +39,9 @@ public:
 		ImageInfo     info;
 		ImageViewInfo view_info;
 		BindingType   type = BindingType::Texture;
+		// Render targets with CMASK fast clear: the metadata surface and CB_COLOR_CLEAR_WORD0/1.
+		uint64_t cmask_address  = 0;
+		uint32_t clear_words[2] = {0, 0};
 	};
 
 	TextureCache(GraphicContext& graphics, CommandScheduler& scheduler, PageManager& page_manager,
@@ -72,6 +75,9 @@ public:
 	[[nodiscard]] bool IsMetaCleared(uint64_t address, uint32_t slice);
 	[[nodiscard]] bool ClearMeta(uint64_t address);
 	[[nodiscard]] bool TouchMeta(uint64_t address, uint32_t slice, bool is_clear);
+	// Registers a color target's CMASK surface. True when a compute clear or buffer fill marked
+	// the slice cleared since the target was last acquired: the caller applies the clear color.
+	[[nodiscard]] bool TakeColorFastClear(uint64_t cmask_address, uint32_t slice);
 
 	void UnmapMemory(uint64_t address, uint64_t size);
 	void ProcessDownloadImages();

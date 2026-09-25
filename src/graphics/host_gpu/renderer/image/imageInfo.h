@@ -428,6 +428,90 @@ inline constexpr std::array<VideoOutFormatPolicy, 7> VIDEO_OUT_FORMAT_POLICIES {
 	return true;
 }
 
+// Decodes CB_COLOR_CLEAR_WORD0/1 (the raw pixel bits of a fast-cleared color target) for the
+// target's view format. Covers the formats DecodePackedColorClear lacks, including 64-bit pixels.
+[[nodiscard]] inline bool DecodeColorClearWords(vk::Format format, uint32_t word0, uint32_t word1,
+                                                vk::ClearColorValue& clear) {
+	const auto half = [](uint32_t bits) {
+		const uint32_t sign     = (bits >> 15u) & 1u;
+		const uint32_t exponent = (bits >> 10u) & 0x1fu;
+		const uint32_t mantissa = bits & 0x3ffu;
+		float          value    = 0.0f;
+		if (exponent == 0) {
+			value = std::ldexp(static_cast<float>(mantissa), -24);
+		} else if (exponent == 31) {
+			value = mantissa == 0 ? INFINITY : NAN;
+		} else {
+			value = std::ldexp(static_cast<float>(mantissa | 0x400u), static_cast<int>(exponent) - 25);
+		}
+		return sign != 0 ? -value : value;
+	};
+	// Unsigned small floats of R11G11B10 (5-bit exponent, 6- or 5-bit mantissa).
+	const auto small_float = [](uint32_t bits, uint32_t mantissa_bits) {
+		const uint32_t exponent = bits >> mantissa_bits;
+		const uint32_t mantissa = bits & ((1u << mantissa_bits) - 1u);
+		if (exponent == 0) {
+			return std::ldexp(static_cast<float>(mantissa), -14 - static_cast<int>(mantissa_bits));
+		}
+		if (exponent == 31) {
+			return mantissa == 0 ? INFINITY : NAN;
+		}
+		return std::ldexp(static_cast<float>(mantissa | (1u << mantissa_bits)),
+		                  static_cast<int>(exponent) - 15 - static_cast<int>(mantissa_bits));
+	};
+	const auto unorm = [](uint32_t value, uint32_t max) {
+		return static_cast<float>(value) / static_cast<float>(max);
+	};
+	vk::ClearColorValue next {};
+	switch (format) {
+		case vk::Format::eR8Unorm: next.float32[0] = unorm(word0 & 0xffu, 0xffu); break;
+		case vk::Format::eR8G8Unorm:
+			next.float32[0] = unorm(word0 & 0xffu, 0xffu);
+			next.float32[1] = unorm((word0 >> 8u) & 0xffu, 0xffu);
+			break;
+		case vk::Format::eR16Unorm: next.float32[0] = unorm(word0 & 0xffffu, 0xffffu); break;
+		case vk::Format::eR16G16Unorm:
+			next.float32[0] = unorm(word0 & 0xffffu, 0xffffu);
+			next.float32[1] = unorm(word0 >> 16u, 0xffffu);
+			break;
+		case vk::Format::eR16Sfloat: next.float32[0] = half(word0 & 0xffffu); break;
+		case vk::Format::eR16G16Sfloat:
+			next.float32[0] = half(word0 & 0xffffu);
+			next.float32[1] = half(word0 >> 16u);
+			break;
+		case vk::Format::eR16G16B16A16Sfloat:
+			next.float32[0] = half(word0 & 0xffffu);
+			next.float32[1] = half(word0 >> 16u);
+			next.float32[2] = half(word1 & 0xffffu);
+			next.float32[3] = half(word1 >> 16u);
+			break;
+		case vk::Format::eR16G16B16A16Unorm:
+			next.float32[0] = unorm(word0 & 0xffffu, 0xffffu);
+			next.float32[1] = unorm(word0 >> 16u, 0xffffu);
+			next.float32[2] = unorm(word1 & 0xffffu, 0xffffu);
+			next.float32[3] = unorm(word1 >> 16u, 0xffffu);
+			break;
+		case vk::Format::eR32G32Sfloat:
+			next.float32[0] = std::bit_cast<float>(word0);
+			next.float32[1] = std::bit_cast<float>(word1);
+			break;
+		case vk::Format::eB10G11R11UfloatPack32:
+			next.float32[0] = small_float(word0 & 0x7ffu, 6u);
+			next.float32[1] = small_float((word0 >> 11u) & 0x7ffu, 6u);
+			next.float32[2] = small_float(word0 >> 22u, 5u);
+			break;
+		case vk::Format::eR8Uint: next.uint32[0] = word0 & 0xffu; break;
+		case vk::Format::eR16Uint: next.uint32[0] = word0 & 0xffffu; break;
+		case vk::Format::eR32G32Uint:
+			next.uint32[0] = word0;
+			next.uint32[1] = word1;
+			break;
+		default: return DecodePackedColorClear(format, word0, clear);
+	}
+	clear = next;
+	return true;
+}
+
 [[nodiscard]] inline bool DecodePackedStencilClear(uint32_t packed, uint8_t& clear) {
 	const auto value = static_cast<uint8_t>(packed);
 	if (packed != static_cast<uint32_t>(value) * 0x01010101u) {
