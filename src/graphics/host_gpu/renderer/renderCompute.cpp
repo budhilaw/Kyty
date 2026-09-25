@@ -15,6 +15,7 @@
 #include "graphics/host_gpu/renderer/pipeline/descriptors.h"
 #include "graphics/host_gpu/renderer/pipeline/pipelineCache.h"
 #include "kernel/memory.h"
+#include "graphics/host_gpu/renderer/frameCapture.h"
 #include "graphics/host_gpu/renderer/pipeline/shaderResourceBarrier.h"
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
@@ -550,6 +551,8 @@ void RenderExecutor::Dispatch(uint64_t submit_id, CommandBuffer& buffer, uint32_
 	if (!light_barriers) {
 		ShaderAccessBarrier(vk_buffer, vk::PipelineStageFlagBits::eComputeShader);
 	}
+	FrameCapture::NoteDispatch(program.shader_hash, thread_group_x, thread_group_y, thread_group_z,
+	                           indirect);
 	m_context.GpuTimerMark(vk_buffer, program.shader_hash, program.info.uses_dma ? 3 : 1,
 	                       (uint64_t {thread_group_x} & 0xfffffu) |
 	                           ((uint64_t {thread_group_y} & 0xfffffu) << 20u) |

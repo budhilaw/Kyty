@@ -401,27 +401,20 @@ static void StartGpuSampler() {
 			if (gpu == nullptr) {
 				continue;
 			}
+			// Nothing may allocate while the thread is suspended: it can be holding the heap
+			// lock, and the sampler would then wait on it forever.
+			uint64_t frames[8] {};
+			int      frame_count = 0;
 			if (SuspendThread(gpu) != static_cast<DWORD>(-1)) {
 				CONTEXT context {};
 				context.ContextFlags = CONTEXT_FULL;
 				if (GetThreadContext(gpu, &context) != 0) {
-					samples++;
-					std::unordered_set<uint64_t> seen;
-					for (int frame = 0; frame < 8 && context.Rip != 0; frame++) {
-						if (context.Rip >= module && context.Rip < module + 0x4000000u) {
-							const auto rva = context.Rip - module;
-							if (frame == 0) {
-								self[rva]++;
-							}
-							if (seen.insert(rva).second) {
-								inclusive[rva]++;
-							}
-						} else if (frame == 0) {
-							self[0]++;
-						}
+					for (; frame_count < 8 && context.Rip != 0; frame_count++) {
+						frames[frame_count] = context.Rip;
 						DWORD64 image_base = 0;
 						auto*   function   = RtlLookupFunctionEntry(context.Rip, &image_base, nullptr);
 						if (function == nullptr) {
+							frame_count++;
 							break;
 						}
 						void*   handler_data = nullptr;
@@ -431,6 +424,23 @@ static void StartGpuSampler() {
 					}
 				}
 				ResumeThread(gpu);
+			}
+			if (frame_count > 0) {
+				samples++;
+				std::unordered_set<uint64_t> seen;
+				for (int frame = 0; frame < frame_count; frame++) {
+					const auto rip = frames[frame];
+					if (rip >= module && rip < module + 0x4000000u) {
+						if (frame == 0) {
+							self[rip - module]++;
+						}
+						if (seen.insert(rip - module).second) {
+							inclusive[rip - module]++;
+						}
+					} else if (frame == 0) {
+						self[0]++;
+					}
+				}
 			}
 			CloseHandle(gpu);
 			if (std::chrono::steady_clock::now() - last > std::chrono::seconds(5) && samples > 0) {

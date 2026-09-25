@@ -1,4 +1,5 @@
 #include "graphics/host_gpu/renderer/renderContext.h"
+#include "graphics/host_gpu/renderer/frameCapture.h"
 
 #include "common/assert.h"
 #include "common/threads.h"
@@ -38,6 +39,7 @@ RenderContext::RenderContext(GraphicContext& graphics)
       m_pipeline_cache(graphics), m_sampler_cache(graphics),
       m_buffer_cache(graphics, m_command_scheduler, m_page_manager, m_texture_cache),
       m_texture_cache(graphics, m_command_scheduler, m_page_manager, m_buffer_cache) {
+	FrameCapture::SetContext(this);
 	EXIT_NOT_IMPLEMENTED(!Common::Thread::IsMainThread());
 }
 
@@ -436,6 +438,67 @@ static std::atomic<bool> g_gpu_checkpoints {false};
 
 void SetGpuCheckpointsEnabled(bool enabled) {
 	g_gpu_checkpoints = enabled;
+}
+
+static std::unordered_map<uint64_t, uint32_t> g_frame_target_writes;
+
+bool FlipTraceEnabled() {
+	static const bool enabled = std::getenv("KYTY_FLIP_TRACE") != nullptr;
+	return enabled;
+}
+
+void NoteColorTargetWrite(uint64_t address) {
+	if (FlipTraceEnabled()) {
+		g_frame_target_writes[address]++;
+	}
+}
+
+struct RenderTargetRecord {
+	uint32_t image  = 0;
+	uint32_t format = 0;
+	uint32_t width  = 0;
+	uint32_t height = 0;
+};
+static std::unordered_map<uint64_t, RenderTargetRecord> g_render_target_images;
+
+void NoteRenderTargetImage(uint64_t address, uint32_t image_index, uint32_t format, uint32_t width,
+                           uint32_t height) {
+	if (FlipTraceEnabled()) {
+		g_render_target_images[address] = {image_index, format, width, height};
+	}
+}
+
+void CheckSampledAlias(uint64_t address, uint32_t image_index, uint32_t format, uint32_t width,
+                       uint32_t height) {
+	if (!FlipTraceEnabled()) {
+		return;
+	}
+	const auto found = g_render_target_images.find(address);
+	if (found == g_render_target_images.end() || found->second.image == image_index) {
+		return;
+	}
+	static std::atomic<uint32_t> log_count {0};
+	if (log_count.fetch_add(1) < 64) {
+		LOGF("RTALIAS addr=0x%010" PRIx64 " rt_image=%u rt_format=%u rt=%ux%u sampled_image=%u "
+		     "sampled_format=%u sampled=%ux%u\n",
+		     address, found->second.image, found->second.format, found->second.width,
+		     found->second.height, image_index, format, width, height);
+	}
+}
+
+std::string TakeFrameTargetStats(uint64_t presented_address) {
+	std::vector<std::pair<uint64_t, uint32_t>> rows(g_frame_target_writes.begin(),
+	                                                g_frame_target_writes.end());
+	std::sort(rows.begin(), rows.end(), [](const auto& a, const auto& b) { return a.second > b.second; });
+	const auto presented = g_frame_target_writes.find(presented_address);
+	std::string text     = fmt::format("presented_draws={} targets={}:",
+	                                   presented == g_frame_target_writes.end() ? 0u : presented->second,
+	                                   rows.size());
+	for (size_t i = 0; i < rows.size() && i < 6; i++) {
+		text += fmt::format(" {:x}x{}", rows[i].first, rows[i].second);
+	}
+	g_frame_target_writes.clear();
+	return text;
 }
 
 void GpuCheckpoint(vk::CommandBuffer command, uint64_t marker) {

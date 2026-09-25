@@ -476,29 +476,47 @@ private:
 			return false;
 		}
 
-		std::lock_guard lock(m_mutex);
-		const auto      end     = vaddr + size;
-		auto            current = vaddr;
-		while (current < end) {
-			MapEntry entry {};
-			if (!FindContainingUnlocked(current, 1, &entry)) {
-				return false;
+		// Segments are resolved under the lock but copied after it is released: the other side
+		// of the copy can be a protected guest page, and the fault handler it raises reads the
+		// backing again on this thread (a DMA copy into a tracked page did exactly that).
+		struct Segment {
+			uint64_t backing_offset;
+			uint64_t data_offset;
+			uint64_t bytes;
+		};
+		std::array<Segment, 8> inline_segments {};
+		std::vector<Segment>   extra_segments;
+		size_t                 count = 0;
+		{
+			std::lock_guard lock(m_mutex);
+			const auto      end     = vaddr + size;
+			auto            current = vaddr;
+			while (current < end) {
+				MapEntry entry {};
+				if (!FindContainingUnlocked(current, 1, &entry)) {
+					return false;
+				}
+				const auto bytes  = std::min(end, entry.vaddr + entry.size) - current;
+				const auto offset = entry.backing_offset + current - entry.vaddr;
+				if (!RangeOk(offset, bytes)) {
+					return false;
+				}
+				const Segment segment {offset, current - vaddr, bytes};
+				if (count < inline_segments.size()) {
+					inline_segments[count] = segment;
+				} else {
+					extra_segments.push_back(segment);
+				}
+				count++;
+				current += bytes;
 			}
-			const auto bytes = std::min(end, entry.vaddr + entry.size) - current;
-			if (!RangeOk(entry.backing_offset + current - entry.vaddr, bytes)) {
-				return false;
-			}
-			current += bytes;
 		}
 
-		current = vaddr;
-		while (current < end) {
-			MapEntry entry {};
-			EXIT_IF(!FindContainingUnlocked(current, 1, &entry));
-			const auto bytes  = std::min(end, entry.vaddr + entry.size) - current;
-			const auto offset = entry.backing_offset + current - entry.vaddr;
-			transfer(m_backing_base + offset, current - vaddr, static_cast<size_t>(bytes));
-			current += bytes;
+		for (size_t i = 0; i < count; i++) {
+			const auto& segment =
+			    i < inline_segments.size() ? inline_segments[i] : extra_segments[i - inline_segments.size()];
+			transfer(m_backing_base + segment.backing_offset, segment.data_offset,
+			         static_cast<size_t>(segment.bytes));
 		}
 		return true;
 	}

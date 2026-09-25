@@ -6,6 +6,7 @@
 #include "graphics/guest_gpu/command_processor/pm4Dispatch.h"
 #include "graphics/guest_gpu/graphicsRun.h"
 #include "graphics/host_gpu/graphicContext.h"
+#include "graphics/host_gpu/renderer/frameCapture.h"
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
 #include "graphics/presentation/videoOut.h"
@@ -1359,7 +1360,11 @@ KYTY_CP_OP_PARSER(CpOpDispatchDirect) {
 	KYTY_PROFILER_FUNCTION();
 
 	EXIT_NOT_IMPLEMENTED(((cmd_id >> 8u) & 0xffu) != Pm4::IT_DISPATCH_DIRECT);
-	EXIT_NOT_IMPLEMENTED(KYTY_PM4_LEN(cmd_id) != 5u);
+	if (KYTY_PM4_LEN(cmd_id) != 5u) {
+		// A damaged packet: skip it by its header length.
+		LOGF("skipped packet 0x%08" PRIx32 " with unexpected length\n", cmd_id);
+		return KYTY_PM4_LEN(cmd_id) - 1u;
+	}
 
 	uint32_t thread_group_x = buffer[0];
 	uint32_t thread_group_y = buffer[1];
@@ -1495,6 +1500,17 @@ KYTY_CP_OP_PARSER(CpOpCondExec) {
 		     " remaining=%" PRIu32 " gpu_dirty=%d\n",
 		     cp.QueueTag(), addr, value, exec_count, dw,
 		     Libs::LibKernel::Memory::TryReadGpuCleanBacking(addr, &clean, 4) ? 0 : 1);
+	}
+	{
+		static std::atomic<uint64_t> total {0};
+		static std::atomic<uint64_t> skipped {0};
+		const auto                   n = total.fetch_add(1) + 1;
+		const auto                   s = skipped.fetch_add(value == 0 ? 1 : 0) + (value == 0 ? 1 : 0);
+		if (n <= 24 || (n % 256) == 0) {
+			LOGF("CONDEXEC addr=0x%010" PRIx64 " value=0x%08" PRIx32 " block=%" PRIu32
+			     " %s total=%" PRIu64 " skipped=%" PRIu64 "\n",
+			     addr, value, exec_count, value == 0 ? "SKIP" : "run", n, s);
+		}
 	}
 	if (value == 0) {
 		return payload_dw + exec_count;
@@ -2050,7 +2066,11 @@ KYTY_CP_OP_PARSER(CpOpIndirectCxRegs) {
 	KYTY_PROFILER_FUNCTION();
 
 	EXIT_NOT_IMPLEMENTED(((cmd_id >> 8u) & 0xffu) != Pm4::IT_SET_CONTEXT_REG_INDIRECT);
-	EXIT_NOT_IMPLEMENTED(KYTY_PM4_LEN(cmd_id) != 5u);
+	if (KYTY_PM4_LEN(cmd_id) != 5u) {
+		// A damaged packet: skip it by its header length.
+		LOGF("skipped packet 0x%08" PRIx32 " with unexpected length\n", cmd_id);
+		return KYTY_PM4_LEN(cmd_id) - 1u;
+	}
 
 	auto* indirect_buffer =
 	    reinterpret_cast<uint32_t*>((static_cast<uint64_t>(buffer[0]) & 0xfffffffcu) |
@@ -2140,7 +2160,11 @@ KYTY_CP_OP_PARSER(CpOpIndirectShRegs) {
 	KYTY_PROFILER_FUNCTION();
 
 	EXIT_NOT_IMPLEMENTED(((cmd_id >> 8u) & 0xffu) != Pm4::IT_SET_SH_REG_INDIRECT);
-	EXIT_NOT_IMPLEMENTED(KYTY_PM4_LEN(cmd_id) != 5u);
+	if (KYTY_PM4_LEN(cmd_id) != 5u) {
+		// A damaged packet: skip it by its header length.
+		LOGF("skipped packet 0x%08" PRIx32 " with unexpected length\n", cmd_id);
+		return KYTY_PM4_LEN(cmd_id) - 1u;
+	}
 
 	auto* indirect_buffer =
 	    reinterpret_cast<uint32_t*>((static_cast<uint64_t>(buffer[0]) & 0xfffffffcu) |
@@ -2213,7 +2237,11 @@ KYTY_CP_OP_PARSER(CpOpIndirectUcRegs) {
 	KYTY_PROFILER_FUNCTION();
 
 	EXIT_NOT_IMPLEMENTED(((cmd_id >> 8u) & 0xffu) != Pm4::IT_SET_UCONFIG_REG_INDIRECT);
-	EXIT_NOT_IMPLEMENTED(KYTY_PM4_LEN(cmd_id) != 5u);
+	if (KYTY_PM4_LEN(cmd_id) != 5u) {
+		// A damaged packet: skip it by its header length.
+		LOGF("skipped packet 0x%08" PRIx32 " with unexpected length\n", cmd_id);
+		return KYTY_PM4_LEN(cmd_id) - 1u;
+	}
 
 	auto* indirect_buffer =
 	    reinterpret_cast<uint32_t*>((static_cast<uint64_t>(buffer[0]) & 0xfffffffcu) |
@@ -2353,6 +2381,7 @@ KYTY_CP_OP_PARSER(CpOpPopMarker) {
 	if (pop_marker_log_count.fetch_add(1) < 64) {
 		LOGF("Pop marker\n");
 	}
+	FrameCapture::NoteMarker("pop marker");
 
 	return dw_num + 1;
 }
@@ -2367,6 +2396,10 @@ KYTY_CP_OP_PARSER(CpOpPushMarker) {
 	static std::atomic<uint32_t> push_marker_log_count {0};
 	if (push_marker_log_count.fetch_add(1) < 128) {
 		LOGF("Push marker: %s\n", str);
+	}
+	if (FrameCapture::Active()) {
+		FrameCapture::NoteMarker(std::string("push marker ") +
+		                         std::string(str, strnlen(str, static_cast<size_t>(dw_num) * 4u)));
 	}
 
 	return dw_num + 1;

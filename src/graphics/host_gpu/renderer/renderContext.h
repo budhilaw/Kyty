@@ -1,6 +1,7 @@
 #ifndef EMULATOR_SRC_GRAPHICS_HOST_GPU_RENDERER_RENDERCONTEXT_H_
 #define EMULATOR_SRC_GRAPHICS_HOST_GPU_RENDERER_RENDERCONTEXT_H_
 
+#include <string>
 #include "common/abi.h"
 #include "common/assert.h"
 #include "common/common.h"
@@ -34,6 +35,16 @@ void PrintRecentShaders();
 void SetGpuCheckpointsEnabled(bool enabled);
 // Leaves an NV diagnostic checkpoint when KYTY_GPU_CHECKPOINTS is set; a no-op otherwise.
 void GpuCheckpoint(vk::CommandBuffer command, uint64_t marker);
+// KYTY_FLIP_TRACE=1: draws per color-target address since the last flip, reported at each flip.
+bool        FlipTraceEnabled();
+void        NoteColorTargetWrite(uint64_t address);
+// Render target image per address (KYTY_FLIP_TRACE): a sampled texture at that address that
+// resolves to another image reads memory the render target never wrote back.
+void        NoteRenderTargetImage(uint64_t address, uint32_t image_index, uint32_t format,
+                                  uint32_t width, uint32_t height);
+void        CheckSampledAlias(uint64_t address, uint32_t image_index, uint32_t format,
+                              uint32_t width, uint32_t height);
+std::string TakeFrameTargetStats(uint64_t presented_address);
 // Logs the command scheduler's submit and priority-operation state for hang reports.
 void ReportSchedulerState();
 

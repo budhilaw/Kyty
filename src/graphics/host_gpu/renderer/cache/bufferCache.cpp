@@ -9,6 +9,7 @@
 #include "graphics/guest_gpu/graphicsRun.h"
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/renderer/cache/textureCache.h"
+#include "graphics/host_gpu/renderer/frameCapture.h"
 #include "graphics/host_gpu/renderer/commandScheduler.h"
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
@@ -693,6 +694,14 @@ void BufferCache::PrefetchReadbacks() {
 	m_scheduler.Flush();
 }
 
+void BufferCache::RequestWriteback(uint64_t vaddr, uint64_t size) {
+	std::lock_guard lock(m_snapshot_mutex);
+	for (auto page = vaddr & ~uint64_t {4095}; page < vaddr + size; page += 4096) {
+		auto& count = m_read_fault_counts[page];
+		count       = std::max(count, 4u);
+	}
+}
+
 bool BufferCache::PrefetchRange(uint64_t vaddr, uint64_t size) {
 	if (!m_memory_tracker.IsRegionGpuModified(vaddr, size)) {
 		return false;
@@ -842,6 +851,16 @@ void BufferCache::RecordGpuBaseline(uint64_t address, const uint8_t* data, uint6
 		const auto page  = at & ~(Page - 1u);
 		const auto begin = at - page;
 		const auto chunk = std::min<uint64_t>(size - done, Page - begin);
+		// Only pages the game polls are ever written back; others need no baseline. Copying
+		// every uploaded byte cost ~14% of the GPU thread on the Language screen.
+		static const bool all_pages = std::getenv("KYTY_READBACK") != nullptr;
+		if (!all_pages) {
+			const auto polled = m_read_fault_counts.find(page);
+			if (polled == m_read_fault_counts.end() || polled->second < 4u) {
+				done += chunk;
+				continue;
+			}
+		}
 		auto&      entry = m_gpu_baselines[page];
 		if (!entry) {
 			entry = std::make_unique<GpuBaseline>();
@@ -1218,6 +1237,7 @@ void BufferCache::FillBuffer(uint64_t vaddr, uint64_t size, uint32_t value, bool
 		EXIT("BufferCache: invalid fill memory address\n");
 	}
 	(void)m_texture_cache.ClearMeta(vaddr);
+	FrameCapture::NoteBuffer("fill", vaddr, size, true);
 	if (!IsRegionGpuModified(vaddr, size)) {
 		// Access the guest mapping so write faults invalidate cached buffers and images.
 		auto* destination = reinterpret_cast<uint32_t*>(vaddr);
@@ -1242,6 +1262,9 @@ void BufferCache::CopyBuffer(uint64_t dst_vaddr, uint64_t src_vaddr, uint64_t si
 		EXIT("BufferCache: invalid copy range, src=0x%016" PRIx64 " dst=0x%016" PRIx64
 		     " size=0x%016" PRIx64 " src_gds=%d dst_gds=%d\n",
 		     src_vaddr, dst_vaddr, size, static_cast<int>(src_gds), static_cast<int>(dst_gds));
+	}
+	if (dst_memory) {
+		FrameCapture::NoteBuffer("copy-dst", dst_vaddr, size, true);
 	}
 	if (src_memory && dst_memory && !IsRegionGpuModified(dst_vaddr, size) &&
 	    !IsRegionGpuModified(src_vaddr, size) && !m_texture_cache.FindImageFromRange(src_vaddr, size)) {

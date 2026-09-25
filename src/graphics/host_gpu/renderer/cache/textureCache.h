@@ -53,6 +53,8 @@ public:
 	[[nodiscard]] vk::ImageView FindTexture(ImageId id, const ImageDesc& desc);
 	[[nodiscard]] vk::ImageView FindRenderTarget(ImageId id, const ImageDesc& desc);
 	[[nodiscard]] vk::ImageView FindDepthTarget(ImageId id, const ImageDesc& desc);
+	// Null when the image was destroyed or its slot reused (frame capture holds old ids).
+	[[nodiscard]] Image*        TryGetImage(ImageId id) { return m_slot_images.try_get(id); }
 	[[nodiscard]] Image&        GetImage(ImageId id) {
 		auto& image = m_slot_images[id];
 		TouchImage(image);

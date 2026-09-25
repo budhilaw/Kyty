@@ -920,6 +920,22 @@ bool ReadGpuBackingOrDownload(uint64_t vaddr, void* data, uint64_t size) {
 }
 
 bool IsCommittedRange(uint64_t vaddr, uint64_t size) {
+	// The PM4 parser asks for every indirect register table; a system call each time cost ~9% of
+	// the GPU thread. The last few committed regions are remembered (a region can be decommitted
+	// later, so entries are only trusted for a short while).
+	struct Region {
+		uint64_t begin = 0;
+		uint64_t end   = 0;
+		uint32_t uses  = 0;
+	};
+	thread_local std::array<Region, 8> recent {};
+	thread_local size_t                next = 0;
+	for (auto& region: recent) {
+		if (region.uses != 0 && vaddr >= region.begin && vaddr + size <= region.end) {
+			region.uses--;
+			return true;
+		}
+	}
 	for (uint64_t cursor = vaddr; cursor < vaddr + size;) {
 		MEMORY_BASIC_INFORMATION info {};
 		if (VirtualQuery(reinterpret_cast<const void*>(cursor), &info, sizeof(info)) == 0 ||
@@ -927,8 +943,29 @@ bool IsCommittedRange(uint64_t vaddr, uint64_t size) {
 			return false;
 		}
 		cursor = reinterpret_cast<uint64_t>(info.BaseAddress) + info.RegionSize;
+		if (cursor >= vaddr + size) {
+			recent[next] = {reinterpret_cast<uint64_t>(info.BaseAddress), cursor, 4096};
+			next         = (next + 1u) % recent.size();
+		}
 	}
 	return true;
+}
+
+bool ReadGpuArgs(uint64_t vaddr, void* data, uint64_t size) {
+	// Indirect draw/dispatch arguments are often written by a compute shader just before; the
+	// host must see the GPU's values, so their readback always reaches guest memory.
+	if (TryReadGpuCleanBacking(vaddr, data, size)) {
+		return true;
+	}
+	// Experimental and slow (a GPU drain per stale read): KYTY_INDIRECT_READBACK=1.
+	static const bool enabled = std::getenv("KYTY_INDIRECT_READBACK") != nullptr;
+	if (enabled && g_gpu_resources != nullptr && Graphics::GuestGpu::IsGpuThread() &&
+	    IsGpuAddressRange(vaddr, size) && g_gpu_resources->IsMapped(vaddr, size)) {
+		auto& cache = GetGpuResources().GetBufferCache();
+		cache.RequestWriteback(vaddr, size);
+		cache.ReadMemory(vaddr, size, false);
+	}
+	return TryReadBacking(vaddr, data, size);
 }
 
 bool ReadGpuBackingOrPrefetch(uint64_t vaddr, void* data, uint64_t size) {

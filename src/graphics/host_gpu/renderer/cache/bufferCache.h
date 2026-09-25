@@ -147,6 +147,9 @@ public:
 	// is already pending; the guest copy updates when the GPU reaches it. Returns true if the
 	// range is GPU-modified (the caller is reading data older than the GPU's).
 	bool PrefetchRange(uint64_t vaddr, uint64_t size);
+	// Marks [vaddr, vaddr+size) as needed by the host (indirect draw/dispatch arguments): its
+	// readbacks reach guest memory even though the game never polls it.
+	void RequestWriteback(uint64_t vaddr, uint64_t size);
 
 private:
 	GraphicContext&                                   m_graphics;

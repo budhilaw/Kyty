@@ -67,6 +67,10 @@ private:
 	struct BufferCursor {
 		std::span<const uint32_t> commands;
 		uint32_t                  offset_dw = 0;
+		// Unknown type-3 headers stepped over as inline data (see ProcessPm4).
+		uint32_t unknown_headers = 0;
+		// Set while stepping through inline data, where a type-3-looking dword must prove itself.
+		bool in_data = false;
 	};
 
 	std::vector<BufferCursor> m_buffer_stack;

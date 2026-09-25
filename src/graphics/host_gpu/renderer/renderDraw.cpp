@@ -22,6 +22,7 @@
 #include "graphics/host_gpu/renderer/pipeline/shaderResourceBarrier.h"
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
+#include "graphics/host_gpu/renderer/frameCapture.h"
 #include "graphics/host_gpu/vulkanCommon.h"
 #include "graphics/shader/recompiler/BufferFormat.h"
 #include "graphics/shader/recompiler/ir/ShaderIR.h"
@@ -485,6 +486,17 @@ RenderState RenderExecutor::AcquireRenderTargets(CommandBuffer& buffer, RenderCo
 		    owner->binding.needs_rebind) {
 			EXIT("color target changed after render-state discovery\n");
 		}
+		NoteColorTargetWrite(target.desc.info.data.address);
+		FrameCapture::NoteTarget("color", target.target_slot, target.image_id.index,
+		                         target.desc.info.data.address,
+		                         static_cast<uint32_t>(target.desc.view_info.format),
+		                         target.desc.info.extent.width, target.desc.info.extent.height);
+		FrameCapture::NoteImageForDump(
+		    (uint64_t {target.image_id.generation} << 32u) | target.image_id.index,
+		    target.desc.info.data.address, "rt");
+		NoteRenderTargetImage(target.desc.info.data.address, target.image_id.index,
+		                      static_cast<uint32_t>(target.desc.info.pixel_format),
+		                      target.desc.info.extent.width, target.desc.info.extent.height);
 		const auto image_view = cache.FindRenderTarget(target.image_id, target.desc);
 		auto&      image      = cache.GetImage(target.image_id);
 		SetVulkanObjectNameF(m_context.GetGraphics().device, image.backing.image,
@@ -1239,6 +1251,12 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 		const auto* program = state.ps_active ? state.ps_input_info.stage.program
 		                                      : state.vertex_info[0].stage.program;
 		m_context.GpuTimerMark(vk_buffer, program != nullptr ? program->shader_hash : 0, 2);
+		if (FrameCapture::Active()) {
+			const auto* vs = state.vertex_info[0].stage.program;
+			const auto* ps = state.ps_active ? state.ps_input_info.stage.program : nullptr;
+			FrameCapture::NoteDraw(draw.Name(), vs != nullptr ? vs->shader_hash : 0,
+			                       ps != nullptr ? ps->shader_hash : 0, "");
+		}
 	}
 	LogDrawPhase(draw.Name(), "DrawComplete");
 	if (!draw.IsIndexed()) {

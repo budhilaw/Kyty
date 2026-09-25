@@ -308,20 +308,25 @@ struct PipelineCache::ProgramCache {
 		ShaderRecompiler::IR::ResourceSpecialization specialization;
 		std::vector<Permutation>                    permutations;
 		bool                                        skip_dispatch = false;
-		// Inputs of the last materialization: identical inputs give identical resources.
-		bool                                        memo_valid = false;
-		std::vector<uint32_t>                       memo_user_data;
-		uint64_t                                    memo_base = 0;
-		std::vector<std::pair<uint64_t, uint32_t>>  memo_reads;
+		// Recent materializations: identical inputs (user data, shader base and every memory
+		// word read) give identical resources, so a match is copied instead of re-evaluated.
+		struct Memo {
+			std::vector<uint32_t>                       user_data;
+			uint64_t                                    base = 0;
+			std::vector<std::pair<uint64_t, uint32_t>>  reads;
+			ShaderRecompiler::IR::ResourceSnapshot       resources;
+			ShaderRecompiler::IR::ResourceSpecialization specialization;
+		};
+		std::vector<Memo> memos;
+		size_t            memo_next = 0;
 	};
 
-	static bool MemoStillValid(const SourceEntry& entry, std::span<const uint32_t> user_data,
-	                           uint64_t base) {
-		if (!entry.memo_valid || entry.memo_base != base ||
-		    !std::ranges::equal(entry.memo_user_data, user_data)) {
+	static bool MemoMatches(const SourceEntry::Memo& memo, std::span<const uint32_t> user_data,
+	                        uint64_t base) {
+		if (memo.base != base || !std::ranges::equal(memo.user_data, user_data)) {
 			return false;
 		}
-		for (const auto& [address, value]: entry.memo_reads) {
+		for (const auto& [address, value]: memo.reads) {
 			uint32_t current = 0;
 			if (!ReadShaderGuestMemoryImpl(address, &current) || current != value) {
 				return false;
@@ -332,19 +337,35 @@ struct PipelineCache::ProgramCache {
 
 	static bool MaterializeRemembered(SourceEntry& entry, const ShaderRecompiler::IR::SrtRuntime& runtime,
 	                                  std::span<const uint32_t> user_data, uint64_t base) {
-		static const bool no_memo = std::getenv("KYTY_NO_MATERIALIZE_MEMO") != nullptr;
-		if (!no_memo && MemoStillValid(entry, user_data, base)) {
-			return true;
+		// Off by default: UI draws pass unique user data per draw, so the memo never hit on the
+		// Language screen and only added copies. KYTY_MATERIALIZE_MEMO=1 enables it.
+		static const bool no_memo = std::getenv("KYTY_MATERIALIZE_MEMO") == nullptr;
+		constexpr size_t  MemoSlots = 16;
+		if (!no_memo) {
+			for (const auto& memo: entry.memos) {
+				if (MemoMatches(memo, user_data, base)) {
+					entry.resources      = memo.resources;
+					entry.specialization = memo.specialization;
+					return true;
+				}
+			}
 		}
-		entry.memo_reads.clear();
-		g_shader_read_log    = &entry.memo_reads;
+		std::vector<std::pair<uint64_t, uint32_t>> reads;
+		g_shader_read_log    = &reads;
 		g_shader_read_failed = false;
 		const bool ok = ShaderRecompiler::IR::MaterializeResources(entry.resource_plan, runtime,
 		                                                         entry.resources, entry.specialization);
 		g_shader_read_log = nullptr;
-		entry.memo_valid  = ok && !g_shader_read_failed && entry.memo_reads.size() <= 4096;
-		entry.memo_user_data.assign(user_data.begin(), user_data.end());
-		entry.memo_base = base;
+		if (ok && !g_shader_read_failed && reads.size() <= 4096 && !no_memo) {
+			SourceEntry::Memo memo {std::vector<uint32_t>(user_data.begin(), user_data.end()), base,
+			                        std::move(reads), entry.resources, entry.specialization};
+			if (entry.memos.size() < MemoSlots) {
+				entry.memos.push_back(std::move(memo));
+			} else {
+				entry.memos[entry.memo_next] = std::move(memo);
+				entry.memo_next              = (entry.memo_next + 1u) % MemoSlots;
+			}
+		}
 		return ok;
 	}
 

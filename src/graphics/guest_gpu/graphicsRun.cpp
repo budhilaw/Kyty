@@ -12,6 +12,7 @@
 #include "graphics/guest_gpu/command_processor/pm4Dispatch.h"
 #include "graphics/guest_gpu/hardwareContext.h"
 #include "graphics/guest_gpu/pm4.h"
+#include "graphics/host_gpu/renderer/frameCapture.h"
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
 #include "graphics/host_gpu/renderer/sync.h"
@@ -1442,6 +1443,11 @@ Pm4ProcessResult CommandProcessor::Process(Pm4Execution&             execution,
 	EXIT_IF(commands.size() > UINT32_MAX);
 	if (execution.m_buffer_stack.empty() && !commands.empty()) {
 		execution.m_buffer_stack.push_back({commands});
+		if (FrameCapture::Active()) {
+			FrameCapture::NoteMarker(fmt::format("submit 0x{:010x} dw={}",
+			                                     reinterpret_cast<uint64_t>(commands.data()),
+			                                     commands.size()));
+		}
 	}
 	if (LabelTraceEnabled() && execution.m_suspended && execution.m_suspend_words != 0) {
 		uint64_t   words = 0;
@@ -1517,6 +1523,11 @@ void CommandProcessor::ProcessPm4(Pm4Execution& execution) {
 		auto& cursor = execution.m_buffer_stack.back();
 		EXIT_IF(cursor.offset_dw > cursor.commands.size());
 		if (cursor.offset_dw == cursor.commands.size()) {
+			if (FrameCapture::Active()) {
+				FrameCapture::NoteMarker(fmt::format("end 0x{:010x} dw={}",
+				                                     reinterpret_cast<uint64_t>(cursor.commands.data()),
+				                                     cursor.commands.size()));
+			}
 			execution.m_buffer_stack.pop_back();
 			continue;
 		}
@@ -1539,10 +1550,47 @@ void CommandProcessor::ProcessPm4(Pm4Execution& execution) {
 					     packet_header >> 30u, total_dw - remaining_dw, packet_header);
 				}
 			}
+			if (packet_header != 0x80000000u) {
+				cursor.in_data = true;
+			}
 			Pm4TraceRecord(total_dw - remaining_dw, packet_header, 1);
 			cursor.offset_dw++;
 			execution.m_made_progress = true;
 			continue;
+		}
+
+		// Inside an inline data block (constants a later SET_SH_REG points a V# at), animated
+		// floats such as -2.25 (0xc0101000, a NOP) decode as known packets and swallow the rest
+		// of the buffer, which made the Uncharted menu UI blink. A header met while stepping
+		// through data counts as a packet only if the packet after it is known too, or it ends
+		// exactly at the end of the buffer. (Requiring two failed: data, SET_SH_REG, DRAW, data
+		// is a real sequence.)
+		if (cursor.in_data) {
+			const auto known_at = [&](uint32_t at, uint32_t& len) {
+				if (at >= total_dw) {
+					return false;
+				}
+				const auto header = cursor.commands[at];
+				if ((header >> 30u) != 3u || g_cp_op_func[(header >> 8u) & 0xffu] == nullptr) {
+					return false;
+				}
+				len = KYTY_PM4_LEN(header);
+				return len <= total_dw - at;
+			};
+			const auto at    = cursor.offset_dw;
+			uint32_t   len0  = 0;
+			uint32_t   len1  = 0;
+			bool       valid = known_at(at, len0);
+			if (valid && at + len0 != total_dw) {
+				valid = known_at(at + len0, len1);
+			}
+			if (!valid) {
+				Pm4TraceRecord(total_dw - remaining_dw, packet_header, 1);
+				cursor.offset_dw++;
+				execution.m_made_progress = true;
+				continue;
+			}
+			cursor.in_data = false;
 		}
 
 		// A submitted size may end mid-packet. Handlers read their body unconditionally, so the
@@ -1612,6 +1660,30 @@ void CommandProcessor::ProcessPm4(Pm4Execution& execution) {
 
 		auto handler = g_cp_op_func[opcode];
 
+		// Command buffers carry inline constant blocks (for example the 32-dword blocks a later
+		// SET_SH_REG points a V# at), and those are stepped over one dword at a time like any
+		// other non-type-3 dword. A float in them such as 0xc09b3332 (-4.85) looks like a type-3
+		// header; step over it too instead of dropping the rest of the buffer. Past a handful per
+		// buffer, the buffer is more likely stale and is dropped below.
+		constexpr uint32_t kMaxUnknownHeadersPerBuffer = 16;
+		if (handler == nullptr && cursor.unknown_headers < kMaxUnknownHeadersPerBuffer &&
+		    (execution.m_buffer_stack.size() > 1 ||
+		     packet - (total_dw - remaining_dw) != m_stream_copy)) {
+			static std::atomic<uint32_t> data_log_count {0};
+			if (data_log_count.fetch_add(1) < 32) {
+				LOGF("PM4: unknown header 0x%08" PRIx32 " in buffer 0x%016" PRIx64
+				     " at dw 0x%05" PRIx32 "/%" PRIu32 "; stepping over it as inline data\n",
+				     packet_header, reinterpret_cast<uint64_t>(packet - (total_dw - remaining_dw)),
+				     total_dw - remaining_dw, total_dw);
+			}
+			cursor.unknown_headers++;
+			cursor.in_data = true;
+			Pm4TraceRecord(total_dw - remaining_dw, packet_header, 1);
+			cursor.offset_dw++;
+			execution.m_made_progress = true;
+			continue;
+		}
+
 		if (handler == nullptr && (execution.m_buffer_stack.size() > 1 ||
 		                           packet - (total_dw - remaining_dw) != m_stream_copy)) {
 			// An indirect buffer is read live from guest memory; the game may already have
@@ -1622,6 +1694,43 @@ void CommandProcessor::ProcessPm4(Pm4Execution& execution) {
 				     " at dw 0x%05" PRIx32 "/%" PRIu32 "; skipping the rest of the buffer\n",
 				     packet_header, reinterpret_cast<uint64_t>(packet - (total_dw - remaining_dw)),
 				     total_dw - remaining_dw, total_dw);
+			}
+			if (static std::atomic<uint32_t> walk_log_count {0}; walk_log_count.fetch_add(1) < 2) {
+				// Re-walk the buffer from its start to show which packet led the parser here.
+				const auto  offset = total_dw - remaining_dw;
+				auto* const base   = packet - offset;
+				uint32_t raw_run = 0;
+				for (uint32_t at = 0; at < offset;) {
+					const auto header = base[at];
+					if ((header >> 30u) != 3u) {
+						raw_run++;
+						at++;
+						continue;
+					}
+					if (raw_run != 0) {
+						LOGF("PM4WALK   (%" PRIu32 " non-type-3 dwords)\n", raw_run);
+						raw_run = 0;
+					}
+					const auto len = KYTY_PM4_LEN(header);
+					LOGF("PM4WALK +0x%05" PRIx32 " header=0x%08" PRIx32 " op=0x%02" PRIx32
+					     " len=%" PRIu32 " :",
+					     at, header, (header >> 8u) & 0xffu, len);
+					for (uint32_t i = 1; i < std::min<uint32_t>(len, 10); i++) {
+						LOGF(" %08" PRIx32, base[at + i]);
+					}
+					LOGF("\n");
+					at += len;
+				}
+				if (raw_run != 0) {
+					LOGF("PM4WALK   (%" PRIu32 " non-type-3 dwords)\n", raw_run);
+				}
+				for (uint32_t i = offset; i < std::min<uint32_t>(total_dw, offset + 48); i += 8) {
+					LOGF("PM4WALK tail +0x%05" PRIx32 ":", i);
+					for (uint32_t j = i; j < std::min<uint32_t>(total_dw, i + 8); j++) {
+						LOGF(" %08" PRIx32, base[j]);
+					}
+					LOGF("\n");
+				}
 			}
 			execution.m_buffer_stack.pop_back();
 			execution.m_made_progress = true;
@@ -1678,6 +1787,13 @@ void CommandProcessor::ProcessPm4(Pm4Execution& execution) {
 		cursor.offset_dw += packet_dw;
 		execution.m_made_progress = true;
 		if (!execution.m_next_buffer.empty()) {
+			if (FrameCapture::Active()) {
+				FrameCapture::NoteMarker(fmt::format(
+				    "{} 0x{:010x} dw={} from 0x{:010x}+0x{:x}", execution.m_chain ? "chain" : "call",
+				    reinterpret_cast<uint64_t>(execution.m_next_buffer.data()),
+				    execution.m_next_buffer.size(), reinterpret_cast<uint64_t>(cursor.commands.data()),
+				    cursor.offset_dw));
+			}
 			// Chains and taken branches reuse the fetcher; only calls retain a return cursor.
 			if (execution.m_chain) {
 				cursor = {execution.m_next_buffer};
@@ -1807,7 +1923,7 @@ void CommandProcessor::DrawIndirect(uint32_t data_offset, uint32_t draw_initiato
 
 	if (!indexed) {
 		DrawIndirectArgs args {};
-		if (!Libs::LibKernel::Memory::TryReadGpuCleanBacking(reinterpret_cast<uint64_t>(args_addr),
+		if (!Libs::LibKernel::Memory::ReadGpuArgs(reinterpret_cast<uint64_t>(args_addr),
 	                                                     &args, sizeof(args))) {
 		if (!GuestRangeCommitted(args_addr, sizeof(args))) {
 			LOGF("\t warning: indirect args at %p are not mapped, draw skipped\n", args_addr);
@@ -1836,7 +1952,7 @@ void CommandProcessor::DrawIndirect(uint32_t data_offset, uint32_t draw_initiato
 	}
 
 	DrawIndexedIndirectArgs args {};
-	if (!Libs::LibKernel::Memory::TryReadGpuCleanBacking(reinterpret_cast<uint64_t>(args_addr),
+	if (!Libs::LibKernel::Memory::ReadGpuArgs(reinterpret_cast<uint64_t>(args_addr),
 	                                                     &args, sizeof(args))) {
 		if (!GuestRangeCommitted(args_addr, sizeof(args))) {
 			LOGF("\t warning: indirect args at %p are not mapped, draw skipped\n", args_addr);
@@ -1896,7 +2012,10 @@ void CommandProcessor::DrawIndirectMulti(uint32_t data_offset, uint32_t max_coun
 
 	uint32_t draw_count = max_count_or_count;
 	if (count_addr != nullptr) {
-		draw_count = *count_addr;
+		uint32_t count_value = 0;
+		(void)Libs::LibKernel::Memory::ReadGpuArgs(reinterpret_cast<uint64_t>(count_addr),
+		                                            &count_value, sizeof(count_value));
+		draw_count = count_value;
 		if (draw_count > max_count_or_count) {
 			draw_count = max_count_or_count;
 		}
@@ -1924,7 +2043,9 @@ void CommandProcessor::DrawIndirectMulti(uint32_t data_offset, uint32_t max_coun
 		                       static_cast<uint64_t>(i) * stride_in_bytes;
 
 		if (!indexed) {
-			auto* args = reinterpret_cast<const DrawIndirectArgs*>(args_addr);
+			DrawIndirectArgs args_value {};
+			(void)Libs::LibKernel::Memory::ReadGpuArgs(args_addr, &args_value, sizeof(args_value));
+			const auto* args = &args_value;
 			m_num_instances = args->instance_count;
 			DrawIndexAuto({.vertex_count   = args->vertex_count_per_instance,
 			               .instance_count = args->instance_count,
@@ -1934,7 +2055,9 @@ void CommandProcessor::DrawIndirectMulti(uint32_t data_offset, uint32_t max_coun
 			continue;
 		}
 
-		auto* args = reinterpret_cast<const DrawIndexedIndirectArgs*>(args_addr);
+		DrawIndexedIndirectArgs args_value {};
+		(void)Libs::LibKernel::Memory::ReadGpuArgs(args_addr, &args_value, sizeof(args_value));
+		const auto* args = &args_value;
 
 		auto* index_addr = reinterpret_cast<const void*>(
 		    m_index_base_addr + static_cast<uint64_t>(args->start_index_location) * index_size);
@@ -2032,7 +2155,7 @@ void CommandProcessor::DispatchIndirect(uint64_t args_addr, uint32_t mode) {
 	EXIT_NOT_IMPLEMENTED(args_addr == 0 || (args_addr & 3u) != 0);
 	NoteIndirectArgsAddress(args_addr);
 	DispatchIndirectArgs args {};
-	if (Libs::LibKernel::Memory::TryReadGpuCleanBacking(args_addr, &args, sizeof(args))) {
+	if (Libs::LibKernel::Memory::ReadGpuArgs(args_addr, &args, sizeof(args))) {
 		DispatchDirect(args.thread_group_x, args.thread_group_y, args.thread_group_z, mode);
 		return;
 	}

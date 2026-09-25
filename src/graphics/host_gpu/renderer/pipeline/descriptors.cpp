@@ -23,6 +23,7 @@
 #include "graphics/host_gpu/renderer/pipeline/shaderResourceBarrier.h"
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
+#include "graphics/host_gpu/renderer/frameCapture.h"
 #include "graphics/host_gpu/vulkanCommon.h"
 #include "graphics/shader/recompiler/ir/ShaderIR.h"
 #include "graphics/shader/recompiler/ir/passes/BindingLayout.h"
@@ -151,6 +152,7 @@ NativeStorageBuffer(RenderContext& context, const PreparedBindings::BufferSource
 	}
 	buffer_offset = static_cast<uint32_t>(adjustment);
 	const vk::DescriptorBufferInfo result {buffer->Handle(), aligned_offset, size + adjustment};
+	FrameCapture::NoteBuffer("buffer", address, size, resource.written);
 	if (resource.written) {
 		context.GetTextureCache().InvalidateMemoryFromGPU(address, size);
 	}
@@ -436,6 +438,7 @@ static TextureCache::ImageDesc NullTextureDesc(const ShaderRecompiler::IR::Image
 // colour view there is invalid, otherwise a 1x1 colour image.
 static TextureBinding NullTextureBinding(const ShaderRecompiler::IR::ImageResource& resource,
                                          bool storage, TextureCache& texture_cache) {
+	FrameCapture::NoteTexture(0, 0, 0, 0, 0, storage, "NULL-BOUND (see TEXDESC log)");
 	auto desc = NullTextureDesc(resource, storage ? TextureCache::BindingType::Storage
 	                                              : TextureCache::BindingType::Texture);
 	if (resource.depth_compare && !storage) {
@@ -595,7 +598,24 @@ static bool TextureViewPreservesMipLayout(const TileSurfaceDescription& descript
 TextureBinding RenderExecutor::ResolveTexture(const ShaderRecompiler::IR::ImageResource&   resource,
                                               const ShaderRecompiler::IR::DescriptorValue& value) {
 	auto descriptor = DecodeNativeDescriptor<ShaderTextureResource>(value);
+	if (resource.r128 && (descriptor.fields[4] | descriptor.fields[5] | descriptor.fields[6] |
+	                      descriptor.fields[7]) != 0) {
+		// A 128-bit descriptor has no dwords 4-7; the hardware reads them as zero. Whatever
+		// follows it in memory (often pointers) was read as depth/array size and turned
+		// screen-size UI textures into multi-GB arrays that were then bound as null (black).
+		static std::atomic<uint32_t> log_count {0};
+		if (log_count.fetch_add(1) < 8) {
+			LOGF("TEXDESC: r128 descriptor, ignoring dwords 4-7 %08x,%08x,%08x,%08x\n",
+			     descriptor.fields[4], descriptor.fields[5], descriptor.fields[6],
+			     descriptor.fields[7]);
+		}
+		descriptor.fields[4] = descriptor.fields[5] = descriptor.fields[6] = descriptor.fields[7] = 0;
+	}
 	const bool storage = resource.written;
+	if (storage) {
+		// Storage-image writes (compute composition) count for KYTY_FLIP_TRACE too.
+		NoteColorTargetWrite(descriptor.Base40());
+	}
 	if (storage) {
 		ValidateStorageImageResource(resource);
 	}
@@ -678,7 +698,13 @@ TextureBinding RenderExecutor::ResolveTexture(const ShaderRecompiler::IR::ImageR
 		// Beyond every device limit: corrupt descriptor data. Bind a null image instead.
 		static std::atomic<uint32_t> log_count {0};
 		if (log_count.fetch_add(1) < 16) {
-			LOGF("TEXDESC: %u layers/depth exceeds device limits; bound as null\n", depth);
+			LOGF("TEXDESC: %u layers/depth exceeds device limits; bound as null r128=%d dim=%u "
+			     "class=%u read=%d written=%d dwords=%08x,%08x,%08x,%08x,%08x,%08x,%08x,%08x\n",
+			     depth, resource.r128 ? 1 : 0, static_cast<uint32_t>(resource.dimension),
+			     static_cast<uint32_t>(resource.resource_class), resource.read, resource.written,
+			     descriptor.fields[0], descriptor.fields[1], descriptor.fields[2],
+			     descriptor.fields[3], descriptor.fields[4], descriptor.fields[5],
+			     descriptor.fields[6], descriptor.fields[7]);
 		}
 		return NullTextureBinding(resource, storage, texture_cache);
 	}
@@ -842,6 +868,12 @@ TextureBinding RenderExecutor::ResolveTexture(const ShaderRecompiler::IR::ImageR
 		(void)SelectSampledColorView(image->info.pixel_format, pixel_format,
 		                             descriptor.DstSelXYZW());
 	}
+	CheckSampledAlias(address, id.index, static_cast<uint32_t>(image->info.pixel_format),
+	                  image->info.extent.width, image->info.extent.height);
+	FrameCapture::NoteTexture(address, id.index, static_cast<uint32_t>(desc.view_info.format),
+	                          image->info.extent.width, image->info.extent.height, storage, nullptr);
+	FrameCapture::NoteImageForDump((uint64_t {id.generation} << 32u) | id.index, address,
+	                               storage ? "storage" : "tex");
 	return {id, nullptr, std::move(desc)};
 }
 

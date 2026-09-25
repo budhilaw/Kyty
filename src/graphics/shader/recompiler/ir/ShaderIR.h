@@ -15,6 +15,7 @@
 #include <array>
 #include <bit>
 #include <list>
+#include <unordered_map>
 #include <memory>
 #include <optional>
 #include <string_view>
@@ -535,6 +536,9 @@ struct ResourcePlan {
 	uint32_t                      user_data_base  = 0;
 	uint32_t                      user_data_count = 64;
 	std::list<Inst>                     value_storage;
+	// Dense index of value_storage, built on first evaluation; list nodes never move, so it
+	// stays valid across moves of the plan.
+	mutable std::unordered_map<const Inst*, uint32_t> value_index;
 	std::vector<MemoryInfo>             memory_info;
 	std::vector<DescriptorSource>       descriptor_sources;
 	std::vector<ResourceBlock>          control_flow;

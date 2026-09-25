@@ -1,4 +1,5 @@
 #include <atomic>
+#include <cstdlib>
 #include "graphics/shader/recompiler/ir/passes/ResourceMaterialization.h"
 
 #include "common/assert.h"
@@ -598,6 +599,28 @@ static bool BuildResourceSpecialization(const ResourcePlan& program, Materialize
 		    .descriptor_swizzle =
 		        program.info.buffers[i].formatted ? descriptor.DstSelXYZW() : DstSel(4, 5, 6, 7),
 		});
+	}
+	// Experiment (KYTY_UINT_AS_UNORM=1): indirect-table textures with integer formats are read
+	// as the matching UNORM format, to test whether UI glyph atlases are misclassified.
+	static const bool uint_as_unorm = std::getenv("KYTY_UINT_AS_UNORM") != nullptr;
+	if (uint_as_unorm) {
+		for (uint32_t i = 0; i < next_specialization.images.size(); i++) {
+			if (next_specialization.images[i].indirect_root == ImageResource::NoIndirectImage) {
+				continue;
+			}
+			auto&      dwords = next_snapshot.images[i].dwords;
+			const auto format = (dwords[1] >> 20u) & 0x1ffu;
+			uint32_t   unorm  = format;
+			switch (format) {
+				case 5: unorm = 1; break;   // 8_UINT -> 8_UNORM
+				case 11: unorm = 7; break;  // 16_UINT -> 16_UNORM
+				case 18: unorm = 14; break; // 8_8_UINT -> 8_8_UNORM
+				case 60: unorm = 56; break; // 8_8_8_8_UINT -> 8_8_8_8_UNORM
+				case 69: unorm = 65; break; // 16_16_16_16_UINT -> 16_16_16_16_UNORM
+				default: break;
+			}
+			dwords[1] = (dwords[1] & ~(0x1ffu << 20u)) | (unorm << 20u);
+		}
 	}
 	for (uint32_t i = 0; i < next_specialization.images.size(); i++) {
 		const auto& descriptor = next_snapshot.images[i];

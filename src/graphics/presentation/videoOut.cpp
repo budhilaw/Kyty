@@ -15,6 +15,7 @@
 #include "graphics/host_gpu/renderer/image/imageInfo.h"
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
+#include "graphics/host_gpu/renderer/frameCapture.h"
 #include "graphics/presentation/presenter.h"
 #include "graphics/presentation/renderDoc.h"
 #include "kernel/pthread.h"
@@ -1019,6 +1020,12 @@ void FlipQueue::Prepare(uint64_t request_id, Graphics::CommandBuffer& buffer) {
 				source_info = cfg->groups[surface.group_index].ImageInfo(surface);
 			}
 		}
+	}
+	Graphics::FrameCapture::OnFlip(special ? 0 : source_info.data.address);
+	if (Graphics::FlipTraceEnabled()) {
+		LOGF("FLIPTRACE id=%" PRIu64 " index=%d special=%d current=%d addr=0x%010" PRIx64 " %s\n",
+		     request_id, index, special ? 1 : 0, current ? 1 : 0, source_info.data.address,
+		     Graphics::TakeFrameTargetStats(source_info.data.address).c_str());
 	}
 	if (!current) {
 		Common::LockGuard lock(m_mutex);

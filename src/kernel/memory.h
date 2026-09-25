@@ -111,6 +111,8 @@ bool                   TryWriteBacking(uint64_t vaddr, const void* data, uint64_
 bool                   TryReadBacking(uint64_t vaddr, void* data, uint64_t size);
 bool                   ReadGpuBackingOrDownload(uint64_t vaddr, void* data, uint64_t size);
 bool                   ReadGpuBackingOrPrefetch(uint64_t vaddr, void* data, uint64_t size);
+// Reads GPU-produced indirect arguments with the GPU's latest values (see ReadGpuArgs).
+bool                   ReadGpuArgs(uint64_t vaddr, void* data, uint64_t size);
 // True when every byte of the range is committed host memory (safe to read directly).
 bool                   IsCommittedRange(uint64_t vaddr, uint64_t size);
 bool                   TryReadGpuCleanBacking(uint64_t vaddr, void* data, uint64_t size);

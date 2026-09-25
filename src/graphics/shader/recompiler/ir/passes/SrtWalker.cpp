@@ -502,15 +502,34 @@ private:
 			return false;
 		}
 		if (!m_reserved) {
-			m_cache.reserve(m_program.value_storage.size());
-			m_visiting.reserve(m_program.value_storage.size());
+			// One flat slot per plan value instead of a hash node per evaluated value: this
+			// evaluation runs for hundreds of draws per frame.
+			if (m_program.value_index.size() != m_program.value_storage.size()) {
+				m_program.value_index.clear();
+				m_program.value_index.reserve(m_program.value_storage.size());
+				uint32_t next = 0;
+				for (const auto& stored: m_program.value_storage) {
+					m_program.value_index.emplace(&stored, next++);
+				}
+			}
+			m_slots.assign(m_program.value_storage.size(), 0);
+			m_have.assign(m_program.value_storage.size(), 0);
+			m_visiting.reserve(64);
 			m_reserved = true;
 		}
 		if (!m_active_mask.IsEmpty() && IsRuntimeSelect(inst->GetOpcode()) &&
 		    inst->NumArgs() == 3 && inst->Arg(0).Resolve() == m_active_mask) {
 			return EvaluateWide(inst->Arg(1), result);
 		}
-		if (const auto found = m_cache.find(inst); found != m_cache.end()) {
+		uint32_t slot = UINT32_MAX;
+		if (const auto indexed = m_program.value_index.find(inst);
+		    indexed != m_program.value_index.end()) {
+			slot = indexed->second;
+			if (m_have[slot] != 0) {
+				result = m_slots[slot];
+				return true;
+			}
+		} else if (const auto found = m_cache.find(inst); found != m_cache.end()) {
 			result = found->second;
 			return true;
 		}
@@ -528,7 +547,12 @@ private:
 			}
 			return false;
 		}
-		m_cache.emplace(inst, out);
+		if (slot != UINT32_MAX) {
+			m_slots[slot] = out;
+			m_have[slot]  = 1;
+		} else {
+			m_cache.emplace(inst, out);
+		}
 		result = out;
 		return true;
 	}
@@ -993,6 +1017,8 @@ private:
 	Evaluator*                                m_clean_evaluator = nullptr;
 	Value                                     m_active_mask;
 	std::unordered_map<const Inst*, uint64_t> m_cache;
+	std::vector<uint64_t>                     m_slots;
+	std::vector<uint8_t>                      m_have;
 	std::vector<const Inst*>                  m_visiting;
 	bool                                      m_reserved = false;
 };
