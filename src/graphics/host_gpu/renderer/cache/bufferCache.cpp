@@ -785,6 +785,11 @@ BufferId BufferCache::CreateBuffer(uint64_t vaddr, uint64_t size) {
 }
 
 void BufferCache::WriteBackMerged(uint64_t vaddr, const uint8_t* data, uint64_t size) {
+	// Diagnostic: KYTY_NO_READBACK=1 drops every GPU-to-guest readback write.
+	static const bool no_readback = std::getenv("KYTY_NO_READBACK") != nullptr;
+	if (no_readback) {
+		return;
+	}
 	// GPU writes through raw pointers mark whole pages only after the dispatch; bytes the CPU
 	// changed since its first write to such a page are newer than the GPU copy and are kept.
 	constexpr uint64_t   Page = TRACKER_PAGE_SIZE;
