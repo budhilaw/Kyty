@@ -2630,9 +2630,14 @@ KYTY_CP_OP_PARSER(CpOpSetUconfigReg) {
 			}
 			return num_values + 1u;
 		}
-		EXIT("unknown user config register\n\t%05" PRIx32 ":\n\tcmd_id = %08" PRIx32
-		     "\n\tcmd_offset = %08" PRIx32 "\n",
-		     num_dw - dw, cmd_id, cmd_offset);
+		// An unmodeled UC register: skip the packet instead of stopping the emulator.
+		static std::atomic<uint32_t> log_count {0};
+		if (log_count.fetch_add(1) < 32) {
+			LOGF("skipped unknown user config register %05" PRIx32 ": cmd_id = %08" PRIx32
+			     " cmd_offset = %08" PRIx32 "\n",
+			     num_dw - dw, cmd_id, cmd_offset);
+		}
+		return num_values + 1u;
 	}
 
 	auto s = pfunc(cp, cmd_id, cmd_offset, buffer + 1, dw);

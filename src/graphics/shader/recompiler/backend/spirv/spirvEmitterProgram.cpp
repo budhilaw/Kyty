@@ -100,30 +100,34 @@ void EmitReturn(ValueEmitContext& ctx) {
 
 // Experimental runaway-loop cap for compute shaders; off unless KYTY_LOOP_CAP=1. It can cut
 // legitimate long loops short, which corrupts game data.
-// Iterations a capped loop may run. The built-in cap targets a shadow filter whose tap count
-// arrives corrupted: its real loops take at most a few dozen taps, while 16384 iterations over
-// 3.7 million threads kept the GPU busy for seconds and made Windows reset the device.
-static uint32_t LoopCapLimit() {
-	static const uint32_t limit = [] {
-		const char* text = std::getenv("KYTY_LOOP_CAP_LIMIT");
-		if (text != nullptr) {
-			return static_cast<uint32_t>(std::strtoul(text, nullptr, 0));
-		}
-		return std::getenv("KYTY_LOOP_CAP") == nullptr ? 64u : (1u << 14u);
-	}();
-	return limit;
+// Runaway-loop protection. A loop whose trip count comes from a stale or corrupt guest
+// constant can keep the GPU busy for seconds; Windows then resets the device ("device lost")
+// and the whole desktop stutters meanwhile. Every shader loop is capped at 1024 iterations,
+// far above real per-thread loops. The shadow filter 1d5918390613826e (Uncharted: Legacy of
+// Thieves), whose tap count is at most a few dozen, is capped at 64.
+//   KYTY_LOOP_CAP=0            disables the cap
+//   KYTY_LOOP_CAP=1            caps loops in every stage
+//   KYTY_LOOP_CAP=<hashes>     caps only the listed shaders
+//   KYTY_LOOP_CAP_LIMIT=<n>    overrides the iteration limit
+static uint32_t LoopCapLimit(const EmitterState& state) {
+	static const char* limit_text = std::getenv("KYTY_LOOP_CAP_LIMIT");
+	if (limit_text != nullptr) {
+		return static_cast<uint32_t>(std::strtoul(limit_text, nullptr, 0));
+	}
+	return state.program.shader_hash == 0x1d5918390613826eull ? 64u : 1024u;
 }
 
-// KYTY_LOOP_CAP=1 caps loops in every shader; a list of hex hashes caps only those.
 static bool LoopCapEnabled(const EmitterState& state) {
 	static const std::string setting = [] {
 		const char* text = std::getenv("KYTY_LOOP_CAP");
-		// Without a setting, only shaders known to spin forever on unmodeled input are capped:
-		// 1d5918390613826e (Uncharted: Legacy of Thieves) hangs the GPU on the intro videos.
-		return std::string(text != nullptr ? text : "1d5918390613826e");
+		return std::string(text != nullptr ? text : "");
 	}();
-	if (setting.empty() || setting == "0") {
+	if (setting == "0") {
 		return false;
+	}
+	if (setting.empty()) {
+		// Draw shaders hang the GPU the same way (a vertex/pixel loop fed a stale count).
+		return true;
 	}
 	return setting == "1" ||
 	       setting.find(fmt::format("{:016x}", state.program.shader_hash)) != std::string::npos;
@@ -214,7 +218,7 @@ void EmitStructuredTerminator(ValueEmitContext& ctx, const IR::Block* block,
 				state.builder.AddFunction(spv::OpStore, counter, next);
 				const auto exceeded = state.builder.AllocateId();
 				state.builder.AddFunction(spv::OpUGreaterThan, TypeBool(state), exceeded, next,
-				                          ConstantU32(state, LoopCapLimit()));
+				                          ConstantU32(state, LoopCapLimit(state)));
 				const auto capped = state.builder.AllocateId();
 				if (true_exits) {
 					state.builder.AddFunction(spv::OpLogicalOr, TypeBool(state), capped, condition,
