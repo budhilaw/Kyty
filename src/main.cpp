@@ -16,6 +16,8 @@
 #include <string>
 #include <chrono>
 #include <thread>
+#include <algorithm>
+#include <unordered_set>
 #include <unordered_map>
 
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
@@ -377,6 +379,85 @@ static bool ParseArgs(int argc, char* argv[], RunOptions& options, bool& show_he
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 // Reports any thread that burns CPU without making a kernel call, with the instruction pointer
 // so a guest spin loop can be traced back to its module.
+// KYTY_SAMPLE_GPU=1: samples the GPU command thread about every millisecond and prints the
+// hottest emulator code (image-relative offsets, self and inclusive) every five seconds.
+static void StartGpuSampler() {
+	if (std::getenv("KYTY_SAMPLE_GPU") == nullptr) {
+		return;
+	}
+	std::thread([] {
+		const auto module = reinterpret_cast<uint64_t>(GetModuleHandleA(nullptr));
+		std::unordered_map<uint64_t, uint32_t> self;
+		std::unordered_map<uint64_t, uint32_t> inclusive;
+		uint32_t samples = 0;
+		auto     last    = std::chrono::steady_clock::now();
+		for (;;) {
+			Sleep(1);
+			const auto tid = Libs::Graphics::GpuOsThreadId();
+			if (tid == 0) {
+				continue;
+			}
+			auto* gpu = OpenThread(THREAD_GET_CONTEXT | THREAD_SUSPEND_RESUME, FALSE, tid);
+			if (gpu == nullptr) {
+				continue;
+			}
+			if (SuspendThread(gpu) != static_cast<DWORD>(-1)) {
+				CONTEXT context {};
+				context.ContextFlags = CONTEXT_FULL;
+				if (GetThreadContext(gpu, &context) != 0) {
+					samples++;
+					std::unordered_set<uint64_t> seen;
+					for (int frame = 0; frame < 8 && context.Rip != 0; frame++) {
+						if (context.Rip >= module && context.Rip < module + 0x4000000u) {
+							const auto rva = context.Rip - module;
+							if (frame == 0) {
+								self[rva]++;
+							}
+							if (seen.insert(rva).second) {
+								inclusive[rva]++;
+							}
+						} else if (frame == 0) {
+							self[0]++;
+						}
+						DWORD64 image_base = 0;
+						auto*   function   = RtlLookupFunctionEntry(context.Rip, &image_base, nullptr);
+						if (function == nullptr) {
+							break;
+						}
+						void*   handler_data = nullptr;
+						DWORD64 establisher  = 0;
+						RtlVirtualUnwind(UNW_FLAG_NHANDLER, image_base, context.Rip, function, &context,
+						                 &handler_data, &establisher, nullptr);
+					}
+				}
+				ResumeThread(gpu);
+			}
+			CloseHandle(gpu);
+			if (std::chrono::steady_clock::now() - last > std::chrono::seconds(5) && samples > 0) {
+				last = std::chrono::steady_clock::now();
+				const auto top = [&](const std::unordered_map<uint64_t, uint32_t>& table,
+				                     const char* name) {
+					std::vector<std::pair<uint64_t, uint32_t>> rows(table.begin(), table.end());
+					std::sort(rows.begin(), rows.end(),
+					          [](const auto& a, const auto& b) { return a.second > b.second; });
+					std::string line = fmt::format("GPUSAMPLE {} n={}:", name, samples);
+					for (size_t i = 0; i < rows.size() && i < 30; i++) {
+						line += fmt::format(" {:x}={:.1f}%", rows[i].first,
+						                    100.0 * rows[i].second / samples);
+					}
+					std::printf("%s\n", line.c_str());
+				};
+				top(self, "self");
+				top(inclusive, "incl");
+				std::fflush(stdout);
+				self.clear();
+				inclusive.clear();
+				samples = 0;
+			}
+		}
+	}).detach();
+}
+
 static void StartSpinWatchdog() {
 	std::thread([] {
 		std::unordered_map<DWORD, uint64_t> previous;
@@ -972,6 +1053,7 @@ static int Main(int argc, char* argv[]) {
 	InitializeThreads();
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 	StartSpinWatchdog();
+	StartGpuSampler();
 	StartHardwareWatch();
 	StartSampler();
 	StartHangWatch();
