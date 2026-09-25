@@ -658,6 +658,21 @@ static bool BuildResourceSpecialization(const ResourcePlan& program, Materialize
 		const bool raw_sint_storage = storage && format == Prospero::BufferFormat::k32SInt &&
 		                              base.written && !base.read && !base.atomic;
 		image.numeric_class         = Prospero::SampledTextureNumericClass(format);
+		if (image.indirect_root != ImageResource::NoIndirectImage &&
+		    image.numeric_class != Prospero::TextureNumericClass::Float) {
+			// Diagnostic: which indirect-table entries are not float textures.
+			static std::atomic<uint32_t> table_log {0};
+			if (table_log.fetch_add(1) < 40) {
+				std::fprintf(stderr,
+				             "INDIRECTCLASS shader=%016llx image=%u root=%u class=%u format=%u "
+				             "dwords=%08x,%08x,%08x,%08x,%08x,%08x,%08x,%08x\n",
+				             static_cast<unsigned long long>(program.shader_hash), i,
+				             image.indirect_root, static_cast<uint32_t>(image.numeric_class),
+				             static_cast<uint32_t>(format), descriptor.dwords[0], descriptor.dwords[1],
+				             descriptor.dwords[2], descriptor.dwords[3], descriptor.dwords[4],
+				             descriptor.dwords[5], descriptor.dwords[6], descriptor.dwords[7]);
+			}
+		}
 		if (storage) {
 			if ((!raw_sint_storage && image.numeric_class == Prospero::TextureNumericClass::Sint) ||
 			    image.numeric_class == Prospero::TextureNumericClass::Unsupported) {

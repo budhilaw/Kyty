@@ -11,6 +11,7 @@
 #include "graphics/host_gpu/renderer/cache/multiLevelPageTable.h"
 #include "graphics/host_gpu/renderer/cache/streamBuffer.h"
 
+#include <array>
 #include <memory>
 #include <mutex>
 #include <unordered_map>
@@ -158,6 +159,16 @@ private:
 	// a page sends only the bytes the CPU changed, so GPU writes elsewhere in the page survive.
 	std::unordered_map<uint64_t, std::vector<uint8_t>> m_write_snapshots;
 	std::recursive_mutex                               m_snapshot_mutex;
+	// What the GPU copy of each 4 KiB page held after the last upload or readback. A readback
+	// writes only bytes the GPU changed relative to it, so untouched bytes keep the guest value.
+	struct GpuBaseline {
+		std::array<uint8_t, 4096> bytes {};
+		std::array<uint64_t, 16>  valid {}; // one bit per dword
+	};
+	std::unordered_map<uint64_t, std::unique_ptr<GpuBaseline>> m_gpu_baselines;
+	void RecordGpuBaseline(uint64_t address, const uint8_t* data, uint64_t size);
+	// CPU read faults per 4 KiB page; pages the game polls (frame markers) get readbacks.
+	std::unordered_map<uint64_t, uint32_t> m_read_fault_counts;
 	MemoryTracker                                     m_memory_tracker;
 	StreamBuffer                                      m_staging_buffer;
 	StreamBuffer                                      m_stream_buffer;

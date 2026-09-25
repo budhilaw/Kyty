@@ -1196,7 +1196,8 @@ void TextureCache::UploadImage(Image& image, Buffer& source, uint64_t source_off
 	if (info.samples != 1 || destination.backing.samples != 1 ||
 	    info.resources.layers == 0 || info.data.size % info.resources.layers != 0 ||
 	    Prospero::NumBytesPerElement(info.guest_format) != info.bytes_per_block) {
-		EXIT("TextureCache: invalid depth upload\n");
+		LOGF("TextureCache: skipped invalid depth upload\n");
+		return;
 	}
 	const auto          layers          = info.resources.layers;
 	const auto          full_slice_size = info.data.size / layers;
@@ -1311,7 +1312,8 @@ void TextureCache::MaterializeDccClear(ImageId id, const ImageDesc& desc,
 		const auto address = range.address + slice_size * (first + slice);
 		uint8_t code = 0;
 		if (!LibKernel::Memory::TryReadBacking(address, &code, sizeof(code))) {
-			EXIT("TextureCache: failed to read DCC metadata backing\n");
+			LOGF("TextureCache: DCC metadata at 0x%016" PRIx64 " unreadable, clear skipped\n", address);
+			return;
 		}
 		vk::ClearValue clear {};
 		if (!DecodeDccClear(desc, code, clear.color)) {

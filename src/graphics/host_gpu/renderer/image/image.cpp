@@ -632,7 +632,7 @@ void Validate(const ImageInfo& info) {
 			    (info.metadata.range.size != 0 &&
 			     info.metadata.range.size > TRACKER_ADDRESS_SIZE - info.metadata.range.address) ||
 			    info.metadata.compression == VideoOutCompression::Unsupported) {
-				EXIT("invalid DCC metadata\n");
+				LOGF("Image: invalid DCC metadata ignored\n");
 			}
 			break;
 	}
@@ -655,6 +655,16 @@ Image::Image(GraphicContext& graphics, CommandScheduler& scheduler, const ImageI
              uint32_t requested_capacity_layers)
     : info(image_info), m_graphics(graphics), m_scheduler(scheduler) {
 	KYTY_PROFILER_FUNCTION();
+	if (info.metadata.kind == ImageMetadataKind::Dcc &&
+	    (info.metadata.range.address == 0 || info.metadata.range.address >= TRACKER_ADDRESS_SIZE ||
+	     (info.metadata.range.size != 0 &&
+	      info.metadata.range.size > TRACKER_ADDRESS_SIZE - info.metadata.range.address) ||
+	     info.metadata.compression == VideoOutCompression::Unsupported)) {
+		// DCC metadata from a corrupt descriptor: treat the surface as uncompressed.
+		LOGF("Image: dropped invalid DCC metadata addr=0x%016" PRIx64 " size=0x%" PRIx64 "\n",
+		     info.metadata.range.address, info.metadata.range.size);
+		info.metadata = {};
+	}
 	ImageOps::Validate(info);
 	m_cpu_dirty =
 	    !info.data.Empty() && info.metadata.compression == VideoOutCompression::Uncompressed;

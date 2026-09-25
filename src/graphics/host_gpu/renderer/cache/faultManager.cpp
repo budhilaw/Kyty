@@ -10,6 +10,7 @@
 #include "graphics/host_gpu/vulkanCommon.h"
 
 #include <bit>
+#include <cstdlib>
 #include <cinttypes>
 #include <cstring>
 #include <limits>
@@ -76,6 +77,12 @@ FaultManager::~FaultManager() {
 }
 
 void FaultManager::ProcessFaultBuffer() {
+	// Diagnostic: KYTY_NO_BDA_READBACK=1 never marks raw-pointer-written pages GPU-modified,
+	// so they are not read back over the guest copy.
+	static const bool no_bda_readback = std::getenv("KYTY_NO_BDA_READBACK") != nullptr;
+	if (no_bda_readback) {
+		m_written_ranges.clear();
+	}
 	for (const auto& [start, size]: std::exchange(m_written_ranges, {})) {
 		if (m_scheduler.Context().IsMapped(start, size)) {
 			(void)m_buffer_cache.ObtainBuffer(start, size, true);

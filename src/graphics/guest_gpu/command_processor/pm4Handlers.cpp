@@ -1682,8 +1682,13 @@ KYTY_CP_OP_PARSER(CpOpDrawIndex) {
 		uint32_t index_count = buffer[3];
 		uint32_t flags       = buffer[4];
 
-		EXIT_NOT_IMPLEMENTED(index_count > max_index_count);
-		EXIT_NOT_IMPLEMENTED((flags & ~0x20u) != 0);
+		index_count = std::min(index_count, max_index_count);
+		if ((flags & ~0x20u) != 0) {
+		static std::atomic<uint32_t> flag_log {0};
+		if (flag_log.fetch_add(1) < 8) {
+			LOGF("draw index: ignoring unmodeled flags 0x%08" PRIx32 "\n", flags);
+		}
+	}
 
 		cp.DrawIndex({.index_count = index_count, .index_addr = index_addr});
 
@@ -1741,8 +1746,13 @@ KYTY_CP_OP_PARSER(CpOpDrawIndexOffset) {
 	uint32_t index_count    = buffer[2];
 	uint32_t flags          = buffer[3];
 
-	EXIT_NOT_IMPLEMENTED(index_count > max_index_size);
-	EXIT_NOT_IMPLEMENTED((flags & ~0x20u) != 0);
+	index_count = std::min(index_count, max_index_size);
+	if ((flags & ~0x20u) != 0) {
+		static std::atomic<uint32_t> flag_log {0};
+		if (flag_log.fetch_add(1) < 8) {
+			LOGF("draw index: ignoring unmodeled flags 0x%08" PRIx32 "\n", flags);
+		}
+	}
 
 	cp.DrawIndexOffset(index_offset, index_count);
 
@@ -2277,7 +2287,7 @@ KYTY_CP_OP_PARSER(CpOpMarker) {
 			cp.FlipWithInterrupt(eop_event_type, cache_action, addr, value);
 			break;
 		}
-		default: EXIT("unknown marker at %05" PRIx32 ": 0x%" PRIx32 "\n", num_dw - dw, id);
+		default: LOGF("skipped unknown marker at %05" PRIx32 ": 0x%" PRIx32 "\n", num_dw - dw, id); break;
 	}
 
 	return len_dw + 1;
@@ -2301,9 +2311,12 @@ KYTY_CP_OP_PARSER(CpOpNop) {
 		return cp_op(cp, cmd_id, buffer, dw, num_dw);
 	}
 
-	EXIT("unknown custom code at 0x%05" PRIx32 ": 0x%02" PRIx32 "\n", num_dw - dw, r);
-
-	return 0;
+	// An unknown NOP payload is skipped like any other NOP.
+	static std::atomic<uint32_t> log_count {0};
+	if (log_count.fetch_add(1) < 16) {
+		LOGF("skipped unknown custom code at 0x%05" PRIx32 ": 0x%02" PRIx32 "\n", num_dw - dw, r);
+	}
+	return KYTY_PM4_LEN(cmd_id) - 1;
 }
 
 KYTY_CP_OP_PARSER(CpOpNumInstances) {

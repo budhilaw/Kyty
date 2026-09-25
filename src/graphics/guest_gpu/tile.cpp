@@ -1319,7 +1319,9 @@ void TileGetTextureSize(Prospero::BufferFormat format, uint32_t width, uint32_t 
 		return;
 	}
 	if (total_size != nullptr && total_size->size == 0) {
-		EXIT("unknown format:\nformat = %u\nwidth  = %u\nheight = %u\nlevels = %u\ntile   = %u\n",
+		// No layout for this format/tile pair (usually a corrupt descriptor): the size stays 0
+		// and the texture binds as a null image.
+		LOGF("unknown tiled format %u %ux%u levels=%u tile=%u; texture treated as empty\n",
 		     static_cast<uint32_t>(format), width, height, levels, static_cast<uint32_t>(tile));
 	}
 }
