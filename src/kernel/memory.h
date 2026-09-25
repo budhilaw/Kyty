@@ -117,6 +117,8 @@ void                   SetSyncShaderReads(bool enabled);
 bool                   ReadGpuBackingOrPrefetch(uint64_t vaddr, void* data, uint64_t size);
 // Reads GPU-produced indirect arguments with the GPU's latest values (see ReadGpuArgs).
 bool                   ReadGpuArgs(uint64_t vaddr, void* data, uint64_t size);
+// The GPU's copy of a range, whatever the tracker believes (GPU thread only).
+bool                   PeekGpuCopy(uint64_t vaddr, void* data, uint64_t size);
 // True when the range is mapped GPU memory whose latest bytes were written by the GPU (the CPU
 // copy is stale until a readback); such arguments are best consumed on the GPU.
 bool                   IsGpuWrittenRange(uint64_t vaddr, uint64_t size);
@@ -203,6 +205,12 @@ bool ProtectGuestHostMemory(uint64_t vaddr, uint64_t size, Common::VirtualMemory
 void NoteGuestStackRange(uint64_t vaddr, uint64_t size);
 // Diagnostic before a GPU readback overwrites guest memory: logs guest pointers it would zero.
 void CheckReadbackClobber(uint64_t vaddr, const void* data, uint64_t size, const char* who);
+// Fence/label dwords the command processor stored straight into guest memory: a buffer
+// readback never overwrites them (the buffer's copy of such a page is older).
+void NoteLabelStore(uint64_t vaddr, uint64_t size);
+// Copies the guest's current value of every noted label dword in [vaddr, vaddr+size) into data.
+void KeepLabelStores(uint64_t vaddr, uint8_t* data, uint64_t size);
+[[nodiscard]] bool RangeHasLabelStores(uint64_t vaddr, uint64_t size);
 bool FreeGuestMemory(uint64_t vaddr, uint64_t size);
 
 #if defined(KYTY_VIRTUAL_MEMORY_ALLOCATION_TESTS)

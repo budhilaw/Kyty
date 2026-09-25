@@ -89,7 +89,16 @@ vk::DescriptorImageInfo MakeImageInfo(const TextureBinding& texture, uint32_t el
 	} else if (element < texture.mip_views.size()) {
 		view = texture.mip_views[element];
 	}
-	EXIT_IF(!texture.image_id || view == nullptr || texture.layout == vk::ImageLayout::eUndefined);
+	if (!texture.image_id || view == nullptr || texture.layout == vk::ImageLayout::eUndefined) {
+		// FindTexture binds nothing for an image another binding of the draw replaced
+		// (robustness2 null descriptor) instead of a view that could dangle.
+		static std::atomic<uint32_t> log_count {0};
+		if (log_count.fetch_add(1) < 16) {
+			LOGF("descriptors: texture binding without a view, bound null (image=%d layout=%d)\n",
+			     texture.image_id ? 1 : 0, static_cast<int>(texture.layout));
+		}
+		return {nullptr, nullptr, vk::ImageLayout::eGeneral};
+	}
 	return {nullptr, view, texture.layout};
 }
 

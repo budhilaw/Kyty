@@ -204,9 +204,14 @@ bool RenderExecutor::TryConsumeComputeImageClear(const ShaderComputeInputInfo& i
 }
 
 static thread_local bool g_gpu_driven_dispatch = false;
+static thread_local bool g_gpu_args_only       = false;
 
 bool InGpuDrivenDispatch() {
-	return g_gpu_driven_dispatch;
+	return g_gpu_driven_dispatch && !g_gpu_args_only;
+}
+
+void SetGpuArgsOnlyDispatch(bool value) {
+	g_gpu_args_only = value;
 }
 
 void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,

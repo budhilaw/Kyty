@@ -477,6 +477,19 @@ void RenderContext::PrepareBda() {
 				m_buffer_cache.SynchronizeBuffersInRange(start, end - start);
 			});
 		} else {
+			// Pages the game writes are logged one at a time; adjacent ones are walked together.
+			std::sort(dirty.begin(), dirty.end());
+			size_t merged = 0;
+			for (size_t i = 0; i < dirty.size(); i++) {
+				if (merged != 0 && dirty[i].first <= dirty[merged - 1].first + dirty[merged - 1].second) {
+					const auto end = std::max(dirty[merged - 1].first + dirty[merged - 1].second,
+					                          dirty[i].first + dirty[i].second);
+					dirty[merged - 1].second = end - dirty[merged - 1].first;
+				} else {
+					dirty[merged++] = dirty[i];
+				}
+			}
+			dirty.resize(merged);
 			for (const auto& [address, size]: dirty) {
 				m_mapped_ranges.ForEachInRange(address, size, [this](uint64_t start, uint64_t end) {
 					m_buffer_cache.SynchronizeBuffersInRange(start, end - start);

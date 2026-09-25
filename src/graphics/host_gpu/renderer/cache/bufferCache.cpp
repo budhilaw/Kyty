@@ -547,7 +547,8 @@ bool BufferCache::WaitForReadback(uint64_t tick) {
 	return false;
 }
 
-bool BufferCache::PeekGpuRange(uint64_t vaddr, uint64_t size, void* out, uint64_t timeout_ns) {
+bool BufferCache::PeekGpuRange(uint64_t vaddr, uint64_t size, void* out, uint64_t timeout_ns,
+                               bool args) {
 	// A copy of the GPU's bytes for the emulator's own use (compute descriptor tables). Guest
 	// memory, the tracker and the poll counts are untouched: writing GPU bytes back for the
 	// emulator's reads corrupted game objects (the game crashed on garbage pointers).
@@ -573,12 +574,14 @@ bool BufferCache::PeekGpuRange(uint64_t vaddr, uint64_t size, void* out, uint64_
 	if (vaddr + size > page + PeekPageSize) {
 		// Straddling reads: each page on its own.
 		const auto first = page + PeekPageSize - vaddr;
-		return PeekGpuRange(vaddr, first, out, timeout_ns) &&
+		return PeekGpuRange(vaddr, first, out, timeout_ns, args) &&
 		       PeekGpuRange(vaddr + first, size - first, static_cast<uint8_t*>(out) + first,
-		                    timeout_ns);
+		                    timeout_ns, args);
 	}
+	static const bool no_cache = std::getenv("KYTY_PEEK_NOCACHE") != nullptr;
 	for (const auto& cached: m_peek_pages) {
-		if (cached.page == page && cached.generation == m_peek_generation) {
+		if (!no_cache && cached.page == page &&
+		    (cached.generation == m_peek_generation || (args && cached.args))) {
 			std::memcpy(out, cached.bytes.data() + (vaddr - page), size);
 			stat_served++;
 			return true;
@@ -647,6 +650,7 @@ bool BufferCache::PeekGpuRange(uint64_t vaddr, uint64_t size, void* out, uint64_
 	auto& cached      = m_peek_pages.emplace_back();
 	cached.page       = page;
 	cached.generation = m_peek_generation;
+	cached.args       = args;
 	std::memcpy(cached.bytes.data(), mapped, PeekPageSize);
 	std::memcpy(out, cached.bytes.data() + (vaddr - page), size);
 	return true;
@@ -1010,6 +1014,16 @@ BufferId BufferCache::CreateBuffer(uint64_t vaddr, uint64_t size) {
 	return id;
 }
 
+void BufferCache::NoteRawPointerWrite(uint64_t vaddr, uint64_t size) {
+	std::lock_guard lock(m_snapshot_mutex);
+	if (m_raw_write_pages.size() > 65536) {
+		m_raw_write_pages.clear();
+	}
+	for (auto page = vaddr & ~uint64_t {4095}; page < vaddr + size; page += 4096) {
+		m_raw_write_pages.insert(page);
+	}
+}
+
 void BufferCache::RecordGpuBaseline(uint64_t address, const uint8_t* data, uint64_t size) {
 	constexpr uint64_t Page = 4096;
 	std::lock_guard    lock(m_snapshot_mutex);
@@ -1025,7 +1039,7 @@ void BufferCache::RecordGpuBaseline(uint64_t address, const uint8_t* data, uint6
 		// Only pages the game polls are ever written back; others need no baseline. Copying
 		// every uploaded byte cost ~14% of the GPU thread on the Language screen.
 		static const bool all_pages = std::getenv("KYTY_READBACK") != nullptr;
-		if (!all_pages) {
+		if (!all_pages && !m_raw_write_pages.contains(page)) {
 			const auto polled = m_read_fault_counts.find(page);
 			if (polled == m_read_fault_counts.end() || polled->second < 4u) {
 				done += chunk;
@@ -1114,36 +1128,21 @@ void BufferCache::WriteBackMerged(uint64_t vaddr, const uint8_t* data, uint64_t 
 			}
 			const auto found = m_gpu_baselines.find(page);
 			if (found == m_gpu_baselines.end()) {
-				// No baseline (the page became polled after its last upload): the GPU copy is
-				// written back whole, but a zero it holds where the guest has data is a byte the
-				// GPU never wrote (job structures share pages with GPU counters; a null pointer
-				// written this way crashed the NdJob workers).
+				// No baseline (the page became polled after its last upload): nothing the GPU
+				// changed can be told from its stale copy of CPU data, so nothing is written this
+				// time. Writing the copy (even keeping zeros and pointers) cut the game's job
+				// structures and crashed the NdJob workers; with readbacks off no run crashed.
 				std::array<uint8_t, 4096> current {};
 				if (!Libs::LibKernel::Memory::TryReadBacking(page, current.data(), BasePage)) {
 					continue;
 				}
 				const auto begin = std::max(page, vaddr);
 				const auto end   = std::min(page + BasePage, vaddr + size);
-				uint32_t   kept  = 0;
-				for (auto address = begin; address < end; address++) {
-					const auto offset = address - page;
-					if (data[address - vaddr] == 0 && current[offset] != 0) {
-						if (merged.empty()) {
-							merged.assign(data, data + size);
-						}
-						merged[address - vaddr] = current[offset];
-						kept++;
-					}
+				if (merged.empty()) {
+					merged.assign(data, data + size);
 				}
-				kept += keep_guest_pointers(page, begin, end, current, nullptr);
-				if (kept != 0) {
-					static std::atomic<uint32_t> log_count {0};
-					if (log_count.fetch_add(1) < 8) {
-						LOGF("BufferCache: readback of 0x%016" PRIx64 " kept %u guest bytes the GPU copy "
-						     "has as zero or non-pointer (no baseline)\n",
-						     page, kept);
-					}
-				}
+				std::memcpy(merged.data() + (begin - vaddr), current.data() + (begin - page),
+				            end - begin);
 				// From now on the page has a baseline: the next readback writes only what the
 				// GPU changes after this one.
 				auto& created = m_gpu_baselines[page];
@@ -1182,18 +1181,18 @@ void BufferCache::WriteBackMerged(uint64_t vaddr, const uint8_t* data, uint64_t 
 				for (auto address = begin; address < end; address++) {
 					const auto offset = address - page;
 					const auto dword  = offset / 4u;
-					if ((baseline.valid[dword / 64u] & (uint64_t {1} << (dword % 64u))) == 0) {
-						continue;
-					}
+					const bool known =
+					    (baseline.valid[dword / 64u] & (uint64_t {1} << (dword % 64u))) != 0;
 					const auto gpu = data[address - vaddr];
-					if (gpu == baseline.bytes[offset] && gpu != current[offset]) {
+					// Unknown bytes keep the guest value too: only a change from the baseline is a
+					// GPU write.
+					if ((!known || gpu == baseline.bytes[offset]) && gpu != current[offset]) {
 						if (merged.empty()) {
 							merged.assign(data, data + size);
 						}
 						merged[address - vaddr] = current[offset];
 					}
 				}
-				(void)keep_guest_pointers(page, begin, end, current, &baseline);
 			}
 			std::memcpy(baseline.bytes.data() + (begin - page), gpu_page, length);
 			for (auto dword = (begin - page + 3u) / 4u; dword < (end - page) / 4u; dword++) {
@@ -1235,7 +1234,14 @@ void BufferCache::WriteBackMerged(uint64_t vaddr, const uint8_t* data, uint64_t 
 		}
 		const auto begin = std::max(first_page + index * BasePage, vaddr);
 		const auto end   = std::min(first_page + run_end * BasePage, vaddr + size);
-		WriteBackingIfMapped(begin, source + (begin - vaddr), end - begin);
+		if (Libs::LibKernel::Memory::RangeHasLabelStores(begin, end - begin)) {
+			// Fences the command processor stored are newer than this copy of the page.
+			std::vector<uint8_t> run(source + (begin - vaddr), source + (end - vaddr));
+			Libs::LibKernel::Memory::KeepLabelStores(begin, run.data(), run.size());
+			WriteBackingIfMapped(begin, run.data(), run.size());
+		} else {
+			WriteBackingIfMapped(begin, source + (begin - vaddr), end - begin);
+		}
 		index = run_end;
 	}
 }
@@ -1392,7 +1398,8 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBuffer(uint64_t vaddr, uint64_t 
 		EXIT("BufferCache: buffer request requires a recording command buffer\n");
 	}
 	if (is_written) {
-		// Whole cache: the pass writing Uncharted's dispatch counts is not seen by range.
+		// Everything: Uncharted's lighting passes write each other's dispatch arguments through a
+		// path a range check missed (argument pages went stale, passes were skipped).
 		InvalidatePeekCache();
 	}
 	if (!GuestRange {vaddr, size}.Valid()) {

@@ -22,6 +22,7 @@
 #include <map>
 #include <memory>
 #include <mutex>
+#include <unordered_set>
 #include <vector>
 
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
@@ -970,6 +971,13 @@ bool IsGpuWrittenRange(uint64_t vaddr, uint64_t size) {
 	}
 	return g_gpu_resources != nullptr && IsGpuAddressRange(vaddr, size) &&
 	       g_gpu_resources->IsMapped(vaddr, size);
+}
+
+bool PeekGpuCopy(uint64_t vaddr, void* data, uint64_t size) {
+	return g_gpu_resources != nullptr && Graphics::GuestGpu::IsGpuThread() &&
+	       IsGpuAddressRange(vaddr, size) && g_gpu_resources->IsMapped(vaddr, size) &&
+	       GetGpuResources().GetBufferCache().PeekGpuRange(vaddr, size, data, 100'000'000ull,
+	                                                       true);
 }
 
 bool ReadGpuArgs(uint64_t vaddr, void* data, uint64_t size) {
@@ -3953,6 +3961,50 @@ bool ProtectGuestMemory(uint64_t vaddr, uint64_t size, VirtualMemory::Mode mode,
 
 static std::mutex                                   g_guest_stack_mutex;
 static std::vector<std::pair<uint64_t, uint64_t>>   g_guest_stacks;
+
+static std::mutex                   g_label_mutex;
+static std::unordered_set<uint64_t> g_label_dwords; // dword-aligned addresses
+
+void NoteLabelStore(uint64_t vaddr, uint64_t size) {
+	std::lock_guard lock(g_label_mutex);
+	if (g_label_dwords.size() > 65536) {
+		g_label_dwords.clear();
+	}
+	for (auto address = vaddr & ~uint64_t {3}; address < vaddr + size; address += 4) {
+		g_label_dwords.insert(address);
+	}
+}
+
+bool RangeHasLabelStores(uint64_t vaddr, uint64_t size) {
+	std::lock_guard lock(g_label_mutex);
+	if (g_label_dwords.empty()) {
+		return false;
+	}
+	for (auto address = vaddr & ~uint64_t {3}; address < vaddr + size; address += 4) {
+		if (g_label_dwords.contains(address)) {
+			return true;
+		}
+	}
+	return false;
+}
+
+void KeepLabelStores(uint64_t vaddr, uint8_t* data, uint64_t size) {
+	std::vector<uint64_t> hits;
+	{
+		std::lock_guard lock(g_label_mutex);
+		for (auto address = (vaddr + 3u) & ~uint64_t {3}; address + 4 <= vaddr + size; address += 4) {
+			if (g_label_dwords.contains(address)) {
+				hits.push_back(address);
+			}
+		}
+	}
+	for (const auto address: hits) {
+		uint32_t current = 0;
+		if (TryReadBacking(address, &current, 4)) {
+			std::memcpy(data + (address - vaddr), &current, 4);
+		}
+	}
+}
 
 void CheckReadbackClobber(uint64_t vaddr, const void* data, uint64_t size, const char* who) {
 	static const bool            enabled = std::getenv("KYTY_CLOBBER_CHECK") != nullptr;

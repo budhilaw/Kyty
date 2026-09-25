@@ -49,14 +49,22 @@ public:
 	[[nodiscard]] bool     ReadMemoryBounded(uint64_t vaddr, uint64_t size, uint64_t timeout_ns);
 	// Copies the GPU's current bytes of a resident range into out without touching guest
 	// memory or tracking state. False when the range is not GPU-owned, resident, or in time.
-	[[nodiscard]] bool PeekGpuRange(uint64_t vaddr, uint64_t size, void* out, uint64_t timeout_ns);
-	// Drops peeked pages: called when GPU work that may write guest memory is recorded.
-	void InvalidatePeekCache() { m_peek_generation++; }
-	// Drops only peeked pages that overlap a range recorded GPU work writes.
+	// args: the page holds indirect arguments; its copy stays valid until a write overlapping it
+	// or a raw-pointer pass is recorded (descriptor pages drop on any recorded write).
+	[[nodiscard]] bool PeekGpuRange(uint64_t vaddr, uint64_t size, void* out, uint64_t timeout_ns,
+	                                bool args = false);
+	// Recorded GPU work writes [vaddr, vaddr+size): descriptor pages all drop, args pages that
+	// overlap it drop.
 	void InvalidatePeekCache(uint64_t vaddr, uint64_t size) {
+		m_peek_generation++;
 		std::erase_if(m_peek_pages, [&](const PeekPage& p) {
 			return p.page < vaddr + size && vaddr < p.page + 4096;
 		});
+	}
+	// Recorded GPU work may write anywhere (raw pointers).
+	void InvalidatePeekCache() {
+		m_peek_generation++;
+		m_peek_pages.clear();
 	}
 	[[nodiscard]] Buffer&  GetBuffer(BufferId id) { return m_slot_buffers[id]; }
 	[[nodiscard]] BufferId FindBuffer(uint64_t vaddr, uint64_t size);
@@ -174,6 +182,9 @@ public:
 	// Marks [vaddr, vaddr+size) as needed by the host (indirect draw/dispatch arguments): its
 	// readbacks reach guest memory even though the game never polls it.
 	void RequestWriteback(uint64_t vaddr, uint64_t size);
+	// A shader wrote [vaddr, vaddr+size) through a raw pointer: its pages keep a GPU baseline
+	// from their next upload, so readbacks write only bytes the GPU changed.
+	void NoteRawPointerWrite(uint64_t vaddr, uint64_t size);
 
 private:
 	GraphicContext&                                   m_graphics;
@@ -200,6 +211,7 @@ private:
 	void RecordGpuBaseline(uint64_t address, const uint8_t* data, uint64_t size);
 	// CPU read faults per 4 KiB page; pages the game polls (frame markers) get readbacks.
 	std::unordered_map<uint64_t, uint32_t> m_read_fault_counts;
+	std::unordered_set<uint64_t>           m_raw_write_pages; // 4 KiB pages
 	MemoryTracker                                     m_memory_tracker;
 	StreamBuffer                                      m_staging_buffer;
 	StreamBuffer                                      m_stream_buffer;
@@ -212,6 +224,7 @@ private:
 	struct PeekPage {
 		uint64_t                  page       = 0;
 		uint64_t                  generation = 0;
+		bool                      args       = false;
 		std::array<uint8_t, 4096> bytes {};
 	};
 	std::vector<PeekPage> m_peek_pages;

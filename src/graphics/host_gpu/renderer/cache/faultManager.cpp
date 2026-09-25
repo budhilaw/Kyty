@@ -169,6 +169,7 @@ void FaultManager::ProcessFaultBuffer() {
 		// Pages a shader wrote through a device address are owned by the GPU from now on.
 		written_ranges.ForEach([this](uint64_t start, uint64_t end) {
 			m_written_ranges.emplace_back(start, end - start);
+			m_buffer_cache.NoteRawPointerWrite(start, end - start);
 			NoteGpuWriter(start, end - start, 5u);
 		});
 		m_fault_areas[area] = 0;

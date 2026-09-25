@@ -2245,6 +2245,37 @@ void CommandProcessor::DispatchIndirect(uint64_t args_addr, uint32_t mode) {
 		return;
 	}
 	if (Libs::LibKernel::Memory::ReadGpuArgs(args_addr, &args, sizeof(args))) {
+		// A zero count in guest memory is usually one a GPU pass wrote through a raw pointer the
+		// tracker never saw (Uncharted's per-material tile lighting: 12 of 19 passes per frame
+		// never ran and the frame stayed white). The GPU's copy decides.
+		// Default: the dispatch reads its counts from the GPU buffer when it executes (no drain,
+		// and ordered with the passes that write them). KYTY_ZERO_ARGS_PEEK=1 instead drains the
+		// GPU and reads them here; that depended on timing (whole runs came out magenta).
+		static const bool zero_peek = std::getenv("KYTY_ZERO_ARGS_PEEK") != nullptr;
+		static const bool zero_gpu  = !zero_peek;
+		const bool        zero =
+		    args.thread_group_x == 0 || args.thread_group_y == 0 || args.thread_group_z == 0;
+		if (zero && zero_gpu && !zero_peek &&
+		    (mode & Pm4::COMPUTE_DISPATCH_INITIATOR_USE_THREAD_DIMENSIONS) == 0) {
+			m_sh_ctx.SetCsWaveSize(Pm4::ComputeWaveSize(mode));
+			// Outputs stay eligible for readback: loading threads wait on them (stalls without).
+			m_renderer.GetRenderExecutor().Dispatch(m_submit_id, CurrentBuffer(), 1, 1, 1, mode,
+			                                        args_addr);
+			return;
+		}
+		if (zero_peek && zero) {
+			DispatchIndirectArgs gpu {};
+			const bool peeked = Libs::LibKernel::Memory::PeekGpuCopy(args_addr, &gpu, sizeof(gpu));
+			if (peeked) {
+				args = gpu;
+			}
+			static std::atomic<uint32_t> log_count {0};
+			if (log_count.fetch_add(1) < 64) {
+				LOGF("ZEROARGS 0x%016" PRIx64 " peeked=%d gpu=%ux%ux%u writer=%016" PRIx64 "\n",
+				     args_addr, peeked ? 1 : 0, gpu.thread_group_x, gpu.thread_group_y,
+				     gpu.thread_group_z, Libs::Graphics::FindGpuWriter(args_addr));
+			}
+		}
 		const auto groups =
 		    uint64_t {args.thread_group_x} * args.thread_group_y * args.thread_group_z;
 		// Garbage counts: the clamped GPU path allows 131072 groups; a stale CPU copy with
@@ -2336,6 +2367,9 @@ void CommandProcessor::WriteAtEndOfPipe(uint32_t cache_policy, uint32_t event_wr
 	// through the alias first and falls back to the direct mapping only when it is committed.
 	const auto dst_address  = reinterpret_cast<uint64_t>(dst_gpu_addr);
 	const auto store_fence  = [&](const void* data, size_t bytes) {
+		if (dst_gpu_addr != nullptr) {
+			Libs::LibKernel::Memory::NoteLabelStore(dst_address, bytes);
+		}
 		if (dst_gpu_addr == nullptr ||
 		    Libs::LibKernel::Memory::TryWriteBacking(dst_address, data, bytes)) {
 			return;

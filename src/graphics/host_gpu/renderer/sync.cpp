@@ -113,6 +113,9 @@ static void RecordEndOfPipeWrite(uint64_t submit_id, CommandBuffer& buffer, uint
 				std::memcpy(reinterpret_cast<void*>(destination), data, bytes);
 			}
 		}
+		// A later readback of the page must not put the buffer's older copy back over it
+		// (a queue waiting on this fence deadlocked the intro).
+		LibKernel::Memory::NoteLabelStore(destination, bytes);
 		ResolvePendingGuestGpuWrite(pending);
 		// Only 32-bit writes are fences; 64-bit ones are timestamps that would flood the map.
 		if (size == EndOfPipeWriteSize::Dword) {

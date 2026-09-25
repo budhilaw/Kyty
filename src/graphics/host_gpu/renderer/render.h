@@ -76,6 +76,9 @@ bool TakeDrawClampStale();
 // True while a GPU-driven (indirect) dispatch resolves its bindings: the buffers it writes are
 // read by the game's CPU afterwards, so they are made eligible for readback.
 [[nodiscard]] bool InGpuDrivenDispatch();
+// The next indirect dispatches take only their counts from the GPU; their outputs are not read
+// back for the CPU (Uncharted's tile lighting).
+void SetGpuArgsOnlyDispatch(bool value);
 
 struct DrawAutoArgs {
 	uint32_t         vertex_count               = 0;

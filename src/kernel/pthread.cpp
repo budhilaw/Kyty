@@ -25,7 +25,9 @@
 #include <cstring>
 #include <ctime>
 #include <memory>
+#include <cstdio>
 #include <mutex>
+#include <unordered_set>
 #include <new>
 #include <thread>
 #include <utility>
@@ -3867,6 +3869,23 @@ int KYTY_SYSV_ABI KernelUsleep(KernelUseconds microseconds) {
 	Common::WaitTrace::Scope wait_scope(Common::WaitTrace::Kind::Sleep);
 	LOGF("\t GWAIT: usleep usec=%u thread=%d caller=%p\n", microseconds,
 	     Common::Thread::GetThreadIdUnique(), __builtin_return_address(0));
+	// KYTY_DUMP_POLL_CODE=1: the guest code before each sleep-polling call site, once, so a
+	// stall's poll loops can be disassembled (_guestpoll_<return address>.bin, 512 bytes before).
+	static const bool dump_poll = std::getenv("KYTY_DUMP_POLL_CODE") != nullptr;
+	if (dump_poll) {
+		static std::mutex                   dumped_mutex;
+		static std::unordered_set<uint64_t> dumped;
+		const auto caller = reinterpret_cast<uint64_t>(__builtin_return_address(0));
+		std::lock_guard lock(dumped_mutex);
+		if (dumped.insert(caller).second && dumped.size() < 64) {
+			char name[64];
+			std::snprintf(name, sizeof(name), "_guestpoll_%016" PRIx64 ".bin", caller);
+			if (auto* file = std::fopen(name, "wb"); file != nullptr) {
+				std::fwrite(reinterpret_cast<const void*>(caller - 512), 1, 576, file);
+				std::fclose(file);
+			}
+		}
+	}
 	Common::Timer t;
 	t.Start();
 	SleepMicroWithSignalPoll(microseconds);
