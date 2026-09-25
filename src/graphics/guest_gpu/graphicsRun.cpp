@@ -2248,11 +2248,11 @@ void CommandProcessor::DispatchIndirect(uint64_t args_addr, uint32_t mode) {
 		// A zero count in guest memory is usually one a GPU pass wrote through a raw pointer the
 		// tracker never saw (Uncharted's per-material tile lighting: 12 of 19 passes per frame
 		// never ran and the frame stayed white). The GPU's copy decides.
-		// Default: the dispatch reads its counts from the GPU buffer when it executes (no drain,
-		// and ordered with the passes that write them). KYTY_ZERO_ARGS_PEEK=1 instead drains the
-		// GPU and reads them here; that depended on timing (whole runs came out magenta).
-		static const bool zero_peek = std::getenv("KYTY_ZERO_ARGS_PEEK") != nullptr;
-		static const bool zero_gpu  = !zero_peek;
+		// Default: the GPU's copy is read here (a drain, served from the peek cache until any
+		// write is recorded). KYTY_ZERO_ARGS_GPU=1 dispatches from the GPU buffer instead; every
+		// run in that mode showed an over-exposed blob instead of the selector's cave.
+		static const bool zero_gpu  = std::getenv("KYTY_ZERO_ARGS_GPU") != nullptr;
+		static const bool zero_peek = !zero_gpu;
 		const bool        zero =
 		    args.thread_group_x == 0 || args.thread_group_y == 0 || args.thread_group_z == 0;
 		if (zero && zero_gpu && !zero_peek &&

@@ -587,12 +587,16 @@ bool BufferCache::PeekGpuRange(uint64_t vaddr, uint64_t size, void* out, uint64_
 			return true;
 		}
 	}
-	const auto id = FindBuffer(page, PeekPageSize);
-	if (!id) {
+	// ObtainBuffer, not FindBuffer: FindBuffer creates a buffer without uploading the guest's
+	// data into it, and the vertex data sharing those pages then stayed zero on the GPU (the
+	// selector drew no geometry in about half the runs).
+	auto [obtained, obtained_offset] = ObtainBuffer(page, PeekPageSize, false);
+	if (obtained == nullptr) {
 		stat_no_buffer++;
 		return false;
 	}
-	auto&      buffer = m_slot_buffers[id];
+	(void)obtained_offset;
+	auto&      buffer = *obtained;
 	const auto begin  = std::max(page, buffer.CpuAddress());
 	const auto end    = std::min(page + PeekPageSize, buffer.CpuAddress() + buffer.Size());
 	if (begin != page || end != page + PeekPageSize) {
@@ -1027,9 +1031,13 @@ void BufferCache::NoteRawPointerWrite(uint64_t vaddr, uint64_t size) {
 void BufferCache::RecordGpuBaseline(uint64_t address, const uint8_t* data, uint64_t size) {
 	constexpr uint64_t Page = 4096;
 	std::lock_guard    lock(m_snapshot_mutex);
-	if (m_gpu_baselines.size() > 65536) {
-		// Over 256 MiB of baselines: start over; pages without one use the older merge.
-		m_gpu_baselines.clear();
+	if (m_gpu_baselines.size() > 98304) {
+		// Over ~400 MiB of baselines: drop an arbitrary eighth rather than all of them (a page
+		// without one skips its next readback).
+		auto it = m_gpu_baselines.begin();
+		for (size_t n = 0; n < 12288 && it != m_gpu_baselines.end(); n++) {
+			it = m_gpu_baselines.erase(it);
+		}
 	}
 	for (uint64_t done = 0; done < size;) {
 		const auto at    = address + done;
@@ -1038,7 +1046,11 @@ void BufferCache::RecordGpuBaseline(uint64_t address, const uint8_t* data, uint6
 		const auto chunk = std::min<uint64_t>(size - done, Page - begin);
 		// Only pages the game polls are ever written back; others need no baseline. Copying
 		// every uploaded byte cost ~14% of the GPU thread on the Language screen.
-		static const bool all_pages = std::getenv("KYTY_READBACK") != nullptr;
+		// Every uploaded page gets one: a page that becomes polled later is then read back
+		// exactly (without it, either stale CPU data was written back or GPU results were lost).
+		// KYTY_POLLED_BASELINES=1 limits them to polled pages (cheaper, lossy).
+		static const bool all_pages = std::getenv("KYTY_POLLED_BASELINES") == nullptr ||
+		                              std::getenv("KYTY_READBACK") != nullptr;
 		if (!all_pages && !m_raw_write_pages.contains(page)) {
 			const auto polled = m_read_fault_counts.find(page);
 			if (polled == m_read_fault_counts.end() || polled->second < 4u) {

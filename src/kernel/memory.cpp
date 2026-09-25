@@ -976,8 +976,7 @@ bool IsGpuWrittenRange(uint64_t vaddr, uint64_t size) {
 bool PeekGpuCopy(uint64_t vaddr, void* data, uint64_t size) {
 	return g_gpu_resources != nullptr && Graphics::GuestGpu::IsGpuThread() &&
 	       IsGpuAddressRange(vaddr, size) && g_gpu_resources->IsMapped(vaddr, size) &&
-	       GetGpuResources().GetBufferCache().PeekGpuRange(vaddr, size, data, 100'000'000ull,
-	                                                       true);
+	       GetGpuResources().GetBufferCache().PeekGpuRange(vaddr, size, data, 100'000'000ull);
 }
 
 bool ReadGpuArgs(uint64_t vaddr, void* data, uint64_t size) {
@@ -992,7 +991,8 @@ bool ReadGpuArgs(uint64_t vaddr, void* data, uint64_t size) {
 	static const bool args_peek = std::getenv("KYTY_NO_ARGS_PEEK") == nullptr;
 	// Dispatch triples only: draw arguments run from the GPU buffer through the clamp pass, and
 	// peeking them (a drain each) took the selector from 18 to 8 fps.
-	if (args_peek && size == 12 && g_gpu_resources != nullptr && Graphics::GuestGpu::IsGpuThread() &&
+	if (args_peek && size == 12 && g_gpu_resources != nullptr &&
+	    Graphics::GuestGpu::IsGpuThread() &&
 	    IsGpuAddressRange(vaddr, size) && g_gpu_resources->IsMapped(vaddr, size) &&
 	    GetGpuResources().GetBufferCache().PeekGpuRange(vaddr, size, data, 100'000'000ull)) {
 		return true;

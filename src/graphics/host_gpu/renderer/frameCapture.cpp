@@ -605,6 +605,34 @@ void NoteBuffer(const char* kind, uint64_t address, uint64_t size, bool written)
 	}
 	s.pending += fmt::format("    {} {} 0x{:010x}..0x{:010x} ({} bytes)\n", kind,
 	                         written ? "WRITE" : "read", address, address + size, size);
+	// KYTY_FRAME_DUMP_COMPARE=1: a read buffer's GPU copy against guest memory (first 4 KiB);
+	// a difference means the draw sees data the CPU has since replaced (or the reverse).
+	static const bool compare = std::getenv("KYTY_FRAME_DUMP_COMPARE") != nullptr;
+	if (compare && !written && size >= 16) {
+		const auto            bytes = std::min<uint64_t>(size & ~uint64_t {3}, 4096);
+		std::vector<uint8_t> guest(bytes);
+		std::vector<uint8_t> gpu(bytes);
+		if (Libs::LibKernel::Memory::TryReadBacking(address, guest.data(), bytes) &&
+		    Libs::LibKernel::Memory::PeekGpuCopy(address, gpu.data(), bytes)) {
+			uint64_t diff = 0;
+			uint64_t first = UINT64_MAX;
+			for (uint64_t i = 0; i < bytes; i++) {
+				if (guest[i] != gpu[i]) {
+					diff++;
+					first = std::min(first, i);
+				}
+			}
+			if (diff != 0) {
+				uint32_t g = 0;
+				uint32_t v = 0;
+				std::memcpy(&g, guest.data() + (first & ~uint64_t {3}), 4);
+				std::memcpy(&v, gpu.data() + (first & ~uint64_t {3}), 4);
+				s.pending += fmt::format("      MISMATCH {} of {} bytes, first +0x{:x} guest={:08x} "
+				                         "gpu={:08x}\n",
+				                         diff, bytes, first, g, v);
+			}
+		}
+	}
 	// Small constant blocks (exposure, focus, counters) are printed as words, as the GPU last
 	// left them: a capture drains the GPU before its draw list is written.
 	if (size <= 64 && size >= 4) {
