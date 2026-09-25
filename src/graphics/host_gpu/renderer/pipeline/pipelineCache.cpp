@@ -156,7 +156,22 @@ thread_local ShaderReadCache g_shader_read_cache;
 // marks the log unusable for memoization.
 thread_local std::vector<std::pair<uint64_t, uint32_t>>* g_shader_read_log    = nullptr;
 thread_local bool                                        g_shader_read_failed = false;
+// KYTY_GPU_TABLE_STATS: descriptor reads that hit memory a GPU pass wrote (stale on the CPU).
+thread_local uint32_t g_gpu_table_reads = 0;
+thread_local uint64_t g_gpu_table_last  = 0;
 } // namespace
+
+namespace {
+struct GpuWriterEntry {
+	uint64_t begin = 0;
+	uint64_t end   = 0;
+	uint64_t tag   = 0;
+};
+std::array<GpuWriterEntry, 4096> g_gpu_writers {};
+std::atomic<uint32_t>            g_gpu_writer_next {0};
+thread_local uint64_t            g_current_writer_shader = 0;
+} // namespace
+
 
 void ResetShaderGuestMemoryCache() {
 	g_shader_read_cache.Reset();
@@ -169,6 +184,11 @@ bool ReadShaderGuestMemory(void*, uint64_t address, uint32_t* value) {
 		return false;
 	}
 	const bool ok = ReadShaderGuestMemoryImpl(address, value);
+	static const bool table_stats = std::getenv("KYTY_GPU_TABLE_STATS") != nullptr;
+	if (table_stats && Libs::LibKernel::Memory::IsGpuWrittenRange(address & ~uint64_t {3}, 4)) {
+		g_gpu_table_reads++;
+		g_gpu_table_last = address;
+	}
 	if (g_shader_read_log != nullptr) {
 		if (ok) {
 			g_shader_read_log->emplace_back(address, *value);
@@ -281,6 +301,34 @@ bool ValidateShaderSpirv(const char* label, uint64_t shader_hash,
 
 } // namespace
 
+void NoteGpuWriter(uint64_t address, uint64_t size, uint64_t tag) {
+	static const bool enabled = std::getenv("KYTY_GPU_TABLE_STATS") != nullptr;
+	if (!enabled || size == 0) {
+		return;
+	}
+	g_gpu_writers[g_gpu_writer_next.fetch_add(1) % g_gpu_writers.size()] = {address, address + size,
+	                                                                        tag};
+}
+
+uint64_t FindGpuWriter(uint64_t address) {
+	const auto next = g_gpu_writer_next.load();
+	for (uint32_t i = 1; i <= g_gpu_writers.size() && i <= next; i++) {
+		const auto& entry = g_gpu_writers[(next - i) % g_gpu_writers.size()];
+		if (address >= entry.begin && address < entry.end) {
+			return entry.tag;
+		}
+	}
+	return 0;
+}
+
+void SetCurrentWriterShader(uint64_t shader_hash) {
+	g_current_writer_shader = shader_hash;
+}
+
+uint64_t CurrentWriterShader() {
+	return g_current_writer_shader;
+}
+
 struct PipelineCache::ProgramCache {
 	struct ProgramKey {
 		ShaderType            stage           = ShaderType::Unknown;
@@ -354,9 +402,24 @@ struct PipelineCache::ProgramCache {
 		std::vector<std::pair<uint64_t, uint32_t>> reads;
 		g_shader_read_log    = &reads;
 		g_shader_read_failed = false;
+		g_gpu_table_reads    = 0;
 		const bool ok = ShaderRecompiler::IR::MaterializeResources(entry.resource_plan, runtime,
 		                                                         entry.resources, entry.specialization);
 		g_shader_read_log = nullptr;
+		if (g_gpu_table_reads != 0) {
+			static std::mutex                             stats_mutex;
+			static std::unordered_map<uint64_t, uint32_t> seen;
+			std::lock_guard                               lock(stats_mutex);
+			auto& count = seen[entry.resource_plan.shader_hash];
+			if (count++ == 0) {
+				LOGF("GPUTABLE shader=%016" PRIx64 " stage=%d reads=%u last=0x%016" PRIx64
+				     " writer=%016" PRIx64 " buffers=%zu images=%zu samplers=%zu ok=%d\n",
+				     entry.resource_plan.shader_hash, static_cast<int>(entry.resource_plan.stage),
+				     g_gpu_table_reads, g_gpu_table_last, FindGpuWriter(g_gpu_table_last),
+				     entry.resources.buffers.size(),
+				     entry.resources.images.size(), entry.resources.samplers.size(), ok ? 1 : 0);
+			}
+		}
 		if (ok && !g_shader_read_failed && reads.size() <= 4096 && !no_memo) {
 			SourceEntry::Memo memo {std::vector<uint32_t>(user_data.begin(), user_data.end()), base,
 			                        std::move(reads), entry.resources, entry.specialization};

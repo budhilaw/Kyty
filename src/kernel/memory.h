@@ -110,6 +110,8 @@ void                   SetFlexibleMemorySize(uint64_t size);
 bool                   TryWriteBacking(uint64_t vaddr, const void* data, uint64_t size);
 bool                   TryReadBacking(uint64_t vaddr, void* data, uint64_t size);
 bool                   ReadGpuBackingOrDownload(uint64_t vaddr, void* data, uint64_t size);
+// Called at each flip; KYTY_TABLE_SYNC refreshes GPU-built tables once per frame.
+void                   NoteGpuFrame();
 bool                   ReadGpuBackingOrPrefetch(uint64_t vaddr, void* data, uint64_t size);
 // Reads GPU-produced indirect arguments with the GPU's latest values (see ReadGpuArgs).
 bool                   ReadGpuArgs(uint64_t vaddr, void* data, uint64_t size);

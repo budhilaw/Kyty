@@ -1806,7 +1806,14 @@ KYTY_CP_OP_PARSER(CpOpDrawIndexAuto) {
 	uint32_t index_count = buffer[0];
 	uint32_t flags       = buffer[1];
 
-	EXIT_NOT_IMPLEMENTED((flags & ~0x22u) != 0);
+	if ((flags & ~0x22u) != 0) {
+		// A damaged draw packet; drawing it would use garbage counts.
+		static std::atomic<uint32_t> log_count {0};
+		if (log_count.fetch_add(1) < 16) {
+			LOGF("PM4: skipped DRAW_INDEX_AUTO with unexpected flags 0x%08x\n", flags);
+		}
+		return 2;
+	}
 
 	cp.DrawIndexAuto({.vertex_count = index_count});
 

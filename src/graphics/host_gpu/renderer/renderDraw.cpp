@@ -559,6 +559,26 @@ RenderState RenderExecutor::AcquireRenderTargets(CommandBuffer& buffer, RenderCo
 			}
 		}
 		ApplyColorFastClear(buffer, target);
+		{
+			// Diagnostic: an integer target fed by a non-integer export mode (or the reverse)
+			// is a Vulkan type mismatch; such G-buffer targets stayed zero.
+			const auto  fmt     = target.desc.view_info.format;
+			const auto  name    = vk::to_string(fmt);
+			const bool  is_int  = name.find("int") != std::string::npos;
+			const auto* modes   = buffer.GetRegisters().GetShaderRegisters().target_output_mode;
+			const auto  mode    = target.target_slot < 8 ? modes[target.target_slot] : 0u;
+			const bool  int_out = mode == 7u || mode == 8u;
+			if (is_int != int_out) {
+				static std::mutex                   seen_mutex;
+				static std::unordered_set<uint64_t> seen;
+				std::lock_guard                     lock(seen_mutex);
+				if (seen.insert((uint64_t {mode} << 32u) | static_cast<uint32_t>(fmt)).second) {
+					LOGF("EXPORT MISMATCH slot=%u mode=%u format=%s rt=0x%016" PRIx64 "\n",
+					     target.target_slot, static_cast<uint32_t>(mode), name.c_str(),
+					     target.desc.info.data.address);
+				}
+			}
+		}
 		FrameCapture::NoteTarget("color", target.target_slot, target.image_id.index,
 		                         target.desc.info.data.address,
 		                         static_cast<uint32_t>(target.desc.view_info.format),
@@ -1260,6 +1280,9 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 		descriptor_stages[stage_count++] = &*bindings.pixel;
 	}
 	const auto stages = std::span {descriptor_stages.data(), stage_count};
+	SetCurrentWriterShader(state.ps_active && state.ps_input_info.stage.program != nullptr
+	                           ? state.ps_input_info.stage.program->shader_hash
+	                           : 7u);
 	PrepareGraphicsBindings(stages, std::span {state.color_info, state.color_count});
 	PreparedVertexBuffers vertex_bindings;
 	PreparedIndexBuffer   index_binding;

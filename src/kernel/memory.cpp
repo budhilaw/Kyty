@@ -1,4 +1,5 @@
 #include "kernel/memory.h"
+#include <unordered_map>
 
 #include "common/assert.h"
 #include "common/logging/log.h"
@@ -906,6 +907,12 @@ bool TryReadGpuCleanBacking(uint64_t vaddr, void* data, uint64_t size) {
 	return TryReadBacking(vaddr, data, size);
 }
 
+std::atomic<uint64_t> g_gpu_frame_epoch {0};
+
+void NoteGpuFrame() {
+	g_gpu_frame_epoch.fetch_add(1, std::memory_order_acq_rel);
+}
+
 bool ReadGpuBackingOrDownload(uint64_t vaddr, void* data, uint64_t size) {
 	if (TryReadGpuCleanBacking(vaddr, data, size)) {
 		return true;
@@ -1015,6 +1022,24 @@ bool ReadGpuBackingOrPrefetch(uint64_t vaddr, void* data, uint64_t size) {
 	if (g_gpu_resources == nullptr || !Graphics::GuestGpu::IsGpuThread() ||
 	    !IsGpuAddressRange(vaddr, size) || !g_gpu_resources->IsMapped(vaddr, size)) {
 		return false;
+	}
+	// Uncharted builds its descriptor tables with a compute pass each frame; the CPU copy is a
+	// frame old, and passes resolved from it read garbage. KYTY_TABLE_SYNC=1 drains the GPU the
+	// first time each 1 MiB table region is read in a frame, so every resolution in that frame
+	// sees this frame's tables; later reads of the region reuse that copy without draining again.
+	static const bool table_sync = std::getenv("KYTY_TABLE_SYNC") != nullptr;
+	if (table_sync) {
+		thread_local std::unordered_map<uint64_t, uint64_t> synced;
+		if (synced.size() > 4096) {
+			synced.clear();
+		}
+		const auto epoch = g_gpu_frame_epoch.load(std::memory_order_acquire) + 1u;
+		auto&      last  = synced[vaddr >> 20u];
+		if (last != epoch) {
+			last = epoch;
+			return ReadGpuBackingOrDownload(vaddr, data, size);
+		}
+		return TryReadBacking(vaddr, data, size);
 	}
 	auto& cache = GetGpuResources().GetBufferCache();
 	(void)cache.PrefetchRange(vaddr, size);

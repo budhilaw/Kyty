@@ -1,4 +1,5 @@
 #include "graphics/host_gpu/renderer/frameCapture.h"
+#include "kernel/memory.h"
 
 #include "common/logging/log.h"
 #include "graphics/host_gpu/renderer/cache/streamBuffer.h"
@@ -528,6 +529,7 @@ uint64_t FlipSerial() {
 
 void OnFlip(uint64_t presented_address) {
 	g_flip_serial.fetch_add(1, std::memory_order_acq_rel);
+	Libs::LibKernel::Memory::NoteGpuFrame();
 	auto& s = S();
 	if (s.frames.empty() && s.trigger.empty()) {
 		return;

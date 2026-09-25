@@ -158,6 +158,7 @@ NativeStorageBuffer(RenderContext& context, const PreparedBindings::BufferSource
 	}
 	if (resource.written) {
 		context.GetTextureCache().InvalidateMemoryFromGPU(address, size);
+		NoteGpuWriter(address, size, CurrentWriterShader() != 0 ? CurrentWriterShader() : 3u);
 	}
 	const char* access = "Read";
 	if (resource.written && resource.read) {

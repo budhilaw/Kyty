@@ -1171,6 +1171,9 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBuffer(uint64_t vaddr, uint64_t 
 		EXIT("BufferCache: invalid buffer range addr=0x%016" PRIx64 " size=0x%016" PRIx64 "\n",
 		     vaddr, size);
 	}
+	if (is_written) {
+		NoteGpuWriter(vaddr, size, CurrentWriterShader() != 0 ? CurrentWriterShader() : 6u);
+	}
 
 	TraceArgs("obtain", vaddr, size,
 	          fmt::format("written={} texel={} cpu_dirty={} gpu_dirty={}", is_written, is_texel_buffer,
@@ -1274,6 +1277,9 @@ void BufferCache::FillBuffer(uint64_t vaddr, uint64_t size, uint32_t value, bool
 		EXIT("BufferCache: invalid fill memory address\n");
 	}
 	(void)m_texture_cache.ClearMeta(vaddr);
+	if (!is_gds) {
+		NoteGpuWriter(vaddr, size, 2u);
+	}
 	FrameCapture::NoteBuffer("fill", vaddr, size, true);
 	if (!IsRegionGpuModified(vaddr, size)) {
 		// Access the guest mapping so write faults invalidate cached buffers and images.
@@ -1318,6 +1324,9 @@ void BufferCache::CopyBuffer(uint64_t dst_vaddr, uint64_t src_vaddr, uint64_t si
 			std::memcpy(destination, reinterpret_cast<const void*>(src_vaddr), size);
 		}
 		return;
+	}
+	if (dst_memory) {
+		NoteGpuWriter(dst_vaddr, size, src_gds ? 4u : 1u);
 	}
 
 	auto& command = m_scheduler.Current();

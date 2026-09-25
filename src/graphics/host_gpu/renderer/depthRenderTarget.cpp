@@ -19,6 +19,8 @@
 #include "graphics/host_gpu/renderer/renderContext.h"
 #include "graphics/host_gpu/vulkanCommon.h"
 
+#include <unordered_map>
+#include <mutex>
 #include <algorithm>
 #include <array>
 #include <atomic>
@@ -342,6 +344,37 @@ void RenderExecutor::ResolveRenderDepthTarget(CommandBuffer& buffer, RenderDepth
 	r.depth_write_enable      = r.depth_test_enable && dc.z_write_enable &&
 	                            !z.depth_view.depth_write_disable && !r.depth_clear_enable;
 	r.depth_compare_op        = static_cast<vk::CompareOp>(dc.zfunc);
+	{
+		// A read-only EQUAL test after a depth prepass (Uncharted's G-buffer pass) failed
+		// everywhere: the recompiled prepass and material vertex shaders differ in the last bit
+		// of depth, so the G-buffer stayed empty and every object rendered black. The test is
+		// widened in the direction the prepass wrote this depth buffer (LESS/LEQUAL -> LEQUAL,
+		// GREATER/GEQUAL -> GEQUAL); hidden surfaces still fail it. KYTY_STRICT_DEPTH_EQUAL=1
+		// keeps exact EQUAL.
+		static std::mutex                                     direction_mutex;
+		static std::unordered_map<uint64_t, vk::CompareOp>    write_direction;
+		static const bool strict = std::getenv("KYTY_STRICT_DEPTH_EQUAL") != nullptr;
+		const auto        key    = r.desc.info.data.address;
+		std::lock_guard   lock(direction_mutex);
+		if (r.depth_write_enable) {
+			switch (r.depth_compare_op) {
+				case vk::CompareOp::eLess:
+				case vk::CompareOp::eLessOrEqual:
+					write_direction[key] = vk::CompareOp::eLessOrEqual;
+					break;
+				case vk::CompareOp::eGreater:
+				case vk::CompareOp::eGreaterOrEqual:
+					write_direction[key] = vk::CompareOp::eGreaterOrEqual;
+					break;
+				default: break;
+			}
+		} else if (!strict && r.depth_test_enable &&
+		           r.depth_compare_op == vk::CompareOp::eEqual) {
+			if (const auto found = write_direction.find(key); found != write_direction.end()) {
+				r.depth_compare_op = found->second;
+			}
+		}
+	}
 
 	r.depth_bounds_test_enable = dc.depth_bounds_enable;
 	r.depth_min_bounds         = hw.GetDepthBoundsMin();

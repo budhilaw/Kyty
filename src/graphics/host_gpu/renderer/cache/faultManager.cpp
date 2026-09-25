@@ -6,6 +6,7 @@
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/renderer/cache/bufferCache.h"
 #include "graphics/host_gpu/renderer/commandScheduler.h"
+#include "graphics/host_gpu/renderer/pipeline/pipelineCache.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
 #include "graphics/host_gpu/vulkanCommon.h"
 
@@ -168,6 +169,7 @@ void FaultManager::ProcessFaultBuffer() {
 		// Pages a shader wrote through a device address are owned by the GPU from now on.
 		written_ranges.ForEach([this](uint64_t start, uint64_t end) {
 			m_written_ranges.emplace_back(start, end - start);
+			NoteGpuWriter(start, end - start, 5u);
 		});
 		m_fault_areas[area] = 0;
 	});

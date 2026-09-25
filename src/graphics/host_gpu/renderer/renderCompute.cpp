@@ -454,6 +454,7 @@ void RenderExecutor::Dispatch(uint64_t submit_id, CommandBuffer& buffer, uint32_
 	auto bind_scope = std::make_unique<Common::WaitTrace::Scope>(Common::WaitTrace::Kind::GpuBindings);
 	auto& bindings = m_compute_bindings;
 	g_gpu_driven_dispatch = indirect;
+	SetCurrentWriterShader(program.shader_hash);
 	PrepareBindings(input_info.stage, bindings);
 	FindBuffers(bindings);
 	g_gpu_driven_dispatch = false;
@@ -533,6 +534,7 @@ void RenderExecutor::Dispatch(uint64_t submit_id, CommandBuffer& buffer, uint32_
 	g_gpu_driven_dispatch = indirect;
 	RebindBuffers(bindings);
 	g_gpu_driven_dispatch = false;
+	SetCurrentWriterShader(0);
 	bind_scope.reset();
 
 	Buffer*  args_buffer = nullptr;

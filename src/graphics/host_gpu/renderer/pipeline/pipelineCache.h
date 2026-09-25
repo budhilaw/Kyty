@@ -20,6 +20,12 @@ namespace Libs::Graphics {
 
 // True when the shader is in the debug dump set (full dump or KYTY_SHADER_DUMP_HASH).
 bool ShaderDumpRequested(uint64_t shader_hash);
+// Diagnostic (KYTY_GPU_TABLE_STATS): who last wrote a guest range on the GPU. tag is a shader
+// hash, 1 for a DMA copy or 2 for a fill.
+void     NoteGpuWriter(uint64_t address, uint64_t size, uint64_t tag);
+uint64_t FindGpuWriter(uint64_t address);
+void     SetCurrentWriterShader(uint64_t shader_hash);
+uint64_t CurrentWriterShader();
 // Diagnostic: remembers indirect argument addresses so writers of them can be identified.
 void NoteIndirectArgsAddress(uint64_t vaddr);
 bool CoversRecentIndirectArgs(uint64_t address, uint64_t size, uint64_t& hit);
