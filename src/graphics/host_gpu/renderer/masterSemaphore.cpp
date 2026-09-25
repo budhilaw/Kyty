@@ -102,6 +102,30 @@ void MasterSemaphore::Refresh() {
 	}
 }
 
+bool MasterSemaphore::TryWait(uint64_t tick, uint64_t timeout_ns) {
+	if (IsFree(tick)) {
+		return true;
+	}
+	Refresh();
+	if (IsFree(tick)) {
+		return true;
+	}
+	vk::SemaphoreWaitInfo wait_info {};
+	wait_info.semaphoreCount = 1;
+	wait_info.pSemaphores    = &m_semaphore;
+	wait_info.pValues        = &tick;
+	const auto result        = m_graphics.device.waitSemaphores(&wait_info, timeout_ns);
+	if (result == vk::Result::eTimeout) {
+		return false;
+	}
+	if (result != vk::Result::eSuccess) {
+		PrintRecentShaders();
+		EXIT("GPU wait failed: %s (tick %" PRIu64 ")\n", vk::to_string(result).c_str(), tick);
+	}
+	Refresh();
+	return true;
+}
+
 void MasterSemaphore::Wait(uint64_t tick) {
 	if (IsFree(tick)) {
 		return;

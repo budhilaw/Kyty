@@ -35,6 +35,9 @@ public:
 	// the priority runner cannot join itself.
 	void                      Shutdown();
 	void                      Wait(uint64_t tick);
+	// Like Wait, but gives up after timeout_ns (a GPU submission can depend on queue work this
+	// thread has not processed yet).
+	[[nodiscard]] bool TryWait(uint64_t tick, uint64_t timeout_ns);
 	void                      PopPendingOperations();
 	void                      DrainPriorityOperations();
 	void                      WaitPriorityOperations(uint64_t tick);

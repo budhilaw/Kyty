@@ -2236,6 +2236,7 @@ void CommandProcessor::DispatchIndirect(uint64_t args_addr, uint32_t mode) {
 	// through the clamped path (bad counts are clamped instead of hanging the device).
 	// KYTY_GPU_DISPATCH_INDIRECT=1 enables it.
 	// Off by default: it hung the GPU in Uncharted even with clamped counts.
+	// Opt-in (KYTY_GPU_DISPATCH_INDIRECT=1): as the default it washed the selector out white.
 	static const bool no_gpu_dispatch = std::getenv("KYTY_GPU_DISPATCH_INDIRECT") == nullptr;
 	if (!no_gpu_dispatch && (mode & Pm4::COMPUTE_DISPATCH_INITIATOR_USE_THREAD_DIMENSIONS) == 0 &&
 	    Libs::LibKernel::Memory::IsGpuWrittenRange(args_addr, sizeof(args))) {

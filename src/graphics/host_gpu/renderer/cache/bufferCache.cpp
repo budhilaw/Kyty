@@ -524,6 +524,32 @@ void BufferCache::InvalidateMemory(uint64_t vaddr, uint64_t size) {
 	                                  [this, vaddr, size] { ReadMemory(vaddr, size, true); });
 }
 
+namespace {
+// Set by ReadMemoryBounded: readback waits give up after this many nanoseconds.
+thread_local uint64_t g_readback_timeout_ns = 0;
+thread_local bool     g_readback_timed_out  = false;
+} // namespace
+
+bool BufferCache::WaitForReadback(uint64_t tick) {
+	if (g_readback_timeout_ns == 0) {
+		m_scheduler.Wait(tick);
+		return true;
+	}
+	if (m_scheduler.TryWait(tick, g_readback_timeout_ns)) {
+		return true;
+	}
+	g_readback_timed_out = true;
+	return false;
+}
+
+bool BufferCache::ReadMemoryBounded(uint64_t vaddr, uint64_t size, uint64_t timeout_ns) {
+	g_readback_timeout_ns = timeout_ns;
+	g_readback_timed_out  = false;
+	ReadMemory(vaddr, size, false);
+	g_readback_timeout_ns = 0;
+	return !g_readback_timed_out;
+}
+
 void BufferCache::ReadMemory(uint64_t vaddr, uint64_t size, bool is_write) {
 	Common::WaitTrace::Scope readback_scope(Common::WaitTrace::Kind::GpuReadback);
 	if (GuestGpu::IsGpuThread()) {
@@ -574,7 +600,9 @@ void BufferCache::ReadMemory(uint64_t vaddr, uint64_t size, bool is_write) {
 		// would find pages tracked as GPU-owned with no dirty bytes left to copy.
 		for (auto it = m_pending_downloads.begin(); it != m_pending_downloads.end();) {
 			if (it->begin < window_end && it->begin + it->size > window_begin) {
-				m_scheduler.Wait(it->tick);
+				if (!WaitForReadback(it->tick)) {
+					return;
+				}
 				m_scheduler.WaitPriorityOperations(it->tick);
 				m_memory_tracker.UnmarkRegionAsGpuModified(it->begin, it->size);
 				it = m_pending_downloads.erase(it);
@@ -618,7 +646,9 @@ void BufferCache::ReadMemory(uint64_t vaddr, uint64_t size, bool is_write) {
 		}
 		if (downloaded) {
 			const auto tick = m_scheduler.CurrentTick();
-			m_scheduler.Wait(tick);
+			if (!WaitForReadback(tick)) {
+				return;
+			}
 			m_scheduler.WaitPriorityOperations(tick);
 			m_memory_tracker.UnmarkRegionAsGpuModified(window_begin, window_end - window_begin);
 			for (const auto& extra: extras) {

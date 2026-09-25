@@ -45,6 +45,8 @@ public:
 
 	void                   InvalidateMemory(uint64_t vaddr, uint64_t size);
 	void                   ReadMemory(uint64_t vaddr, uint64_t size, bool is_write = false);
+	// ReadMemory whose GPU waits give up after timeout_ns; false when the data is not there yet.
+	[[nodiscard]] bool     ReadMemoryBounded(uint64_t vaddr, uint64_t size, uint64_t timeout_ns);
 	[[nodiscard]] Buffer&  GetBuffer(BufferId id) { return m_slot_buffers[id]; }
 	[[nodiscard]] BufferId FindBuffer(uint64_t vaddr, uint64_t size);
 	[[nodiscard]] std::pair<Buffer*, uint64_t> ObtainBuffer(uint64_t vaddr, uint64_t size,
@@ -84,6 +86,7 @@ public:
 		m_memory_tracker.TakeCpuDirtyLog(out, full);
 	}
 	void               RunGarbageCollector();
+	bool               WaitForReadback(uint64_t tick);
 
 private:
 	friend struct BufferCacheTestAccess;

@@ -235,6 +235,17 @@ void CommandScheduler::Wait(uint64_t tick) {
 	}
 }
 
+bool CommandScheduler::TryWait(uint64_t tick, uint64_t timeout_ns) {
+	EXIT_IF(tick > CurrentTick());
+	if (tick == CurrentTick()) {
+		CheckActive();
+		const auto submitted_tick = Submit();
+		EXIT_IF(submitted_tick != tick);
+		BeginNext();
+	}
+	return m_master.TryWait(tick, timeout_ns);
+}
+
 void CommandScheduler::PopPendingOperations() {
 	m_master.Refresh();
 	for (;;) {

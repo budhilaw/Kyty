@@ -30,6 +30,8 @@ public:
 
 	void Refresh();
 	void Wait(uint64_t tick);
+	// False when the tick is still pending after timeout_ns.
+	[[nodiscard]] bool TryWait(uint64_t tick, uint64_t timeout_ns);
 
 private:
 	GraphicContext&       m_graphics;

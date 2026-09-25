@@ -1027,6 +1027,9 @@ bool ReadGpuBackingOrPrefetch(uint64_t vaddr, void* data, uint64_t size) {
 	// frame old, and passes resolved from it read garbage. KYTY_TABLE_SYNC=1 drains the GPU the
 	// first time each 1 MiB table region is read in a frame, so every resolution in that frame
 	// sees this frame's tables; later reads of the region reuse that copy without draining again.
+	// Opt-in (KYTY_TABLE_SYNC=1). The wait is bounded: a
+	// submission can depend on async-compute work this thread has not processed yet, and an
+	// unbounded drain deadlocked the intro. On timeout the last copy is used for this frame.
 	static const bool table_sync = std::getenv("KYTY_TABLE_SYNC") != nullptr;
 	if (table_sync) {
 		thread_local std::unordered_map<uint64_t, uint64_t> synced;
@@ -1037,7 +1040,8 @@ bool ReadGpuBackingOrPrefetch(uint64_t vaddr, void* data, uint64_t size) {
 		auto&      last  = synced[vaddr >> 20u];
 		if (last != epoch) {
 			last = epoch;
-			return ReadGpuBackingOrDownload(vaddr, data, size);
+			(void)GetGpuResources().GetBufferCache().ReadMemoryBounded(vaddr, size,
+			                                                          100'000'000ull);
 		}
 		return TryReadBacking(vaddr, data, size);
 	}
