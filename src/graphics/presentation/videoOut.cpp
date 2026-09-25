@@ -25,6 +25,8 @@
 #include <algorithm>
 #include <cstdlib>
 #include <array>
+#include <atomic>
+#include <fmt/format.h>
 #include <list>
 #include <thread>
 #include <vector>
@@ -544,6 +546,14 @@ Graphics::ImageInfo BufferAttributeGroup::ImageInfo(const VideoOutBuffer& buffer
 	Graphics::VideoOutPixelFormatInfo pixel_format {};
 	if (!Graphics::DecodeVideoOutPixelFormat(attribute.pixel_format, pixel_format)) {
 		EXIT("unsupported video-out pixel format: 0x%016" PRIx64 "\n", attribute.pixel_format);
+	}
+	if (attribute.pixel_format == Graphics::VIDEO_OUT_PIXEL_FORMAT_R10_G10_B10_A2_BT2100_PQ) {
+		static std::atomic_flag warned = ATOMIC_FLAG_INIT;
+		if (!warned.test_and_set(std::memory_order_relaxed)) {
+			Log::WriteToConsoleAndLog(fmt::format(
+			    "Warning: HDR-to-SDR conversion is not implemented; displaying PQ video-out "
+			    "pixels unchanged (format=0x{:016x}).\n", attribute.pixel_format));
+		}
 	}
 	const auto tile_mode = Graphics::Prospero::TileMode::kRenderTarget;
 	const auto pitch =
@@ -1558,7 +1568,9 @@ KYTY_SYSV_ABI int VideoOutIsFlipPending(int handle) {
 	VideoOutFlipStatus status {};
 	DriverState().GetFlipQueue().GetFlipStatus(*ctx, status);
 
-	LOGF("\t flipPendingNum = %d\n", status.flipPendingNum);
+	if (Config::GraphicsDebugDumpEnabled()) {
+		LOGF("\t flipPendingNum = %d\n", status.flipPendingNum);
+	}
 
 	return status.flipPendingNum;
 }
