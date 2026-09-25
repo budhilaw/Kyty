@@ -1828,20 +1828,28 @@ void TextureCache::InvalidateMemory(uint64_t address, uint64_t size) {
 	InvalidateCpuAliases(address, size);
 }
 
+// A depth image whose layout does not match its guest range cannot be read back; the
+// download is skipped instead of stopping the emulator.
+#define KYTY_DEPTH_SKIP_IF(cond)                                                                  \
+	if (cond) {                                                                                   \
+		LOGF("TextureCache: skipped depth download (%s)\n", #cond);                          \
+		return;                                                                                   \
+	}
+
 void TextureCache::DownloadDepth(Image& image, Buffer& destination, uint64_t destination_offset) {
 	const auto&    info             = image.info;
 	const auto     layers           = info.resources.layers;
 	const auto     full_slice_size  = info.data.size / layers;
 	const auto     transfer_bytes   = DepthAspectTransferBytes(info.pixel_format);
 	const uint64_t texels_per_slice = static_cast<uint64_t>(info.pitch) * info.extent.height;
-	EXIT_NOT_IMPLEMENTED(transfer_bytes == 0 || texels_per_slice > UINT32_MAX ||
+	KYTY_DEPTH_SKIP_IF(transfer_bytes == 0 || texels_per_slice > UINT32_MAX ||
 	                     texels_per_slice > UINT64_MAX / transfer_bytes ||
 	                     texels_per_slice > UINT64_MAX / info.bytes_per_block);
 	const uint64_t transfer_slice = texels_per_slice * transfer_bytes;
 	const uint64_t guest_slice    = texels_per_slice * info.bytes_per_block;
-	EXIT_NOT_IMPLEMENTED(transfer_slice > UINT64_MAX / layers);
+	KYTY_DEPTH_SKIP_IF(transfer_slice > UINT64_MAX / layers);
 	const uint64_t transfer_size = transfer_slice * layers;
-	EXIT_NOT_IMPLEMENTED(guest_slice > full_slice_size);
+	KYTY_DEPTH_SKIP_IF(guest_slice > full_slice_size);
 	auto copies = BuildDepthCopies(info, full_slice_size, vk::ImageAspectFlagBits::eDepth);
 	if (transfer_bytes == info.bytes_per_block) {
 		if (!info.IsTiled()) {

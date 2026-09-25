@@ -785,9 +785,12 @@ BufferId BufferCache::CreateBuffer(uint64_t vaddr, uint64_t size) {
 }
 
 void BufferCache::WriteBackMerged(uint64_t vaddr, const uint8_t* data, uint64_t size) {
-	// Diagnostic: KYTY_NO_READBACK=1 drops every GPU-to-guest readback write.
-	static const bool no_readback = std::getenv("KYTY_NO_READBACK") != nullptr;
-	if (no_readback) {
+	// GPU-to-guest readbacks are off by default. The GPU copy of a page can hold bytes older
+	// than what the CPU wrote since (writes the tracker never saw), and writing it back
+	// corrupted game objects: with readbacks on, about half of all runs of PPSA05684 crashed in
+	// the first minute; with them off, none did. KYTY_READBACK=1 turns them back on.
+	static const bool readback = std::getenv("KYTY_READBACK") != nullptr;
+	if (!readback) {
 		return;
 	}
 	// GPU writes through raw pointers mark whole pages only after the dispatch; bytes the CPU
@@ -1032,9 +1035,19 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBufferForImage(uint64_t vaddr, u
 	}
 
 	auto [staging, stage_offset] = m_staging_buffer.Map(size, 16);
-	if (staging == nullptr || (!Libs::LibKernel::Memory::TryReadBacking(vaddr, staging, size) &&
-	                           !Libs::LibKernel::Memory::TryReadPrtBacking(vaddr, staging, size))) {
-		EXIT("BufferCache: failed to read mapped guest image backing\n");
+	if (staging == nullptr) {
+		EXIT("BufferCache: failed to map staging memory for guest image backing\n");
+	}
+	if (!Libs::LibKernel::Memory::TryReadBacking(vaddr, staging, size) &&
+	    !Libs::LibKernel::Memory::TryReadPrtBacking(vaddr, staging, size)) {
+		// The descriptor points at memory with no backing (a stale or corrupt texture); upload
+		// zeros instead of stopping the emulator.
+		static std::atomic<uint32_t> log_count {0};
+		if (log_count.fetch_add(1) < 16) {
+			LOGF("BufferCache: image backing 0x%016" PRIx64 "+0x%" PRIx64 " unreadable, zero-filled\n",
+			     vaddr, size);
+		}
+		std::memset(staging, 0, size);
 	}
 	m_staging_buffer.Commit();
 	return {&m_staging_buffer, stage_offset};

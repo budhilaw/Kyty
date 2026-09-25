@@ -689,14 +689,26 @@ Image::Image(GraphicContext& graphics, CommandScheduler& scheduler, const ImageI
 		     static_cast<vk::ImageCreateFlags::MaskType>(create.flags), info.samples);
 	}
 
+	bool reduced = false;
 	if (!graphics.CreateImage(create, backing)) {
-		EXIT("failed to create image: extent=%ux%ux%u format=%d layers=%u levels=%u\n",
+		// Usually video memory is exhausted by an array whose layer count came from a corrupt
+		// descriptor. One layer keeps the emulator running; the extra layers read as empty.
+		LOGF("failed to create image: extent=%ux%ux%u format=%d layers=%u levels=%u; retrying with 1 layer\n",
 		     create.extent.width, create.extent.height, create.extent.depth,
 		     static_cast<int>(create.format), create.arrayLayers, create.mipLevels);
+		create.arrayLayers    = 1;
+		capacity_layers       = 1;
+		info.resources.layers = 1;
+		reduced               = true;
+		if (!graphics.CreateImage(create, backing)) {
+			EXIT("failed to create image: extent=%ux%ux%u format=%d layers=1 levels=%u\n",
+			     create.extent.width, create.extent.height, create.extent.depth,
+			     static_cast<int>(create.format), create.mipLevels);
+		}
 	}
 	// Spare layers are physical capacity only; transitions and copies work in guest layers.
 	if (!info.IsVolume()) {
-		backing.layers = info.resources.layers;
+		backing.layers = reduced ? 1u : info.resources.layers;
 	}
 }
 

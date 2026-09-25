@@ -1,3 +1,4 @@
+#include <cstdlib>
 #include "graphics/shader/recompiler/backend/spirv/spirvEmitterInternal.h"
 
 #include <algorithm>
@@ -201,7 +202,9 @@ void DefineDescriptors(EmitterState& state) {
 					state.builder.AddAnnotation(spv::OpDecorate, state.storage_buffer_u64_variable,
 					                            spv::DecorationAliased);
 				}
-				if (state.requirements.coherent_buffers) {
+				// Diagnostic: KYTY_NO_COHERENT=1 leaves storage buffers undecorated.
+				static const bool no_coherent = std::getenv("KYTY_NO_COHERENT") != nullptr;
+				if (state.requirements.coherent_buffers && !no_coherent) {
 					// RDNA2 stores publish to L2 even without GLC; every alias of the buffer
 					// must participate in visibility for cache-bypassing polling loads.
 					state.builder.AddAnnotation(spv::OpDecorate, state.storage_buffer_variable,
