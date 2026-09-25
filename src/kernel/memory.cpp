@@ -990,9 +990,9 @@ bool ReadGpuArgs(uint64_t vaddr, void* data, uint64_t size) {
 	// Without a drain, the GPU's own copy is fetched in the background: this read still sees
 	// the CPU copy, and the following frame's read sees the GPU value from one frame earlier.
 	// GPU-culled dispatch counts had stayed at their initial zero forever, so Uncharted's
-	// tile lighting never ran. On by default; KYTY_NO_ARGS_PREFETCH=1 disables it.
+	// tile lighting never ran. Opt-in (KYTY_ARGS_PREFETCH=1): as the default the selector was whiter.
 	// The device loss once blamed on this was GPU-culled draw arguments (now clamped).
-	static const bool no_prefetch = std::getenv("KYTY_NO_ARGS_PREFETCH") != nullptr;
+	static const bool no_prefetch = std::getenv("KYTY_ARGS_PREFETCH") == nullptr;
 	if (!no_prefetch && g_gpu_resources != nullptr && Graphics::GuestGpu::IsGpuThread() &&
 	    IsGpuAddressRange(vaddr, size) && g_gpu_resources->IsMapped(vaddr, size)) {
 		(void)GetGpuResources().GetBufferCache().PrefetchRange(vaddr, size);

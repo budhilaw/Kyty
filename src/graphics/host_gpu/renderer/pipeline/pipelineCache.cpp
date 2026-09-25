@@ -386,9 +386,9 @@ struct PipelineCache::ProgramCache {
 
 	static bool MaterializeRemembered(SourceEntry& entry, const ShaderRecompiler::IR::SrtRuntime& runtime,
 	                                  std::span<const uint32_t> user_data, uint64_t base) {
-		// Scene draws repeat the same user data and tables every frame, so a hit skips the
-		// whole evaluation (the largest CPU cost per draw). KYTY_NO_MATERIALIZE_MEMO=1 disables.
-		static const bool no_memo = std::getenv("KYTY_NO_MATERIALIZE_MEMO") != nullptr;
+		// Opt-in (KYTY_MATERIALIZE_MEMO=1): Uncharted's scene draws change their user data every
+		// frame too, so the memo never hit and its bookkeeping cost ~6% of the GPU thread.
+		static const bool no_memo = std::getenv("KYTY_MATERIALIZE_MEMO") == nullptr;
 		constexpr size_t  MemoSlots = 16;
 		if (!no_memo) {
 			for (const auto& memo: entry.memos) {
