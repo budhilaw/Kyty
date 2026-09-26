@@ -539,6 +539,30 @@ struct UniformFillPlan {
 	std::array<Value, 4> values;
 };
 
+// Precompiled form of one plan value for the SRT evaluator: operands resolved once per shader
+// instead of through Value::Resolve / Inst::Arg on every draw.
+struct CompiledEvalOperand {
+	enum Kind : uint8_t { Immediate, Node, Invalid, Generic };
+	Value    value;
+	uint64_t imm  = 0;
+	uint32_t node = UINT32_MAX;
+	Kind     kind = Invalid;
+};
+
+struct CompiledEvalNode {
+	// Operations with their own compiled form besides plain arithmetic (fast).
+	enum Special : uint8_t { None, UserData, ShaderBase, ReadConst, Select, RawRead };
+	const Inst*                        inst    = nullptr;
+	ValueOpcode                        op      = ValueOpcode::Void;
+	bool                               fast    = false;
+	Special                            special = None;
+	uint8_t                            args    = 0;
+	uint32_t                           aux     = 0; // user-data register, SRT slot, memory index
+	bool                               four    = false; // raw read handle has four words
+	// Raw reads: [0..3] handle words, [4] offset.
+	std::array<CompiledEvalOperand, 5> operands {};
+};
+
 // Immutable runtime resource analysis retained by the shader cache. It owns descriptor/SRT,
 // uniform condition and fill values without retaining translated blocks.
 struct ResourcePlan {
@@ -560,6 +584,8 @@ struct ResourcePlan {
 	mutable std::unordered_map<const Inst*, uint32_t> value_index;
 	// value_storage size when its instructions were last numbered for evaluation.
 	mutable size_t evaluation_numbered = SIZE_MAX;
+	// One node per evaluation index, rebuilt whenever the values are numbered.
+	mutable std::vector<CompiledEvalNode> compiled_eval;
 	std::vector<MemoryInfo>             memory_info;
 	std::vector<DescriptorSource>       descriptor_sources;
 	std::vector<ResourceBlock>          control_flow;

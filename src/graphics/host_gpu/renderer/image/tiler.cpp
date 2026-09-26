@@ -23,8 +23,10 @@
 #include <algorithm>
 #include <array>
 #include <bit>
+#include <cstdlib>
 #include <cstring>
 #include <limits>
+#include <mutex>
 
 namespace Libs::Graphics {
 
@@ -61,6 +63,11 @@ TileManager::TileManager(GraphicContext& graphics, CommandScheduler& scheduler,
 }
 
 TileManager::~TileManager() {
+	for (auto& [capacity, scratches]: m_scratch_pool) {
+		for (const auto& scratch: scratches) {
+			vmaDestroyBuffer(m_graphics.allocator, scratch.buffer, scratch.allocation);
+		}
+	}
 	for (auto pipeline: m_pipelines) {
 		if (pipeline != nullptr) {
 			m_graphics.device.destroyPipeline(pipeline, nullptr);
@@ -91,8 +98,21 @@ TileManager::~TileManager() {
 
 TileManager::Scratch TileManager::AllocateScratch(uint64_t size) {
 	EXIT_IF(size == 0);
+	static const bool no_pool  = std::getenv("KYTY_NO_SCRATCH_POOL") != nullptr;
+	const uint64_t    capacity = no_pool ? size : std::bit_ceil(std::max<uint64_t>(size, 64 * 1024));
+	if (!no_pool) {
+		std::lock_guard lock(m_scratch_mutex);
+		auto            found = m_scratch_pool.find(capacity);
+		if (found != m_scratch_pool.end() && !found->second.empty()) {
+			auto scratch = found->second.back();
+			found->second.pop_back();
+			m_scratch_pooled_bytes -= capacity;
+			scratch.size = size;
+			return scratch;
+		}
+	}
 	vk::BufferCreateInfo create {};
-	create.size  = size;
+	create.size  = capacity;
 	create.usage = vk::BufferUsageFlagBits::eStorageBuffer | vk::BufferUsageFlagBits::eTransferSrc |
 	               vk::BufferUsageFlagBits::eTransferDst;
 
@@ -108,13 +128,25 @@ TileManager::Scratch TileManager::AllocateScratch(uint64_t size) {
 		result = vmaCreateBuffer(m_graphics.allocator, &raw, &allocate, &buffer, &memory, nullptr);
 	}
 	RequireVulkanSuccess(static_cast<vk::Result>(result), "allocate TileManager scratch buffer");
-	return {buffer, memory, size};
+	return {buffer, memory, size, no_pool ? 0 : capacity};
 }
 
 void TileManager::DeferDestroy(Scratch scratch) {
 	auto allocator = m_graphics.allocator;
-	m_scheduler.DeferOperation(
-	    [allocator, scratch] { vmaDestroyBuffer(allocator, scratch.buffer, scratch.allocation); });
+	// Runs once the GPU has finished with the buffer: it returns to the pool while that stays
+	// under 256 MiB.
+	m_scheduler.DeferOperation([this, allocator, scratch] {
+		constexpr uint64_t MaxPooled = 256ull * 1024 * 1024;
+		if (scratch.capacity != 0) {
+			std::lock_guard lock(m_scratch_mutex);
+			if (m_scratch_pooled_bytes + scratch.capacity <= MaxPooled) {
+				m_scratch_pool[scratch.capacity].push_back(scratch);
+				m_scratch_pooled_bytes += scratch.capacity;
+				return;
+			}
+		}
+		vmaDestroyBuffer(allocator, scratch.buffer, scratch.allocation);
+	});
 }
 
 // A subresource whose layout does not fit its buffers comes from a corrupt descriptor; it is

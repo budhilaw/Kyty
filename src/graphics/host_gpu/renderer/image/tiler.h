@@ -5,6 +5,9 @@
 #include "graphics/guest_gpu/tile.h"
 #include "graphics/host_gpu/vulkanCommon.h"
 
+#include <mutex>
+#include <unordered_map>
+#include <vector>
 #include <array>
 #include <span>
 #include <vector>
@@ -109,6 +112,7 @@ private:
 		vk::Buffer    buffer     = nullptr;
 		VmaAllocation allocation = nullptr;
 		uint64_t      size       = 0;
+		uint64_t      capacity   = 0; // pool bucket size; 0 when not pooled
 	};
 	struct StorageBinding {
 		vk::DescriptorBufferInfo info;
@@ -142,6 +146,11 @@ private:
 	vk::Pipeline                            m_d24_to_d16  = nullptr;
 	vk::Pipeline                            m_d32_to_d16  = nullptr;
 	vk::Pipeline                            m_swap_bgra16 = nullptr;
+	// Scratch buffers the GPU finished with, by power-of-two capacity. Every texture upload
+	// created and freed a dedicated allocation (~6% of the GPU thread in vmaFreeMemory alone).
+	std::mutex                                              m_scratch_mutex;
+	std::unordered_map<uint64_t, std::vector<Scratch>>      m_scratch_pool;
+	uint64_t                                                m_scratch_pooled_bytes = 0;
 };
 
 } // namespace Libs::Graphics

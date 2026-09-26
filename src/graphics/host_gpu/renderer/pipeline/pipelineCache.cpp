@@ -400,7 +400,8 @@ struct PipelineCache::ProgramCache {
 			}
 		}
 		std::vector<std::pair<uint64_t, uint32_t>> reads;
-		g_shader_read_log    = &reads;
+		// Every read was appended to this log (an allocation per draw) even with the memo off.
+		g_shader_read_log    = no_memo ? nullptr : &reads;
 		g_shader_read_failed = false;
 		g_gpu_table_reads    = 0;
 		const bool ok = ShaderRecompiler::IR::MaterializeResources(entry.resource_plan, runtime,
