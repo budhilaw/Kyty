@@ -576,6 +576,7 @@ bool BufferCache::WaitForReadback(uint64_t tick) {
 
 bool BufferCache::PeekGpuRange(uint64_t vaddr, uint64_t size, void* out, uint64_t timeout_ns,
                                bool args) {
+	GpuWaitScope wait_reason(GpuWaitReason::Peek);
 	// A copy of the GPU's bytes for the emulator's own use (compute descriptor tables). Guest
 	// memory, the tracker and the poll counts are untouched: writing GPU bytes back for the
 	// emulator's reads corrupted game objects (the game crashed on garbage pointers).
@@ -709,7 +710,19 @@ void BufferCache::ReadMemory(uint64_t vaddr, uint64_t size, bool is_write) {
 		     "addr=0x%016" PRIx64 " size=0x%016" PRIx64 "\n",
 		     vaddr, size);
 	}
+	// Game threads: the whole round trip through the GPU thread counts as their wait.
+	struct GameWait {
+		uint64_t start = GuestGpu::IsGpuThread() ? 0 : Common::Timer::QueryPerformanceCounter();
+		~GameWait() {
+			if (start != 0) {
+				RecordGpuWait(GpuWaitReason::Readback,
+				              (Common::Timer::QueryPerformanceCounter() - start) * 1'000'000ull /
+				                  Common::Timer::QueryPerformanceFrequency());
+			}
+		}
+	} game_wait;
 	m_scheduler.Context().GetGpu().SendCommandSync([this, vaddr, size, is_write] {
+		GpuWaitScope wait_reason(GpuWaitReason::Readback);
 		if (is_write && !IsRegionRegistered(vaddr, size)) {
 			return;
 		}
@@ -861,6 +874,7 @@ void BufferCache::RetirePendingDownloads(bool wait_all) {
 }
 
 void BufferCache::ForceReadback(uint64_t vaddr, uint64_t size) {
+	GpuWaitScope wait_reason(GpuWaitReason::ForceReadback);
 	const auto* owner = m_page_table.Find(vaddr >> PageTable::kPageBits);
 	if (owner == nullptr || !*owner) {
 		return;
@@ -901,6 +915,7 @@ void BufferCache::ForceReadback(uint64_t vaddr, uint64_t size) {
 }
 
 bool BufferCache::TryWaitPendingDownload(uint64_t vaddr, uint64_t size) {
+	GpuWaitScope wait_reason(GpuWaitReason::Pending);
 	for (auto it = m_pending_downloads.begin(); it != m_pending_downloads.end(); ++it) {
 		if (vaddr >= it->begin && vaddr + size <= it->begin + it->size) {
 			m_scheduler.Wait(it->tick);
@@ -1603,9 +1618,9 @@ void BufferCache::AppendUploadCopies(Buffer& buffer, uint64_t address, uint64_t 
 		if (found == m_write_snapshots.end()) {
 			continue;
 		}
-		const auto           begin = std::max(page, address);
-		const auto           end   = std::min(page + Page, address + bytes);
-		std::vector<uint8_t> current(Page);
+		const auto begin = std::max(page, address);
+		const auto end   = std::min(page + Page, address + bytes);
+		thread_local std::array<uint8_t, Page> current {};
 		const bool readable = Libs::LibKernel::Memory::TryReadBacking(page, current.data(), Page);
 		const auto snapshot = std::move(found->second);
 		m_write_snapshots.erase(found);
@@ -1721,10 +1736,26 @@ vk::Buffer BufferCache::UploadCopies(Buffer& buffer, std::span<vk::BufferCopy> c
 		// the staging buffer, which is write-combined and slow to read (86% of the GPU thread when
 		// many pages were uploaded, ~10% at the Uncharted selector).
 		thread_local std::vector<uint8_t> scratch;
+		// KYTY_UPLOAD_TRACE=<hex address>: every upload covering that address, with the two dwords
+		// there (the CPU copy about to replace the GPU's).
+		static const uint64_t trace_address = [] {
+			const char* text = std::getenv("KYTY_UPLOAD_TRACE");
+			return text != nullptr ? std::strtoull(text, nullptr, 16) : uint64_t {0};
+		}();
 		for (auto& copy: copies) {
 			const auto address = buffer.CpuAddress() + copy.dstOffset;
 			scratch.resize(copy.size);
 			ReadGuestForUpload(address, scratch.data(), copy.size);
+			if (trace_address != 0 && trace_address >= address && trace_address + 8 <= address + copy.size) {
+				float values[2] {};
+				std::memcpy(values, scratch.data() + (trace_address - address), sizeof(values));
+				std::printf("UPLOADTRACE frame=%d addr=0x%llx range=0x%llx+0x%llx values=%g %g buffer=0x%llx\n",
+				            m_scheduler.Context().GetGpu().GetFrameNum(),
+				            static_cast<unsigned long long>(trace_address),
+				            static_cast<unsigned long long>(address),
+				            static_cast<unsigned long long>(copy.size), values[0], values[1],
+				            static_cast<unsigned long long>(buffer.CpuAddress()));
+			}
 			std::memcpy(mapped + copy.srcOffset, scratch.data(), copy.size);
 			RecordGpuBaseline(address, scratch.data(), copy.size);
 			copy.srcOffset += base_offset;
@@ -2009,13 +2040,18 @@ bool BufferCache::IsRegionCpuModified(uint64_t vaddr, uint64_t size) {
 	return m_memory_tracker.IsRegionCpuModified(vaddr, size);
 }
 
-void BufferCache::RunGarbageCollector() {
-	const auto tick = m_gc_tick++;
+void BufferCache::RunGarbageCollector(bool frame_end) {
+	// Ages count frames, not collector calls (one per submission): see TextureCache.
+	const auto tick = m_gc_tick;
+	if (frame_end) {
+		m_gc_tick++;
+	}
 	if (m_graphics.CanReportMemoryUsage()) {
 		m_total_used_memory = m_graphics.GetDeviceMemoryUsage();
 	}
 	static uint64_t gc_deleted = 0;
-	if (tick % 600 == 0) {
+	static uint64_t gc_calls   = 0;
+	if (gc_calls++ % 600 == 0) {
 		printf("VRAM used=%" PRIu64 "MB trigger=%" PRIu64 "MB critical=%" PRIu64 "MB pending=%zu gc_deleted=%" PRIu64 "\n",
 		       m_total_used_memory >> 20u, m_trigger_gc_memory >> 20u, m_critical_gc_memory >> 20u,
 		       m_pending_downloads.size(), gc_deleted);
@@ -2027,7 +2063,7 @@ void BufferCache::RunGarbageCollector() {
 	}
 
 	const bool     aggressive = m_total_used_memory >= m_critical_gc_memory;
-	const uint64_t age        = std::min<uint64_t>(aggressive ? 80 : 160, tick);
+	const uint64_t age        = std::min<uint64_t>(aggressive ? 8 : 60, tick);
 	const size_t   limit      = aggressive ? 64 : 32;
 
 	// Waiting for every in-flight download here drained the GPU each frame once memory use

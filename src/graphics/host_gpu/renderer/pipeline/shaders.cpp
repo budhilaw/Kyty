@@ -3,6 +3,7 @@
 #include "common/emulatorConfig.h"
 #include "common/logging/log.h"
 #include "common/profiler.h"
+#include "common/timer.h"
 #include "graphics/guest_gpu/gpu_defs.h"
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/renderer/debug.h"
@@ -18,7 +19,9 @@
 #include "graphics/shader/rectListShader.h"
 #include "graphics/shader/shader.h"
 
+#include <atomic>
 #include <chrono>
+#include <cstdlib>
 #include <cstdio>
 #include <cinttypes>
 #include <algorithm>
@@ -208,6 +211,34 @@ static void CreateDescriptorLayout(GraphicContext& graphics, PipelineCache::Pipe
 	            &create, nullptr, &pipeline.descriptor_set_layout) != vk::Result::eSuccess);
 }
 
+namespace {
+// KYTY_WAIT_STATS=1: pipelines created per 5 s and the time spent creating them.
+struct PipelineCreateStat {
+	uint64_t start = Common::Timer::QueryPerformanceCounter();
+	~PipelineCreateStat() {
+		static const bool enabled = std::getenv("KYTY_WAIT_STATS") != nullptr;
+		if (!enabled) {
+			return;
+		}
+		static std::atomic<uint64_t> count {0};
+		static std::atomic<uint64_t> us {0};
+		static std::atomic<uint64_t> last {0};
+		const auto now       = Common::Timer::QueryPerformanceCounter();
+		const auto frequency = Common::Timer::QueryPerformanceFrequency();
+		count++;
+		us += (now - start) * 1'000'000ull / frequency;
+		auto previous = last.load();
+		if (previous == 0) {
+			last.compare_exchange_strong(previous, now);
+		} else if (now - previous >= frequency * 5 && last.compare_exchange_strong(previous, now)) {
+			std::printf("PIPECREATE 5s: n=%llu ms=%llu\n",
+			            static_cast<unsigned long long>(count.exchange(0)),
+			            static_cast<unsigned long long>(us.exchange(0) / 1000));
+		}
+	}
+};
+} // namespace
+
 // NOLINTNEXTLINE(readability-function-cognitive-complexity)
 void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& pipeline,
                             const PipelineRenderingState&          rendering,
@@ -217,6 +248,7 @@ void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& p
                             const PipelineCache::GraphicsPrograms& programs,
                             const PipelineStaticParameters&        static_params,
                             vk::PipelineCache                      driver_cache) {
+	PipelineCreateStat create_stat;
 	const auto& vs_input_info  = vertex_info.front();
 	const auto& vertex_program = programs.vertex[0];
 	const auto& pixel_program  = programs.pixel;
@@ -571,6 +603,7 @@ void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& p
 void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& pipeline,
                             const ShaderComputeInputInfo& input_info,
                             vk::ShaderModule compute_module, vk::PipelineCache driver_cache) {
+	PipelineCreateStat create_stat;
 	EXIT_IF(compute_module == nullptr);
 
 	vk::PipelineShaderStageCreateInfo                     comp_shader_stage_info {};

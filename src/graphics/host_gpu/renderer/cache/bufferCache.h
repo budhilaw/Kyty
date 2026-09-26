@@ -116,7 +116,7 @@ public:
 	void TakeCpuDirtyLog(std::vector<std::pair<uint64_t, uint64_t>>& out, bool& full) {
 		m_memory_tracker.TakeCpuDirtyLog(out, full);
 	}
-	void               RunGarbageCollector();
+	void               RunGarbageCollector(bool frame_end);
 	// Records a staged upload of host data into a device buffer.
 	void WriteDataBuffer(Buffer& buffer, uint64_t address, const void* source, uint64_t size);
 	bool               WaitForReadback(uint64_t tick);

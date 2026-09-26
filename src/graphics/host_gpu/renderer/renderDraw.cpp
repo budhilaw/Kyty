@@ -1281,7 +1281,8 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 		                              index_source.guest_element_size);
 	}
 	LogDrawPhase(draw.Name(), "PrepareBindings");
-	auto bind_scope = std::make_unique<Common::WaitTrace::Scope>(Common::WaitTrace::Kind::GpuBindings);
+	std::optional<Common::WaitTrace::Scope> bind_scope;
+	bind_scope.emplace(Common::WaitTrace::Kind::GpuBindings);
 	auto&                            bindings = m_graphics_bindings;
 	std::array<PreparedBindings*, 4> descriptor_stages {};
 	uint32_t                         stage_count = 0;

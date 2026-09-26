@@ -135,21 +135,19 @@ void PipelineCacheLog(fmt::format_string<Args...> format, Args&&... args) {
 // materialization the tables are read in 256-byte blocks instead; the cache is reset before
 // each materialization so values never outlive the dispatch they were read for.
 namespace {
+// Direct-mapped by address; Reset() only moves the epoch.
 struct ShaderReadCache {
 	static constexpr uint64_t BlockBytes = 256;
-	static constexpr size_t   Slots      = 16;
+	static constexpr size_t   Slots      = 64;
 	struct Block {
-		uint64_t                                base  = UINT64_MAX;
+		uint64_t                              base  = UINT64_MAX;
+		uint64_t                              epoch = 0;
 		std::array<uint32_t, BlockBytes / 4u> words {};
 	};
 	std::array<Block, Slots> blocks {};
-	size_t                   next = 0;
-	void                     Reset() {
-		for (auto& block: blocks) {
-			block.base = UINT64_MAX;
-		}
-		next = 0;
-	}
+	uint64_t                 epoch = 1;
+	void                     Reset() { epoch++; }
+	Block&                   Slot(uint64_t base) { return blocks[(base / BlockBytes) % Slots]; }
 };
 thread_local ShaderReadCache g_shader_read_cache;
 // While set, every successful materialization read is appended (address, value); a failed read
@@ -203,18 +201,17 @@ static bool ReadShaderGuestMemoryImpl(uint64_t address, uint32_t* value) {
 	auto&      cache = g_shader_read_cache;
 	const auto base  = address & ~(ShaderReadCache::BlockBytes - 1u);
 	if ((address & 3u) == 0) {
-		for (const auto& block: cache.blocks) {
-			if (block.base == base) {
-				*value = block.words[(address - base) / 4u];
-				return true;
-			}
+		auto& block = cache.Slot(base);
+		if (block.base == base && block.epoch == cache.epoch) {
+			*value = block.words[(address - base) / 4u];
+			return true;
 		}
-		auto& block = cache.blocks[cache.next];
+		block.base = UINT64_MAX;
 		if (Libs::LibKernel::Memory::ReadGpuBackingOrPrefetch(base, block.words.data(),
 		                                                      ShaderReadCache::BlockBytes)) {
-			block.base = base;
-			cache.next = (cache.next + 1u) % ShaderReadCache::Slots;
-			*value     = block.words[(address - base) / 4u];
+			block.base  = base;
+			block.epoch = cache.epoch;
+			*value      = block.words[(address - base) / 4u];
 			return true;
 		}
 	}

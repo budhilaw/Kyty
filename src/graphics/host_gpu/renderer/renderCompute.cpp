@@ -534,7 +534,7 @@ void RenderExecutor::Dispatch(uint64_t submit_id, CommandBuffer& buffer, uint32_
 	if (program.info.uses_dma) {
 		MapUserDataPointers(bindings);
 		if (!program.info.dma_srt_only) {
-			m_context.PrepareBda();
+			m_context.PrepareBda(program.info.dma_writes);
 		}
 	}
 	RebindImages(bindings);
@@ -668,7 +668,7 @@ void RenderExecutor::DispatchIndirect(uint64_t submit_id, CommandBuffer& buffer,
 	if (program.info.uses_dma) {
 		MapUserDataPointers(bindings);
 		if (!program.info.dma_srt_only) {
-			m_context.PrepareBda();
+			m_context.PrepareBda(program.info.dma_writes);
 		}
 	}
 	RebindImages(bindings);

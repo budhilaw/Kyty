@@ -10,6 +10,21 @@ namespace Libs::Graphics {
 
 struct GraphicContext;
 
+// Why a thread blocks on the GPU: counted per reason, logged as GPUWAITS every 5 s.
+enum class GpuWaitReason : uint32_t { Other, Peek, Readback, ForceReadback, Pending, Flip, Count };
+void                 SetGpuWaitReason(GpuWaitReason reason);
+[[nodiscard]] GpuWaitReason GetGpuWaitReason();
+// KYTY_WAIT_STATS=1: one blocking wait of us microseconds, by the calling thread.
+void RecordGpuWait(GpuWaitReason reason, uint64_t us);
+struct GpuWaitScope {
+	explicit GpuWaitScope(GpuWaitReason reason): m_saved(GetGpuWaitReason()) { SetGpuWaitReason(reason); }
+	~GpuWaitScope() { SetGpuWaitReason(m_saved); }
+	KYTY_CLASS_NO_COPY(GpuWaitScope);
+
+private:
+	GpuWaitReason m_saved;
+};
+
 class MasterSemaphore {
 public:
 	explicit MasterSemaphore(GraphicContext& graphics);

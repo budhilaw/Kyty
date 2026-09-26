@@ -1396,11 +1396,11 @@ bool GuestGpu::Process(Submission& submission) {
 			}
 			if (progressed) {
 				if (complete) {
-					m_renderer.RunGarbageCollector();
+					m_renderer.RunGarbageCollector(false);
 				}
 				cp.BufferFlush();
 			} else if (complete) {
-				m_renderer.RunGarbageCollector();
+				m_renderer.RunGarbageCollector(false);
 			}
 			break;
 		}
@@ -1422,17 +1422,17 @@ bool GuestGpu::Process(Submission& submission) {
 			           Pm4ProcessResult::Complete;
 			if (submission.command_execution.MadeProgress()) {
 				if (complete) {
-					m_renderer.RunGarbageCollector();
+					m_renderer.RunGarbageCollector(false);
 				}
 				cp.BufferFlush();
 			} else if (complete) {
-				m_renderer.RunGarbageCollector();
+				m_renderer.RunGarbageCollector(false);
 			}
 			break;
 		}
 		case SubmissionType::FlipPreparation:
 			m_renderer.PrefetchReadbacks();
-			m_renderer.RunGarbageCollector();
+			m_renderer.RunGarbageCollector(true);
 			cp.PrepareCpuFlip(submission.flip_request_id);
 			break;
 	}
@@ -2401,13 +2401,30 @@ void CommandProcessor::WriteAtEndOfPipe(uint32_t cache_policy, uint32_t event_wr
 		if (no_parse_fence) {
 			return;
 		}
-		if (dst_gpu_addr == nullptr ||
-		    Libs::LibKernel::Memory::TryWriteBacking(dst_address, data, bytes)) {
+		if (dst_gpu_addr == nullptr) {
 			return;
 		}
-		if (Libs::LibKernel::Memory::IsCommittedRange(dst_address, bytes)) {
-			std::memcpy(dst_gpu_addr, data, bytes);
-			return;
+		// A page being remapped (placeholder split/replace on another thread) is briefly neither
+		// backed nor committed. Dropping the store then lost the fence for good: the game polled
+		// it forever (intro hang at frame ~120) or asserted on its frame marker. Retry until the
+		// remap is done; only a store still failing after 200 ms is dropped.
+		const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(200);
+		for (uint32_t attempt = 0;; attempt++) {
+			if (Libs::LibKernel::Memory::TryWriteBacking(dst_address, data, bytes)) {
+				return;
+			}
+			if (Libs::LibKernel::Memory::IsCommittedRange(dst_address, bytes)) {
+				std::memcpy(dst_gpu_addr, data, bytes);
+				return;
+			}
+			if (std::chrono::steady_clock::now() >= deadline) {
+				break;
+			}
+			if (attempt < 64) {
+				std::this_thread::yield();
+			} else {
+				std::this_thread::sleep_for(std::chrono::microseconds(200));
+			}
 		}
 		static std::atomic<uint32_t> log_count {0};
 		if (log_count.fetch_add(1) < 16) {

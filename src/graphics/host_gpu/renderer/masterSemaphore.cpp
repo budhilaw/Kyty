@@ -3,7 +3,11 @@
 
 #include "common/assert.h"
 #include "common/timer.h"
+#include "graphics/guest_gpu/graphicsRun.h"
 #include "graphics/host_gpu/graphicContext.h"
+
+#include <cstdlib>
+#include <string>
 
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 #include <cinttypes>
@@ -102,6 +106,79 @@ void MasterSemaphore::Refresh() {
 	}
 }
 
+namespace {
+thread_local GpuWaitReason g_wait_reason = GpuWaitReason::Other;
+
+std::atomic<uint64_t> g_wait_count[2][static_cast<size_t>(GpuWaitReason::Count)] {};
+std::atomic<uint64_t> g_wait_us[2][static_cast<size_t>(GpuWaitReason::Count)] {};
+std::atomic<uint64_t> g_wait_last_print {0};
+
+// Records one blocking wait (the tick was not reached when it began).
+class WaitStat {
+public:
+	WaitStat(): m_start(Common::Timer::QueryPerformanceCounter()) {}
+	~WaitStat() {
+		static const bool enabled = std::getenv("KYTY_WAIT_STATS") != nullptr;
+		if (!enabled) {
+			return;
+		}
+		const auto now       = Common::Timer::QueryPerformanceCounter();
+		const auto frequency = Common::Timer::QueryPerformanceFrequency();
+		RecordGpuWait(g_wait_reason, (now - m_start) * 1'000'000ull / frequency);
+	}
+	KYTY_CLASS_NO_COPY(WaitStat);
+
+private:
+	uint64_t m_start;
+};
+} // namespace
+
+void RecordGpuWait(GpuWaitReason wait_reason, uint64_t us) {
+	static const bool enabled = std::getenv("KYTY_WAIT_STATS") != nullptr;
+	if (!enabled) {
+		return;
+	}
+	{
+		const auto now       = Common::Timer::QueryPerformanceCounter();
+		const auto frequency = Common::Timer::QueryPerformanceFrequency();
+		const auto gpu       = GuestGpu::IsGpuThread() ? 1 : 0;
+		const auto reason    = static_cast<size_t>(wait_reason);
+		g_wait_count[gpu][reason].fetch_add(1, std::memory_order_relaxed);
+		g_wait_us[gpu][reason].fetch_add(us, std::memory_order_relaxed);
+		auto last = g_wait_last_print.load(std::memory_order_relaxed);
+		if (last == 0) {
+			g_wait_last_print.compare_exchange_strong(last, now);
+			return;
+		}
+		if (now - last < frequency * 5 ||
+		    !g_wait_last_print.compare_exchange_strong(last, now)) {
+			return;
+		}
+		static const char* names[] = {"other", "peek", "readback", "force", "pending", "flip"};
+		std::string line = "GPUWAITS 5s:";
+		for (int thread = 0; thread < 2; thread++) {
+			line += thread == 1 ? " | gpu:" : " game:";
+			for (size_t r = 0; r < static_cast<size_t>(GpuWaitReason::Count); r++) {
+				const auto n  = g_wait_count[thread][r].exchange(0);
+				const auto t  = g_wait_us[thread][r].exchange(0);
+				if (n != 0) {
+					line += " " + std::string(names[r]) + "=" + std::to_string(n) + "/" +
+					        std::to_string(t / 1000) + "ms";
+				}
+			}
+		}
+		std::printf("%s\n", line.c_str());
+	}
+}
+
+void SetGpuWaitReason(GpuWaitReason reason) {
+	g_wait_reason = reason;
+}
+
+GpuWaitReason GetGpuWaitReason() {
+	return g_wait_reason;
+}
+
 bool MasterSemaphore::TryWait(uint64_t tick, uint64_t timeout_ns) {
 	if (IsFree(tick)) {
 		return true;
@@ -110,6 +187,7 @@ bool MasterSemaphore::TryWait(uint64_t tick, uint64_t timeout_ns) {
 	if (IsFree(tick)) {
 		return true;
 	}
+	WaitStat stat;
 	vk::SemaphoreWaitInfo wait_info {};
 	wait_info.semaphoreCount = 1;
 	wait_info.pSemaphores    = &m_semaphore;
@@ -134,6 +212,7 @@ void MasterSemaphore::Wait(uint64_t tick) {
 	if (IsFree(tick)) {
 		return;
 	}
+	WaitStat stat;
 
 	// Thousands of these waits happen per second, mostly for work the GPU finishes within
 	// microseconds. A kernel wait costs a scheduler round trip of the better part of a

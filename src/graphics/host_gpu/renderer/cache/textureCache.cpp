@@ -1223,7 +1223,14 @@ void TextureCache::UploadImage(Image& image, Buffer& source, uint64_t source_off
 	upload(copies, linear);
 }
 
+namespace {
+// Reported with the collector: image uploads from guest memory and images the collector freed.
+std::atomic<uint64_t> g_image_inits {0};
+std::atomic<uint64_t> g_image_gc_frees {0};
+} // namespace
+
 void TextureCache::InitializeImage(ImageId id) {
+	g_image_inits.fetch_add(1, std::memory_order_relaxed);
 	auto& image = m_slot_images[id];
 	if (image.info.data.Empty()) {
 		return;
@@ -2258,9 +2265,23 @@ void TextureCache::UnmapMemory(uint64_t address, uint64_t size) {
 	}
 }
 
-void TextureCache::RunGarbageCollector() {
+void TextureCache::RunGarbageCollector(bool frame_end) {
 	std::scoped_lock lock {m_lock};
-	const uint64_t   tick = m_gc_tick++;
+	// Ages count frames. They counted collector calls, which run after every submission (dozens
+	// per frame): textures used once a frame looked old, were freed and rebuilt from guest memory
+	// every frame (18% of the GPU thread at the Uncharted selector, near the VRAM budget).
+	const uint64_t tick = m_gc_tick;
+	if (frame_end) {
+		m_gc_tick++;
+		if (tick % 150 == 0) {
+			std::printf("IMAGES frames=150 inits=%llu gc_frees=%llu used=%lluMB pressure=%lluMB critical=%lluMB\n",
+			            static_cast<unsigned long long>(g_image_inits.exchange(0)),
+			            static_cast<unsigned long long>(g_image_gc_frees.exchange(0)),
+			            static_cast<unsigned long long>(m_total_used_memory >> 20u),
+			            static_cast<unsigned long long>(m_pressure_gc_memory >> 20u),
+			            static_cast<unsigned long long>(m_critical_gc_memory >> 20u));
+		}
+	}
 	if (m_graphics.CanReportMemoryUsage()) {
 		m_total_used_memory = m_graphics.GetDeviceMemoryUsage();
 	}
@@ -2271,7 +2292,8 @@ void TextureCache::RunGarbageCollector() {
 	const auto collect = [&](bool allow_aggressive) {
 		bool           pressured  = m_total_used_memory >= m_pressure_gc_memory;
 		bool           aggressive = allow_aggressive && m_total_used_memory >= m_critical_gc_memory;
-		const uint64_t age       = std::min<uint64_t>(aggressive ? 160 : pressured ? 80 : 16, tick);
+		// Anything drawn in the last few frames is the working set; freeing it only thrashes.
+		const uint64_t age       = std::min<uint64_t>(aggressive ? 8 : pressured ? 30 : 60, tick);
 		size_t         deletions = aggressive ? 40 : pressured ? 20 : 10;
 		std::vector<ImageId> candidates;
 		candidates.reserve(deletions);
@@ -2311,6 +2333,7 @@ void TextureCache::RunGarbageCollector() {
 				}
 			}
 			FreeImage(id);
+			g_image_gc_frees.fetch_add(1, std::memory_order_relaxed);
 			if (m_total_used_memory < m_critical_gc_memory && aggressive) {
 				deletions >>= 2;
 				aggressive = false;

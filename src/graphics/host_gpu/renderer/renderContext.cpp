@@ -457,9 +457,14 @@ void RenderContext::UnmapMemory(uint64_t vaddr, uint64_t size) {
 	m_gpu->SendCommandSync(unmap);
 }
 
-void RenderContext::PrepareBda() {
-	// A pass with raw pointers may write any mapped page.
-	m_buffer_cache.InvalidatePeekCache();
+void RenderContext::PrepareBda(bool writes) {
+	// A pass that stores through raw pointers may write any mapped page. Read-only passes used to
+	// drop the peek cache too, and each following compute pass drained the GPU again.
+	// KYTY_PEEK_DROP_ALWAYS=1 restores that.
+	static const bool drop_always = std::getenv("KYTY_PEEK_DROP_ALWAYS") != nullptr;
+	if (writes || drop_always) {
+		m_buffer_cache.InvalidatePeekCache();
+	}
 	m_buffer_cache.NoteRawWriteDispatch();
 	std::shared_lock lock(m_mapped_ranges_mutex);
 	// Every dispatch used to walk every mapped buffer (about 15% of the GPU thread). Nothing
@@ -705,6 +710,15 @@ void RenderContext::GpuTimerMark(vk::CommandBuffer command, uint64_t label, uint
 	if (m_timer_current < 0) {
 		return;
 	}
+	// KYTY_GPU_TIMING=frame: only the marks at command-buffer begin and end, so the report's
+	// total is the GPU's busy time (per-draw marks overflowed the query blocks).
+	static const bool frame_only = [] {
+		const char* mode = std::getenv("KYTY_GPU_TIMING");
+		return mode != nullptr && std::string_view(mode) == "frame";
+	}();
+	if (frame_only && (label != 0 || kind != 0)) {
+		return;
+	}
 	auto& block = m_timer_blocks[static_cast<size_t>(m_timer_current)];
 	if (block.used >= GpuTimerBlockQueries) {
 		return;
@@ -828,7 +842,7 @@ void RenderContext::GpuTimerReport() {
 	m_timer_kind_ms[0] = m_timer_kind_ms[1] = m_timer_kind_ms[2] = 0.0;
 }
 
-void RenderContext::RunGarbageCollector() {
+void RenderContext::RunGarbageCollector(bool frame_end) {
 	Common::WaitTrace::Scope gc_scope(Common::WaitTrace::Kind::GpuGarbage);
 	GpuTimerReport();
 	if (m_fault_process_pending) {
@@ -836,8 +850,8 @@ void RenderContext::RunGarbageCollector() {
 		m_buffer_cache.ProcessFaultBuffer();
 	}
 	m_texture_cache.ProcessDownloadImages();
-	m_texture_cache.RunGarbageCollector();
-	m_buffer_cache.RunGarbageCollector();
+	m_texture_cache.RunGarbageCollector(frame_end);
+	m_buffer_cache.RunGarbageCollector(frame_end);
 	// Games rarely exit cleanly, so compiled pipelines are persisted while running.
 	const auto now = std::chrono::steady_clock::now();
 	if (now - m_last_pipeline_save > std::chrono::seconds(20)) {

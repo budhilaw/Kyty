@@ -1285,7 +1285,8 @@ void RenderExecutor::MapUserDataPointers(const PreparedBindings& bindings) {
 
 void RenderExecutor::PrepareGraphicsBindings(std::span<PreparedBindings* const> stages,
                                              std::span<RenderColorInfo> colors) {
-	bool uses_dma = false;
+	bool uses_dma   = false;
+	bool dma_writes = false;
 	for (auto* stage: stages) {
 		FindBuffers(*stage);
 		if (stage->runtime->program->info.uses_dma) {
@@ -1293,9 +1294,10 @@ void RenderExecutor::PrepareGraphicsBindings(std::span<PreparedBindings* const> 
 		}
 		// SRT-only raw-pointer shaders had their ranges made resident above: no dirty-page walk.
 		uses_dma |= stage->runtime->program->info.uses_dma && !stage->runtime->program->info.dma_srt_only;
+		dma_writes |= stage->runtime->program->info.dma_writes;
 	}
 	if (uses_dma) {
-		m_context.PrepareBda();
+		m_context.PrepareBda(dma_writes);
 	}
 	for (auto* stage: stages) {
 		RebindImages(*stage);

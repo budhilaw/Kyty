@@ -15,8 +15,11 @@
 #include "kernel/pthread.h"
 #include "libs/errno.h"
 
+#include <chrono>
+#include <cstdio>
 #include <cstring>
 #include <limits>
+#include <thread>
 
 namespace Libs::Graphics::Sync {
 
@@ -108,9 +111,26 @@ static void RecordEndOfPipeWrite(uint64_t submit_id, CommandBuffer& buffer, uint
 		const uint32_t low   = static_cast<uint32_t>(value);
 		const void*    data  = size == EndOfPipeWriteSize::Qword ? static_cast<const void*>(&value)
 		                                                          : static_cast<const void*>(&low);
-		if (!LibKernel::Memory::TryWriteBacking(destination, data, bytes)) {
+		// A page mid-remap on another thread is briefly neither: the store is retried (a dropped
+		// fence hung the intro), and only one still failing after 200 ms is skipped.
+		const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(200);
+		for (uint32_t attempt = 0;; attempt++) {
+			if (LibKernel::Memory::TryWriteBacking(destination, data, bytes)) {
+				break;
+			}
 			if (LibKernel::Memory::IsCommittedRange(destination, bytes)) {
 				std::memcpy(reinterpret_cast<void*>(destination), data, bytes);
+				break;
+			}
+			if (std::chrono::steady_clock::now() >= deadline) {
+				std::printf("end-of-pipe store to 0x%016llx skipped (unmapped)\n",
+				            static_cast<unsigned long long>(destination));
+				break;
+			}
+			if (attempt < 64) {
+				std::this_thread::yield();
+			} else {
+				std::this_thread::sleep_for(std::chrono::microseconds(200));
 			}
 		}
 		// A later readback of the page must not put the buffer's older copy back over it

@@ -464,6 +464,8 @@ struct ShaderInfo {
 	int32_t                          instance_offset_sgpr = -1;
 	bool                             has_bitwise_xor    = false;
 	bool                             uses_dma           = false;
+	// Some raw-pointer access stores or does atomics (read-only passes leave GPU copies intact).
+	bool                             dma_writes         = false;
 	std::vector<GpuSrtRange>         gpu_srt_ranges;
 	// Raw-pointer loads come only from offloaded SRT reads, whose ranges are made resident per draw:
 	// the dirty-page walk before the draw is not needed.

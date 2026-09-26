@@ -74,8 +74,10 @@ public:
 	[[nodiscard]] bool IsMapped(uint64_t vaddr, uint64_t size) const noexcept;
 	void               MapMemory(uint64_t vaddr, uint64_t size);
 	void               UnmapMemory(uint64_t vaddr, uint64_t size);
-	void               PrepareBda();
-	void               RunGarbageCollector();
+	// writes: some stage stores through raw pointers.
+	void               PrepareBda(bool writes);
+	// frame_end: called at a flip; cache ages count frames, not submissions.
+	void               RunGarbageCollector(bool frame_end);
 	void               PrefetchReadbacks();
 
 	// KYTY_GPU_TIMING=1: a timestamp after every draw and dispatch, aggregated per shader and

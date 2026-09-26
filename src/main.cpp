@@ -398,6 +398,8 @@ static void StartAllThreadSampler() {
 			std::unordered_map<uint64_t, uint32_t> exe;     // emulator code, by RVA
 			std::unordered_map<uint64_t, uint32_t> modules; // system modules, by base
 			std::unordered_map<uint64_t, uint32_t> callers; // emulator caller of system code
+			std::unordered_map<uint64_t, uint32_t> guest_rips; // guest code, by 64-byte line
+			std::unordered_map<uint64_t, uint32_t> guest_calls; // guest code a host wait returns to
 		};
 		std::unordered_map<DWORD, ThreadStats> stats;
 		std::vector<DWORD>                     tids;
@@ -439,13 +441,13 @@ static void StartAllThreadSampler() {
 				if (s.cpu_start == 0) {
 					s.cpu_start = cpu_time(thread);
 				}
-				uint64_t frames[8] {};
+				uint64_t frames[24] {};
 				int      frame_count = 0;
 				if (SuspendThread(thread) != static_cast<DWORD>(-1)) {
 					CONTEXT context {};
 					context.ContextFlags = CONTEXT_FULL;
 					if (GetThreadContext(thread, &context) != 0) {
-						for (; frame_count < 8 && context.Rip != 0; frame_count++) {
+						for (; frame_count < 24 && context.Rip != 0; frame_count++) {
 							frames[frame_count] = context.Rip;
 							DWORD64 image_base = 0;
 							auto*   function   = RtlLookupFunctionEntry(context.Rip, &image_base, nullptr);
@@ -466,6 +468,13 @@ static void StartAllThreadSampler() {
 					continue;
 				}
 				s.samples++;
+				// The walk stops at the first frame without unwind data: guest code that called in.
+				if (frame_count > 1) {
+					const auto last = frames[frame_count - 1];
+					if (!(last >= module && last < module + 0x4000000u) && last >= 0x800000000ull && last < 0x10000000000ull) {
+						s.guest_calls[last & ~uint64_t {15}]++;
+					}
+				}
 				const auto rip = frames[0];
 				if (rip >= module && rip < module + 0x4000000u) {
 					s.exe[rip - module]++;
@@ -477,11 +486,13 @@ static void StartAllThreadSampler() {
 				                   reinterpret_cast<LPCSTR>(rip), &owner);
 				if (owner == nullptr) {
 					s.guest++;
+					s.guest_rips[rip & ~uint64_t {63}]++;
 					continue;
 				}
 				s.modules[reinterpret_cast<uint64_t>(owner)]++;
 				for (int frame = 1; frame < frame_count; frame++) {
-					if (frames[frame] >= module && frames[frame] < module + 0x4000000u) {
+					// The CRT and STL wait stubs at the end of .text say nothing: skip to their caller.
+					if (frames[frame] >= module && frames[frame] < module + 0x1190000u) {
 						s.callers[frames[frame] - module]++;
 						break;
 					}
@@ -527,12 +538,13 @@ static void StartAllThreadSampler() {
 				}
 				return text;
 			};
-			for (size_t i = 0; i < rows.size() && i < 8; i++) {
+			for (size_t i = 0; i < rows.size() && i < 16; i++) {
 				auto& s = stats[rows[i].tid];
-				std::printf("THREADSAMPLE tid=%lu cpu=%.0f%% samples=%u guest=%.0f%% |exe%s |mod%s |via%s\n",
+				std::printf("THREADSAMPLE tid=%lu cpu=%.0f%% samples=%u guest=%.0f%% |exe%s |mod%s |via%s |guestrip%s |gcall%s\n",
 				            static_cast<unsigned long>(rows[i].tid), rows[i].cpu, s.samples,
 				            100.0 * s.guest / std::max(s.samples, 1u), top(s.exe, s.samples, 6, false).c_str(),
-				            top(s.modules, s.samples, 4, true).c_str(), top(s.callers, s.samples, 4, false).c_str());
+				            top(s.modules, s.samples, 4, true).c_str(), top(s.callers, s.samples, 4, false).c_str(),
+				            top(s.guest_rips, s.samples, 5, false).c_str(), top(s.guest_calls, s.samples, 4, false).c_str());
 			}
 			std::fflush(stdout);
 			for (auto& [tid, s]: stats) {
@@ -541,6 +553,8 @@ static void StartAllThreadSampler() {
 				s.exe.clear();
 				s.modules.clear();
 				s.callers.clear();
+				s.guest_rips.clear();
+				s.guest_calls.clear();
 			}
 		}
 	}).detach();
@@ -560,6 +574,8 @@ static void StartGpuSampler() {
 		std::unordered_map<uint64_t, uint32_t> ext_caller;
 		std::unordered_map<uint64_t, uint32_t> ext_caller2;
 		std::unordered_map<uint64_t, uint32_t> parent;
+		std::unordered_map<uint64_t, uint32_t> new_caller;
+		std::unordered_map<uint64_t, uint32_t> new_caller2;
 		uint32_t samples = 0;
 		auto     last    = std::chrono::steady_clock::now();
 		for (;;) {
@@ -574,12 +590,13 @@ static void StartGpuSampler() {
 			}
 			// Nothing may allocate while the thread is suspended: it can be holding the heap
 			// lock, and the sampler would then wait on it forever.
-			uint64_t frames[16] {};
+			uint64_t frames[20] {};
 			int      frame_count = 0;
 			if (SuspendThread(gpu) != static_cast<DWORD>(-1)) {
 				CONTEXT context {};
 				context.ContextFlags = CONTEXT_FULL;
 				if (GetThreadContext(gpu, &context) != 0) {
+					const uint64_t start_rsp = context.Rsp;
 					for (; frame_count < 16 && context.Rip != 0; frame_count++) {
 						frames[frame_count] = context.Rip;
 						DWORD64 image_base = 0;
@@ -592,6 +609,35 @@ static void StartGpuSampler() {
 						DWORD64 establisher  = 0;
 						RtlVirtualUnwind(UNW_FLAG_NHANDLER, image_base, context.Rip, function, &context,
 						                 &handler_data, &establisher, nullptr);
+					}
+					// Driver frames without unwind data end the walk before any emulator frame:
+					// scan the stack for return addresses into the emulator (a call precedes them).
+					const auto in_exe = [&](uint64_t v) { return v >= module + 0x1000 && v < module + 0x4000000u; };
+					bool       found  = false;
+					for (int frame = 1; frame < frame_count; frame++) {
+						found = found || in_exe(frames[frame]);
+					}
+					if (!found && !in_exe(frames[0])) {
+						MEMORY_BASIC_INFORMATION info {};
+						if (VirtualQuery(reinterpret_cast<void*>(start_rsp), &info, sizeof(info)) != 0) {
+							const auto end = reinterpret_cast<uint64_t>(info.BaseAddress) + info.RegionSize;
+							int        got = 0;
+							for (uint64_t p = start_rsp & ~7ull; p + 8 <= end && p < start_rsp + 0x8000 && got < 2 &&
+							                                     frame_count < 20;
+							     p += 8) {
+								const auto v = *reinterpret_cast<const uint64_t*>(p);
+								if (!in_exe(v)) {
+									continue;
+								}
+								const auto* code = reinterpret_cast<const uint8_t*>(v);
+								if (code[-5] == 0xE8 || (code[-6] == 0xFF && code[-5] == 0x15) ||
+								    (code[-2] == 0xFF && (code[-1] & 0x38) == 0x10) ||
+								    (code[-3] == 0xFF && (code[-2] & 0x38) == 0x10)) {
+									frames[frame_count++] = v;
+									got++;
+								}
+							}
+						}
 					}
 				}
 				ResumeThread(gpu);
@@ -615,6 +661,20 @@ static void StartGpuSampler() {
 						                       GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
 						                   reinterpret_cast<LPCSTR>(rip), &owner);
 						ext_module[reinterpret_cast<uint64_t>(owner)]++;
+					}
+				}
+				// Who allocates: the two emulator frames above operator new.
+				{
+					static const auto new_addr =
+					    reinterpret_cast<uint64_t>(static_cast<void* (*)(size_t)>(&::operator new));
+					for (int frame = 0; frame + 1 < frame_count; frame++) {
+						if (frames[frame] >= new_addr && frames[frame] < new_addr + 0x80) {
+							new_caller[frames[frame + 1] - module]++;
+							if (frame + 2 < frame_count) {
+								new_caller2[frames[frame + 2] - module]++;
+							}
+							break;
+						}
 					}
 				}
 				// Caller of the sampled emulator function (who spins in a lock, who allocates).
@@ -657,6 +717,8 @@ static void StartGpuSampler() {
 				top(ext_caller, "extcaller");
 				top(ext_caller2, "extcaller2");
 				top(parent, "parent");
+				top(new_caller, "newcaller");
+				top(new_caller2, "newcaller2");
 				{
 					std::string line = fmt::format("GPUSAMPLE extmod n={}:", samples);
 					for (const auto& [base, count]: ext_module) {
@@ -673,6 +735,8 @@ static void StartGpuSampler() {
 				ext_caller.clear();
 				ext_caller2.clear();
 				parent.clear();
+				new_caller.clear();
+				new_caller2.clear();
 				std::fflush(stdout);
 				self.clear();
 				inclusive.clear();

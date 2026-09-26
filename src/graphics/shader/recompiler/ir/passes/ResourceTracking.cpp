@@ -90,7 +90,8 @@ public:
 		m_info.images.clear();
 		m_info.samplers.clear();
 		m_info.sampled_pairs.clear();
-		m_info.uses_dma = false;
+		m_info.uses_dma   = false;
+		m_info.dma_writes = false;
 		m_shader_writes = HasShaderMemoryWrites(program);
 	}
 
@@ -1131,6 +1132,7 @@ private:
 		if (buffer != BufferAccess::None) {
 			if (TryLowerBufferToAddress(inst, flags)) {
 				m_info.uses_dma = true;
+				m_info.dma_writes |= buffer != BufferAccess::Read;
 				return;
 			}
 			GetHandle(inst.Arg(0), ValueOpcode::GetBufferResource, 4, flags.pc, handle, source);
@@ -1159,6 +1161,7 @@ private:
 			}
 			ValidateAddressHandle(inst.Arg(0), flags.pc);
 			m_info.uses_dma = true;
+			m_info.dma_writes |= address_info.access != AddressAccess::Read;
 			return;
 		}
 
