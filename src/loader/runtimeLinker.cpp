@@ -815,6 +815,12 @@ static bool KytyExceptionHandler(const Common::HostException::ExceptionInfo& exc
 			return true;
 		}
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+		// The GPU tracker's write faults are the common case (thousands per second on the game's
+		// threads): handled before the VirtualQuery below, which only the rare unmapped page needs.
+		if (Libs::LibKernel::Memory::HandleGpuFault(access, info->access_violation_vaddr)) {
+			g_free_page_retries = 0;
+			return true;
+		}
 		{
 			// A page the host never reserved cannot be brought back by the GPU tracker; retrying
 			// would spin forever. Report it as the guest fault it is.

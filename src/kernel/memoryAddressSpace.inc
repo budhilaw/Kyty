@@ -817,7 +817,9 @@ public:
 		if (size == 0 || UINT64_MAX - vaddr < size) {
 			return false;
 		}
-		std::lock_guard lock(m_mutex);
+		// Shared: every write fault and every tracker walk changes protection, and they queued on
+		// this lock around the system call. Per-page order comes from the trackers' own locks.
+		std::shared_lock lock(m_mutex);
 		return ProtectMappedUnlocked(vaddr, size, mode);
 	}
 
@@ -826,7 +828,7 @@ public:
 			return false;
 		}
 
-		std::lock_guard lock(m_mutex);
+		std::shared_lock lock(m_mutex);
 		return ProtectMappedUnlocked(vaddr, size, mode);
 	}
 
@@ -1415,7 +1417,7 @@ private:
 #endif
 	}
 
-	std::mutex                                 m_mutex;
+	std::shared_mutex                          m_mutex; // shared: protection changes only read the maps
 	std::map<uint64_t, uint64_t>               m_free;
 	std::map<uint64_t, MappedRegion>            m_mapped;
 	std::vector<std::pair<uint64_t, uint64_t>> m_owned;

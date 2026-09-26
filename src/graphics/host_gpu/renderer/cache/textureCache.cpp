@@ -1897,6 +1897,25 @@ void TextureCache::InvalidateMemory(uint64_t address, uint64_t size) {
 	if (!GuestRange {address, size}.Valid()) {
 		EXIT("TextureCache: invalid memory-invalidation range\n");
 	}
+	// Every write fault of every game thread comes here, and most fault pages hold no image:
+	// those return before the cache-wide lock (the game threads spun on it). An image's pages are
+	// in the page table before the image protects them, and a new image starts CPU-dirty.
+	{
+		ImagePageTable::PageRange pages {};
+		if (!ImagePageTable::TryGetPageRange(address, size, pages)) {
+			return;
+		}
+		bool owned = false;
+		ForEachPage(address, size, [&](uint64_t page) {
+			if (!owned) {
+				const auto* owners = m_image_page_table.Find(page);
+				owned              = owners != nullptr && !owners->empty();
+			}
+		});
+		if (!owned) {
+			return;
+		}
+	}
 	std::scoped_lock lock {m_lock};
 	InvalidateCpuAliases(address, size);
 }

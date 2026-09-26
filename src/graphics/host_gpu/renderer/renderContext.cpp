@@ -286,7 +286,9 @@ bool RenderContext::HandleFault(PageFaultAccess access, uint64_t fault_vaddr) no
 		return false;
 	}
 	if (access == PageFaultAccess::Write) {
-		if (uint64_t hit = 0; CoversRecentIndirectArgs(fault_vaddr & ~uint64_t {0xfff}, 0x1000, hit)) {
+		// Diagnostic only (thousands of write faults per second): with the label trace.
+		if (uint64_t hit = 0; LabelTraceEnabled() &&
+		                      CoversRecentIndirectArgs(fault_vaddr & ~uint64_t {0xfff}, 0x1000, hit)) {
 			static std::atomic<uint32_t> log_count {0};
 			if (log_count.fetch_add(1) < 4096) {
 				LOGF("SHADERDUMP cpu write fault near args=0x%016" PRIx64 " at=0x%016" PRIx64

@@ -381,7 +381,173 @@ static bool ParseArgs(int argc, char* argv[], RunOptions& options, bool& show_he
 // so a guest spin loop can be traced back to its module.
 // KYTY_SAMPLE_GPU=1: samples the GPU command thread about every millisecond and prints the
 // hottest emulator code (image-relative offsets, self and inclusive) every five seconds.
+// KYTY_SAMPLE_ALL=1: every thread of the process. Every five seconds, for the busiest threads
+// (by CPU time): the CPU share and where their samples landed (guest code, emulator functions,
+// system modules), to tell whether the game's own threads limit the frame rate.
+static void StartAllThreadSampler() {
+	if (std::getenv("KYTY_SAMPLE_ALL") == nullptr) {
+		return;
+	}
+	std::thread([] {
+		const auto self_tid = GetCurrentThreadId();
+		const auto module   = reinterpret_cast<uint64_t>(GetModuleHandleA(nullptr));
+		struct ThreadStats {
+			uint64_t                               cpu_start = 0;
+			uint32_t                               samples   = 0;
+			uint32_t                               guest     = 0;
+			std::unordered_map<uint64_t, uint32_t> exe;     // emulator code, by RVA
+			std::unordered_map<uint64_t, uint32_t> modules; // system modules, by base
+			std::unordered_map<uint64_t, uint32_t> callers; // emulator caller of system code
+		};
+		std::unordered_map<DWORD, ThreadStats> stats;
+		std::vector<DWORD>                     tids;
+		auto last_list   = std::chrono::steady_clock::now() - std::chrono::seconds(1);
+		auto last_report = std::chrono::steady_clock::now();
+		const auto cpu_time = [](HANDLE thread) {
+			FILETIME created {}, exited {}, kernel {}, user {};
+			if (GetThreadTimes(thread, &created, &exited, &kernel, &user) == 0) {
+				return uint64_t {0};
+			}
+			return ((uint64_t {kernel.dwHighDateTime} << 32u) | kernel.dwLowDateTime) +
+			       ((uint64_t {user.dwHighDateTime} << 32u) | user.dwLowDateTime);
+		};
+		for (;;) {
+			Sleep(2);
+			const auto now = std::chrono::steady_clock::now();
+			if (now - last_list > std::chrono::milliseconds(500)) {
+				last_list = now;
+				tids.clear();
+				auto* snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
+				if (snapshot != INVALID_HANDLE_VALUE) {
+					THREADENTRY32 entry {};
+					entry.dwSize = sizeof(entry);
+					for (BOOL ok = Thread32First(snapshot, &entry); ok; ok = Thread32Next(snapshot, &entry)) {
+						if (entry.th32OwnerProcessID == GetCurrentProcessId() && entry.th32ThreadID != self_tid) {
+							tids.push_back(entry.th32ThreadID);
+						}
+					}
+					CloseHandle(snapshot);
+				}
+			}
+			for (const auto tid: tids) {
+				auto* thread = OpenThread(THREAD_GET_CONTEXT | THREAD_SUSPEND_RESUME | THREAD_QUERY_INFORMATION,
+				                          FALSE, tid);
+				if (thread == nullptr) {
+					continue;
+				}
+				auto& s = stats[tid];
+				if (s.cpu_start == 0) {
+					s.cpu_start = cpu_time(thread);
+				}
+				uint64_t frames[8] {};
+				int      frame_count = 0;
+				if (SuspendThread(thread) != static_cast<DWORD>(-1)) {
+					CONTEXT context {};
+					context.ContextFlags = CONTEXT_FULL;
+					if (GetThreadContext(thread, &context) != 0) {
+						for (; frame_count < 8 && context.Rip != 0; frame_count++) {
+							frames[frame_count] = context.Rip;
+							DWORD64 image_base = 0;
+							auto*   function   = RtlLookupFunctionEntry(context.Rip, &image_base, nullptr);
+							if (function == nullptr) {
+								frame_count++;
+								break;
+							}
+							void*   handler_data = nullptr;
+							DWORD64 establisher  = 0;
+							RtlVirtualUnwind(UNW_FLAG_NHANDLER, image_base, context.Rip, function, &context,
+							                 &handler_data, &establisher, nullptr);
+						}
+					}
+					ResumeThread(thread);
+				}
+				CloseHandle(thread);
+				if (frame_count == 0) {
+					continue;
+				}
+				s.samples++;
+				const auto rip = frames[0];
+				if (rip >= module && rip < module + 0x4000000u) {
+					s.exe[rip - module]++;
+					continue;
+				}
+				HMODULE owner = nullptr;
+				GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+				                       GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+				                   reinterpret_cast<LPCSTR>(rip), &owner);
+				if (owner == nullptr) {
+					s.guest++;
+					continue;
+				}
+				s.modules[reinterpret_cast<uint64_t>(owner)]++;
+				for (int frame = 1; frame < frame_count; frame++) {
+					if (frames[frame] >= module && frames[frame] < module + 0x4000000u) {
+						s.callers[frames[frame] - module]++;
+						break;
+					}
+				}
+			}
+			if (now - last_report < std::chrono::seconds(5)) {
+				continue;
+			}
+			const auto elapsed_100ns =
+			    static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(now - last_report).count()) * 10u;
+			last_report = now;
+			struct Row {
+				DWORD  tid;
+				double cpu;
+			};
+			std::vector<Row> rows;
+			for (auto& [tid, s]: stats) {
+				auto* thread = OpenThread(THREAD_QUERY_INFORMATION, FALSE, tid);
+				if (thread == nullptr) {
+					continue;
+				}
+				const auto cpu = cpu_time(thread);
+				CloseHandle(thread);
+				rows.push_back({tid, elapsed_100ns == 0 ? 0.0 : 100.0 * static_cast<double>(cpu - s.cpu_start) / elapsed_100ns});
+				s.cpu_start = cpu;
+			}
+			std::sort(rows.begin(), rows.end(), [](const Row& a, const Row& b) { return a.cpu > b.cpu; });
+			const auto top = [](const std::unordered_map<uint64_t, uint32_t>& table, uint32_t total, size_t count,
+			                    bool names) {
+				std::vector<std::pair<uint64_t, uint32_t>> items(table.begin(), table.end());
+				std::sort(items.begin(), items.end(), [](const auto& a, const auto& b) { return a.second > b.second; });
+				std::string text;
+				for (size_t i = 0; i < items.size() && i < count; i++) {
+					if (names) {
+						char name[MAX_PATH] {};
+						GetModuleFileNameA(reinterpret_cast<HMODULE>(items[i].first), name, MAX_PATH);
+						const char* slash = std::strrchr(name, '\\');
+						text += fmt::format(" {}={:.0f}%", slash != nullptr ? slash + 1 : name,
+						                    100.0 * items[i].second / std::max(total, 1u));
+					} else {
+						text += fmt::format(" {:x}={:.0f}%", items[i].first, 100.0 * items[i].second / std::max(total, 1u));
+					}
+				}
+				return text;
+			};
+			for (size_t i = 0; i < rows.size() && i < 8; i++) {
+				auto& s = stats[rows[i].tid];
+				std::printf("THREADSAMPLE tid=%lu cpu=%.0f%% samples=%u guest=%.0f%% |exe%s |mod%s |via%s\n",
+				            static_cast<unsigned long>(rows[i].tid), rows[i].cpu, s.samples,
+				            100.0 * s.guest / std::max(s.samples, 1u), top(s.exe, s.samples, 6, false).c_str(),
+				            top(s.modules, s.samples, 4, true).c_str(), top(s.callers, s.samples, 4, false).c_str());
+			}
+			std::fflush(stdout);
+			for (auto& [tid, s]: stats) {
+				s.samples = 0;
+				s.guest   = 0;
+				s.exe.clear();
+				s.modules.clear();
+				s.callers.clear();
+			}
+		}
+	}).detach();
+}
+
 static void StartGpuSampler() {
+	StartAllThreadSampler();
 	if (std::getenv("KYTY_SAMPLE_GPU") == nullptr) {
 		return;
 	}
