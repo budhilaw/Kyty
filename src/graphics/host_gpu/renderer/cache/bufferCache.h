@@ -143,7 +143,7 @@ private:
 	void TouchBuffer(const Buffer& buffer);
 	[[nodiscard]] OverlapResult ResolveOverlaps(uint64_t vaddr, uint64_t size);
 	void JoinOverlap(BufferId new_id, BufferId overlap_id, bool accumulate_stream_score);
-	[[nodiscard]] BufferId CreateBuffer(uint64_t vaddr, uint64_t size, bool host = false);
+	[[nodiscard]] BufferId CreateBuffer(uint64_t vaddr, uint64_t size, bool host = false, bool device = false);
 	// Rebinds a frequently rewritten buffer onto guest memory; returns the buffer now covering it.
 	BufferId PromoteToHost(BufferId id);
 	void                   Register(BufferId id);
@@ -236,6 +236,8 @@ private:
 	static constexpr uint64_t HostChunkSize = 256ull * 1024 * 1024;
 	// Uploads after which a CPU-rewritten buffer is moved onto guest memory, and the largest size.
 	static constexpr uint32_t HostPromoteUploads = 8;
+	// Larger buffers are geometry and heaps the GPU reads heavily: over PCIe they cost more GPU
+	// time than their uploads (256 MiB: 11 fps instead of 20).
 	static constexpr uint64_t HostPromoteMaxSize = 64ull * 1024 * 1024;
 	[[nodiscard]] vk::Buffer CreateHostBuffer(uint64_t vaddr, uint64_t size, vk::DeviceAddress& address);
 	HostChunk* ImportHostChunk(uint64_t index);

@@ -82,6 +82,9 @@ public:
 	// guest memory), and whether that was tried and failed.
 	uint32_t upload_count = 0;
 	bool     host_failed  = false;
+	// The GPU writes into it: it must stay in video memory (the command processor signals its
+	// labels before the GPU ran, so only a readback fault gets the game current GPU results).
+	bool gpu_written = false;
 
 protected:
 	[[nodiscard]] GraphicContext&   Graphics() const noexcept { return *m_graphics; }

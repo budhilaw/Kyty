@@ -315,9 +315,11 @@ BufferCache::BufferCache(GraphicContext& graphics, CommandScheduler& scheduler,
 	    m_slot_buffers.insert(m_graphics, m_scheduler, MemoryUsage::DeviceLocal, 0, AllFlags, 16);
 	EXIT_IF(null_id != NULL_BUFFER_ID);
 	SetVulkanObjectNameF(m_graphics.device, GetBuffer(null_id).Handle(), "Kyty.NullBuffer");
-	// Buffers the CPU keeps rewriting are bound onto guest memory itself (imported host memory):
-	// no uploads, dirty-page walks or readbacks for them. KYTY_NO_HOST_BUFFERS=1 disables.
-	m_host_buffers = m_graphics.external_memory_host && std::getenv("KYTY_NO_HOST_BUFFERS") == nullptr;
+	// Opt-in (KYTY_HOST_BUFFERS=1): buffers the CPU keeps rewriting are bound onto guest memory
+	// itself. It removes their uploads and walks, but the GPU then reads whatever the game wrote
+	// last, frames ahead of what it is drawing (the Uncharted selector culled its scene in 3 of 4
+	// runs).
+	m_host_buffers = m_graphics.external_memory_host && std::getenv("KYTY_HOST_BUFFERS") != nullptr;
 	if (m_host_buffers) {
 		LOGF("HOSTBUF: buffers are bound onto guest memory\n");
 	}
@@ -1223,14 +1225,14 @@ BufferId BufferCache::PromoteToHost(BufferId id) {
 		result.host_failed = true;
 	} else {
 		static std::atomic<uint32_t> log_count {0};
-		if (log_count.fetch_add(1) < 64) {
+		if (log_count.fetch_add(1) < 1024) {
 			LOGF("HOSTBUF: promoted 0x%010" PRIx64 " size 0x%" PRIx64 "\n", result.CpuAddress(), result.Size());
 		}
 	}
 	return next;
 }
 
-BufferId BufferCache::CreateBuffer(uint64_t vaddr, uint64_t size, bool host) {
+BufferId BufferCache::CreateBuffer(uint64_t vaddr, uint64_t size, bool host, bool device) {
 	EXIT_IF(m_scheduler.Current().IsInvalid());
 	const auto end = Common::AlignUp(vaddr + size, CACHING_PAGESIZE);
 	vaddr = Common::AlignDown(vaddr, CACHING_PAGESIZE);
@@ -1239,9 +1241,13 @@ BufferId BufferCache::CreateBuffer(uint64_t vaddr, uint64_t size, bool host) {
 
 	TraceArgs("create", overlap.begin, overlap.end - overlap.begin, "");
 	// A promoted buffer that a new request overlaps stays on guest memory.
-	for (auto it = overlap.first; it != overlap.last && !host; ++it) {
-		host = m_slot_buffers[it->second].IsHostBacked();
+	bool gpu_written = false;
+	for (auto it = overlap.first; it != overlap.last; ++it) {
+		host        = host || m_slot_buffers[it->second].IsHostBacked();
+		gpu_written = gpu_written || m_slot_buffers[it->second].gpu_written;
 	}
+	// Memory the GPU writes stays in video memory.
+	host = host && !device && !gpu_written;
 	vk::DeviceAddress host_address = 0;
 	const vk::Buffer  host_buffer =
 	    m_host_buffers && host ? CreateHostBuffer(overlap.begin, overlap.end - overlap.begin, host_address)
@@ -1253,6 +1259,7 @@ BufferId BufferCache::CreateBuffer(uint64_t vaddr, uint64_t size, bool host) {
 	                                        overlap.begin,
 	                                        AllFlags | vk::BufferUsageFlagBits::eShaderDeviceAddress,
 	                                        overlap.end - overlap.begin);
+	m_slot_buffers[id].gpu_written = gpu_written;
 	const auto& buffer = m_slot_buffers[id];
 	SetVulkanObjectNameF(m_graphics.device, buffer.Handle(),
 	                     "Kyty.GameBuffer[guest=0x{:016x} size=0x{:x}]", overlap.begin,
@@ -1734,9 +1741,20 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBuffer(uint64_t vaddr, uint64_t 
 	}
 	// A buffer the CPU keeps rewriting moves onto guest memory: no more uploads or dirty-page
 	// walks for it. GPU-written and texel buffers stay in video memory.
+	if (m_host_buffers && is_written && m_slot_buffers[id].IsHostBacked()) {
+		// The GPU is about to write it: back to video memory (see Buffer::gpu_written).
+		const auto& host_buffer = m_slot_buffers[id];
+		static std::atomic<uint32_t> demote_logs {0};
+		if (demote_logs.fetch_add(1) < 256) {
+			LOGF("HOSTBUF: demoted 0x%010" PRIx64 " size 0x%" PRIx64 " (GPU write 0x%010" PRIx64 "+0x%" PRIx64 ")\n",
+			     host_buffer.CpuAddress(), host_buffer.Size(), vaddr, size);
+		}
+		id = CreateBuffer(host_buffer.CpuAddress(), host_buffer.Size(), false, true);
+	}
 	if (m_host_buffers && !is_written && !is_texel_buffer) {
 		const auto& candidate = m_slot_buffers[id];
-		if (!candidate.IsHostBacked() && !candidate.host_failed && candidate.upload_count >= HostPromoteUploads &&
+		if (!candidate.IsHostBacked() && !candidate.host_failed && !candidate.gpu_written &&
+		    candidate.upload_count >= HostPromoteUploads &&
 		    candidate.Size() <= HostPromoteMaxSize) {
 			id = PromoteToHost(id);
 		}
@@ -1747,6 +1765,7 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBuffer(uint64_t vaddr, uint64_t 
 	          fmt::format("buffer=0x{:x}+0x{:x}", buffer.CpuAddress(), buffer.Size()));
 	(void)SynchronizeBuffer(buffer, vaddr, size, is_written, is_texel_buffer);
 	if (is_written) {
+		buffer.gpu_written = true;
 		if (!buffer.IsHostBacked()) {
 			m_gpu_modified_ranges.Add(vaddr, size);
 		}
@@ -2115,7 +2134,7 @@ void BufferCache::SynchronizeRangesBatch(std::span<const std::pair<uint64_t, uin
 			continue;
 		}
 		buffer.upload_count++;
-		if (m_host_buffers && !buffer.IsHostBacked() && !buffer.host_failed &&
+		if (m_host_buffers && !buffer.IsHostBacked() && !buffer.host_failed && !buffer.gpu_written &&
 		    buffer.upload_count >= HostPromoteUploads && buffer.Size() <= HostPromoteMaxSize) {
 			promote.push_back(group.id);
 		}
