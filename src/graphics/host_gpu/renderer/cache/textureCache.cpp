@@ -1,5 +1,6 @@
 #include "graphics/host_gpu/renderer/cache/textureCache.h"
-#include "graphics/guest_gpu/command_processor/commandProcessor.h"
+#include "graphics/guest_gpu/graphicsRun.h"
+#include "graphics/guest_gpu/graphicsRun.h"
 
 #include "common/alignment.h"
 #include "common/assert.h"
@@ -2128,6 +2129,25 @@ void TextureCache::InvalidateMemoryFromGPU(uint64_t address, uint64_t size) {
 bool TextureCache::IsRegionGpuModified(uint64_t address, uint64_t size) {
 	if (!GuestRange {address, size}.Valid()) {
 		return false;
+	}
+	// Descriptor-table reads ask this thousands of times per frame for memory no image covers.
+	// Images are registered and unregistered on the GPU thread only, so there the page table can
+	// be checked for owners without the lock the game threads' write faults contend on.
+	if (GuestGpu::IsGpuThread()) {
+		ImagePageTable::PageRange pages {};
+		if (!ImagePageTable::TryGetPageRange(address, size, pages)) {
+			return false;
+		}
+		bool owned = false;
+		ForEachPage(address, size, [&](uint64_t page) {
+			if (!owned) {
+				const auto* owners = m_image_page_table.Find(page);
+				owned              = owners != nullptr && !owners->empty();
+			}
+		});
+		if (!owned) {
+			return false;
+		}
 	}
 	std::scoped_lock lock {m_lock};
 	for (const auto id: FindImagesInRegion(address, size, false)) {

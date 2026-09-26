@@ -2116,11 +2116,19 @@ void BufferCache::SynchronizeRangesBatch(std::span<const std::pair<uint64_t, uin
 		}
 		return;
 	}
+	// Only the dirty-bit collection (and protection update) runs under the tracker's region locks;
+	// building the copy lists compares snapshots and takes another mutex, and game threads
+	// faulting on those regions spun behind it.
+	thread_local std::vector<std::tuple<size_t, uint64_t, uint64_t>> collected;
+	collected.clear();
 	m_memory_tracker.ForEachUploadRangeBatch(
 	    pieces, [&](size_t index, uint64_t address, uint64_t bytes) noexcept {
-		    auto& group = groups[piece_group[index]];
-		    AppendUploadCopies(m_slot_buffers[group.id], address, bytes, group.copies, group.total);
+		    collected.emplace_back(index, address, bytes);
 	    });
+	for (const auto& [index, address, bytes]: collected) {
+		auto& group = groups[piece_group[index]];
+		AppendUploadCopies(m_slot_buffers[group.id], address, bytes, group.copies, group.total);
+	}
 	thread_local std::vector<BufferId> promote;
 	promote.clear();
 	bool began = false;
