@@ -451,16 +451,7 @@ void Finish(uint64_t presented_address) {
 		auto&                        scheduler = s.context->GetCommandScheduler();
 		std::vector<PendingDownload> pending   = std::move(s.snapshots);
 		s.snapshots.clear();
-		// KYTY_FRAME_DUMP_PRESENTED=1 writes only the presented image: a cheap screenshot of
-		// exact frames (a time-based shot missed runs that ended early).
-		static const bool presented_only = std::getenv("KYTY_FRAME_DUMP_PRESENTED") != nullptr;
-		if (presented_only) {
-			pending.clear();
-		}
 		for (const auto& captured: s.images) {
-			if (presented_only && captured.address != presented_address) {
-				continue;
-			}
 			(void)StartDownload(s, captured, pending);
 		}
 		scheduler.FlushAndWait();
