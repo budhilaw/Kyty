@@ -269,6 +269,7 @@ bool BufferCache::DownloadBufferMemory(Buffer& buffer, uint64_t vaddr, uint64_t 
 	                       nullptr);
 	native.copyBuffer(buffer.Handle(), m_download_buffer.Handle(),
 	                  static_cast<uint32_t>(copies.size()), copies.data());
+	m_scheduler.Context().GpuTimerMark(native, 0x444F574Eu, 0); // 'DOWN'
 
 	auto after          = before;
 	after.srcAccessMask = vk::AccessFlagBits::eTransferWrite;
@@ -1390,6 +1391,7 @@ bool BufferCache::SynchronizeBuffer(Buffer& buffer, uint64_t vaddr, uint64_t siz
 		                       vk::DependencyFlagBits::eByRegion, 0, nullptr, 1, &before, 0, nullptr);
 		native.copyBuffer(source, buffer.Handle(), static_cast<uint32_t>(copies.size()),
 		                  copies.data());
+		m_scheduler.Context().GpuTimerMark(native, 0x55504C44u, 0); // 'UPLD'
 		auto after          = before;
 		after.srcAccessMask = vk::AccessFlagBits::eTransferWrite;
 		after.dstAccessMask = vk::AccessFlagBits::eMemoryRead | vk::AccessFlagBits::eMemoryWrite;
@@ -1683,10 +1685,12 @@ void BufferCache::RunGarbageCollector() {
 	if (m_graphics.CanReportMemoryUsage()) {
 		m_total_used_memory = m_graphics.GetDeviceMemoryUsage();
 	}
+	static uint64_t gc_deleted = 0;
 	if (tick % 600 == 0) {
-		printf("VRAM used=%" PRIu64 "MB trigger=%" PRIu64 "MB critical=%" PRIu64 "MB pending=%zu\n",
+		printf("VRAM used=%" PRIu64 "MB trigger=%" PRIu64 "MB critical=%" PRIu64 "MB pending=%zu gc_deleted=%" PRIu64 "\n",
 		       m_total_used_memory >> 20u, m_trigger_gc_memory >> 20u, m_critical_gc_memory >> 20u,
-		       m_pending_downloads.size());
+		       m_pending_downloads.size(), gc_deleted);
+		gc_deleted = 0;
 	}
 	static const bool no_gc = std::getenv("KYTY_NO_GC") != nullptr;
 	if (no_gc || m_total_used_memory < m_trigger_gc_memory) {
@@ -1733,6 +1737,7 @@ void BufferCache::RunGarbageCollector() {
 			TraceArgs("gc-delete", buffer.CpuAddress(), buffer.Size(), "");
 			m_memory_tracker.UntrackMemory(buffer.CpuAddress(), buffer.Size());
 			DeleteBuffer(id);
+			gc_deleted++;
 		}
 		return ++retire_count == limit;
 	});
@@ -1867,6 +1872,8 @@ void BufferCache::SynchronizeRangesBatch(std::span<const std::pair<uint64_t, uin
 		                  group.copies.data());
 	}
 	if (began) {
+		// KYTY_GPU_TIMING: GPU time of the walk's uploads ('UPLD').
+		m_scheduler.Context().GpuTimerMark(m_scheduler.Current().Handle(), 0x55504C44u, 0);
 		vk::MemoryBarrier barrier {};
 		barrier.srcAccessMask = vk::AccessFlagBits::eTransferWrite;
 		barrier.dstAccessMask = vk::AccessFlagBits::eMemoryRead | vk::AccessFlagBits::eMemoryWrite;

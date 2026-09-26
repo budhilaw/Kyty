@@ -1254,6 +1254,8 @@ void TextureCache::InitializeImage(ImageId id) {
 			EXIT("TextureCache: failed to obtain image upload source\n");
 		}
 		UploadImage(image, *source, source_offset);
+		// KYTY_GPU_TIMING: detile and image upload ('IMGU').
+		m_scheduler.Context().GpuTimerMark(m_scheduler.Current().Handle(), 0x494D4755u, 0);
 		image.ClearBufferModified();
 	}
 	if (image.IsCpuDirty()) {

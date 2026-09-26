@@ -2267,13 +2267,36 @@ void CommandProcessor::DispatchIndirect(uint64_t args_addr, uint32_t mode) {
 			DispatchIndirectArgs gpu {};
 			const bool peeked = Libs::LibKernel::Memory::PeekGpuCopy(args_addr, &gpu, sizeof(gpu));
 			if (peeked) {
-				args = gpu;
+				// The tile-lighting passes' GPU copy sometimes held a count only in x, with y and z
+				// garbage (14400 x 5636157 x 5636205); the dispatch was then skipped as implausible
+				// and those tiles went unlit. The CPU-written y and z (1 x 1) are kept then.
+				const auto guest = args;
+				args             = gpu;
+				constexpr uint32_t MaxDimension = 65535u;
+				if (gpu.thread_group_x != 0 && gpu.thread_group_x <= (1u << 17u) &&
+				    (gpu.thread_group_y > MaxDimension || gpu.thread_group_z > MaxDimension) &&
+				    guest.thread_group_y != 0 && guest.thread_group_y <= MaxDimension &&
+				    guest.thread_group_z != 0 && guest.thread_group_z <= MaxDimension) {
+					args.thread_group_y = guest.thread_group_y;
+					args.thread_group_z = guest.thread_group_z;
+				}
 			}
 			static std::atomic<uint32_t> log_count {0};
 			if (log_count.fetch_add(1) < 64) {
 				LOGF("ZEROARGS 0x%016" PRIx64 " peeked=%d gpu=%ux%ux%u writer=%016" PRIx64 "\n",
 				     args_addr, peeked ? 1 : 0, gpu.thread_group_x, gpu.thread_group_y,
 				     gpu.thread_group_z, Libs::Graphics::FindGpuWriter(args_addr));
+			}
+		}
+		if (args.thread_group_x != 0 && args.thread_group_x <= (1u << 17u) &&
+		    (args.thread_group_y > 65535u || args.thread_group_z > 65535u)) {
+			// Garbage y/z with a plausible x (see above): the guest's own y and z decide.
+			DispatchIndirectArgs guest {};
+			if (Libs::LibKernel::Memory::TryReadBacking(args_addr, &guest, sizeof(guest)) &&
+			    guest.thread_group_y != 0 && guest.thread_group_y <= 65535u &&
+			    guest.thread_group_z != 0 && guest.thread_group_z <= 65535u) {
+				args.thread_group_y = guest.thread_group_y;
+				args.thread_group_z = guest.thread_group_z;
 			}
 		}
 		const auto groups =

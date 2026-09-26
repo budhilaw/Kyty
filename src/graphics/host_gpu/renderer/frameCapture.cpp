@@ -545,8 +545,29 @@ uint64_t FlipSerial() {
 	return g_flip_serial.load(std::memory_order_acquire);
 }
 
+std::atomic<uint32_t> g_frame_draws {0};
+
+void NoteDraw() {
+	g_frame_draws.fetch_add(1, std::memory_order_relaxed);
+}
+
 void OnFlip(uint64_t presented_address) {
-	g_flip_serial.fetch_add(1, std::memory_order_acq_rel);
+	const auto flip = g_flip_serial.fetch_add(1, std::memory_order_acq_rel) + 1;
+	{
+		// Draws per frame, logged every 30 flips: the Uncharted selector draws ~700 when the scene
+		// renders and ~22 when the game culled it (the blob), so a single run is classifiable.
+		static uint32_t min_draws = UINT32_MAX;
+		static uint32_t max_draws = 0;
+		const auto      draws     = g_frame_draws.exchange(0, std::memory_order_relaxed);
+		min_draws                 = std::min(min_draws, draws);
+		max_draws                 = std::max(max_draws, draws);
+		if (flip % 30u == 0u) {
+			std::printf("FRAMEDRAWS flip=%llu min=%u max=%u\n", static_cast<unsigned long long>(flip),
+			            min_draws, max_draws);
+			min_draws = UINT32_MAX;
+			max_draws = 0;
+		}
+	}
 	Libs::LibKernel::Memory::NoteGpuFrame();
 	auto& s = S();
 	if (s.frames.empty() && s.trigger.empty()) {

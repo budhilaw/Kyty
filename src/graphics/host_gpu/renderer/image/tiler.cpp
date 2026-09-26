@@ -134,9 +134,9 @@ TileManager::Scratch TileManager::AllocateScratch(uint64_t size) {
 void TileManager::DeferDestroy(Scratch scratch) {
 	auto allocator = m_graphics.allocator;
 	// Runs once the GPU has finished with the buffer: it returns to the pool while that stays
-	// under 256 MiB.
+	// under 64 MiB (video memory is at its budget at the selector).
 	m_scheduler.DeferOperation([this, allocator, scratch] {
-		constexpr uint64_t MaxPooled = 256ull * 1024 * 1024;
+		constexpr uint64_t MaxPooled = 64ull * 1024 * 1024;
 		if (scratch.capacity != 0) {
 			std::lock_guard lock(m_scratch_mutex);
 			if (m_scratch_pooled_bytes + scratch.capacity <= MaxPooled) {

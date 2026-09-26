@@ -1551,8 +1551,11 @@ bool EvaluateRuntimeSourcesImpl(const ResourcePlan& program, std::span<const uin
 				active.at(source) = 0u;
 			}
 		}
-		std::vector<uint8_t>  visited(program.control_flow.size());
-		std::vector<uint32_t> pending {0};
+		// Reused per thread: two allocations per draw otherwise.
+		thread_local std::vector<uint8_t>  visited;
+		thread_local std::vector<uint32_t> pending;
+		visited.assign(program.control_flow.size(), 0u);
+		pending.assign(1, 0u);
 		while (!pending.empty()) {
 			const auto index = pending.back();
 			pending.pop_back();
@@ -1601,11 +1604,10 @@ bool EvaluateRuntimeSourcesImpl(const ResourcePlan& program, std::span<const uin
 		if (!split_stats) {
 			return;
 		}
-		static std::mutex stats_mutex;
-		static uint64_t   calls = 0, sources_n = 0, flat_n = 0, sources_ns = 0, flat_ns = 0;
-		static auto       last  = std::chrono::steady_clock::now();
-		const auto        now   = std::chrono::steady_clock::now();
-		std::lock_guard   lock(stats_mutex);
+		// Per thread (the GPU thread does nearly all of it): a lock here slowed the profiled runs.
+		thread_local uint64_t calls = 0, sources_n = 0, flat_n = 0, sources_ns = 0, flat_ns = 0;
+		thread_local auto     last  = std::chrono::steady_clock::now();
+		const auto            now   = std::chrono::steady_clock::now();
 		calls++;
 		sources_n += sources.size();
 		flat_n += evaluate_flat ? program.srt_reads.size() : 0u;

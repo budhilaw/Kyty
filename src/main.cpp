@@ -393,6 +393,7 @@ static void StartGpuSampler() {
 		std::unordered_map<uint64_t, uint32_t> ext_module;
 		std::unordered_map<uint64_t, uint32_t> ext_caller;
 		std::unordered_map<uint64_t, uint32_t> ext_caller2;
+		std::unordered_map<uint64_t, uint32_t> parent;
 		uint32_t samples = 0;
 		auto     last    = std::chrono::steady_clock::now();
 		for (;;) {
@@ -450,6 +451,11 @@ static void StartGpuSampler() {
 						ext_module[reinterpret_cast<uint64_t>(owner)]++;
 					}
 				}
+				// Caller of the sampled emulator function (who spins in a lock, who allocates).
+				if (frame_count > 1 && frames[0] >= module && frames[0] < module + 0x4000000u &&
+				    frames[1] >= module && frames[1] < module + 0x4000000u) {
+					parent[frames[1] - module]++;
+				}
 				if (frame_count > 0 && !(frames[0] >= module && frames[0] < module + 0x4000000u)) {
 					for (int frame = 1; frame < frame_count; frame++) {
 						if (frames[frame] >= module && frames[frame] < module + 0x4000000u) {
@@ -484,6 +490,7 @@ static void StartGpuSampler() {
 				top(inclusive, "incl");
 				top(ext_caller, "extcaller");
 				top(ext_caller2, "extcaller2");
+				top(parent, "parent");
 				{
 					std::string line = fmt::format("GPUSAMPLE extmod n={}:", samples);
 					for (const auto& [base, count]: ext_module) {
@@ -499,6 +506,7 @@ static void StartGpuSampler() {
 				ext_module.clear();
 				ext_caller.clear();
 				ext_caller2.clear();
+				parent.clear();
 				std::fflush(stdout);
 				self.clear();
 				inclusive.clear();
