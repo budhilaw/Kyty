@@ -1412,10 +1412,16 @@ vk::Buffer BufferCache::UploadCopies(Buffer& buffer, std::span<vk::BufferCopy> c
 
 	auto [mapped, base_offset] = m_staging_buffer.Map(total_size, 4);
 	if (mapped != nullptr) {
+		// Guest data goes through ordinary host memory: the baseline used to be copied back out of
+		// the staging buffer, which is write-combined and slow to read (86% of the GPU thread when
+		// many pages were uploaded, ~10% at the Uncharted selector).
+		thread_local std::vector<uint8_t> scratch;
 		for (auto& copy: copies) {
 			const auto address = buffer.CpuAddress() + copy.dstOffset;
-			ReadGuestForUpload(address, mapped + copy.srcOffset, copy.size);
-			RecordGpuBaseline(address, mapped + copy.srcOffset, copy.size);
+			scratch.resize(copy.size);
+			ReadGuestForUpload(address, scratch.data(), copy.size);
+			std::memcpy(mapped + copy.srcOffset, scratch.data(), copy.size);
+			RecordGpuBaseline(address, scratch.data(), copy.size);
 			copy.srcOffset += base_offset;
 		}
 		m_staging_buffer.Commit();
@@ -1427,8 +1433,11 @@ vk::Buffer BufferCache::UploadCopies(Buffer& buffer, std::span<vk::BufferCopy> c
 	for (const auto& copy: copies) {
 		const auto address = buffer.CpuAddress() + copy.dstOffset;
 		auto*      target  = temporary->Mapped().data() + copy.srcOffset;
-		ReadGuestForUpload(address, target, copy.size);
-		RecordGpuBaseline(address, target, copy.size);
+		thread_local std::vector<uint8_t> scratch;
+		scratch.resize(copy.size);
+		ReadGuestForUpload(address, scratch.data(), copy.size);
+		std::memcpy(target, scratch.data(), copy.size);
+		RecordGpuBaseline(address, scratch.data(), copy.size);
 	}
 	temporary->Flush(0, total_size);
 	const auto handle = temporary->Handle();
