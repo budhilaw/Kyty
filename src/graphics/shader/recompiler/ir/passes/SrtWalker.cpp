@@ -530,6 +530,27 @@ private:
 		if (inst == nullptr) {
 			return false;
 		}
+		Prepare();
+		if (!m_active_mask.IsEmpty() && IsRuntimeSelect(inst->GetOpcode()) &&
+		    inst->NumArgs() == 3 && inst->Arg(0).Resolve() == m_active_mask) {
+			return EvaluateWide(inst->Arg(1), result);
+		}
+		return EvaluateIndexed(inst, result);
+	}
+
+public:
+	// A root compiled with the plan (an SRT read or a descriptor-source dword).
+	bool EvaluateRoot(const CompiledEvalOperand& operand, uint32_t& result) {
+		Prepare();
+		uint64_t wide = 0;
+		if (!Operand(operand, wide)) {
+			return false;
+		}
+		result = static_cast<uint32_t>(wide);
+		return true;
+	}
+
+	void Prepare() {
 		if (!m_reserved) {
 			// One flat slot per plan value instead of a hash node per evaluated value: this
 			// evaluation runs for hundreds of draws per frame. Plan values carry their slot.
@@ -559,10 +580,10 @@ private:
 			t_evaluation_slots.Reserve(m_program.compiled_eval.size());
 			m_reserved = true;
 		}
-		if (!m_active_mask.IsEmpty() && IsRuntimeSelect(inst->GetOpcode()) &&
-		    inst->NumArgs() == 3 && inst->Arg(0).Resolve() == m_active_mask) {
-			return EvaluateWide(inst->Arg(1), result);
-		}
+	}
+
+private:
+	bool EvaluateIndexed(const Inst* inst, uint64_t& result) {
 		const auto slot = inst->AssignedEvaluationIndex();
 		if (slot != UINT32_MAX && slot < m_program.compiled_eval.size()) {
 			return EvaluateSlot(slot, result);
@@ -655,10 +676,62 @@ private:
 		}
 	}
 
+	CompiledEvalOperand CompileOperand(Value value, uint32_t count) const {
+		CompiledEvalOperand operand;
+		value = value.Resolve();
+		if (value.IsImmediate()) {
+			operand.kind = CompiledEvalOperand::Immediate;
+			switch (value.GetType()) {
+				case Type::U1: operand.imm = value.U1(); break;
+				case Type::U8: operand.imm = value.U8(); break;
+				case Type::U16: operand.imm = value.U16(); break;
+				case Type::U32: operand.imm = value.U32(); break;
+				case Type::U64: operand.imm = value.U64(); break;
+				case Type::F32: operand.imm = std::bit_cast<uint32_t>(value.F32Value()); break;
+				default: operand.kind = CompiledEvalOperand::Invalid; break;
+			}
+			return operand;
+		}
+		const auto* source = value.TryInstruction();
+		if (source == nullptr) {
+			return operand; // Invalid
+		}
+		const auto source_index = source->AssignedEvaluationIndex();
+		if (source_index != UINT32_MAX && source_index < count) {
+			operand.kind = CompiledEvalOperand::Node;
+			operand.node = source_index;
+		} else {
+			operand.kind  = CompiledEvalOperand::Generic;
+			operand.value = value;
+		}
+		return operand;
+	}
+
 	void BuildCompiled(uint32_t count) {
 		static const bool disabled = std::getenv("KYTY_NO_COMPILED_SRT") != nullptr;
 		auto&             nodes    = m_program.compiled_eval;
 		nodes.assign(count, CompiledEvalNode {});
+		// Roots: the evaluation entry points of every draw.
+		const auto root = [&](Value value) {
+			if (disabled) {
+				CompiledEvalOperand operand;
+				operand.kind  = CompiledEvalOperand::Generic;
+				operand.value = value;
+				return operand;
+			}
+			return CompileOperand(value, count);
+		};
+		m_program.compiled_srt_roots.clear();
+		for (const auto& read: m_program.srt_reads) {
+			m_program.compiled_srt_roots.push_back(root(read.value));
+		}
+		m_program.compiled_source_roots.assign(m_program.descriptor_sources.size(), {});
+		for (size_t s = 0; s < m_program.descriptor_sources.size(); s++) {
+			const auto& source = m_program.descriptor_sources[s];
+			for (uint32_t d = 0; d < source.dword_count && d < 8u; d++) {
+				m_program.compiled_source_roots[s][d] = root(source.dwords[d]);
+			}
+		}
 		for (const auto& stored: m_program.value_storage) {
 			const auto index = stored.AssignedEvaluationIndex();
 			if (index == UINT32_MAX || index >= count) {
@@ -670,36 +743,7 @@ private:
 			if (disabled) {
 				continue;
 			}
-			const auto compile = [&](Value value) {
-				CompiledEvalOperand operand;
-				value = value.Resolve();
-				if (value.IsImmediate()) {
-					operand.kind = CompiledEvalOperand::Immediate;
-					switch (value.GetType()) {
-						case Type::U1: operand.imm = value.U1(); break;
-						case Type::U8: operand.imm = value.U8(); break;
-						case Type::U16: operand.imm = value.U16(); break;
-						case Type::U32: operand.imm = value.U32(); break;
-						case Type::U64: operand.imm = value.U64(); break;
-						case Type::F32: operand.imm = std::bit_cast<uint32_t>(value.F32Value()); break;
-						default: operand.kind = CompiledEvalOperand::Invalid; break;
-					}
-					return operand;
-				}
-				const auto* source = value.TryInstruction();
-				if (source == nullptr) {
-					return operand; // Invalid
-				}
-				const auto source_index = source->AssignedEvaluationIndex();
-				if (source_index != UINT32_MAX && source_index < count) {
-					operand.kind = CompiledEvalOperand::Node;
-					operand.node = source_index;
-				} else {
-					operand.kind  = CompiledEvalOperand::Generic;
-					operand.value = value;
-				}
-				return operand;
-			};
+			const auto compile = [&](Value value) { return CompileOperand(value, count); };
 			const auto args = stored.NumArgs();
 			if (IsFastOp(node.op) && args <= node.operands.size()) {
 				node.fast = true;
@@ -1529,7 +1573,9 @@ bool EvaluateRuntimeSourcesImpl(const ResourcePlan& program, std::span<const uin
                                 std::vector<uint32_t>& flat, bool evaluate_flat,
                                 std::span<const uint8_t> clean_flat_slots,
                                 std::vector<uint8_t>&    active_sources) {
-	const auto t_eval_start = std::chrono::steady_clock::now();
+	static const bool split_timing = std::getenv("KYTY_SAMPLE_GPU") != nullptr;
+	const auto t_eval_start = split_timing ? std::chrono::steady_clock::now()
+	                                       : std::chrono::steady_clock::time_point {};
 	t_srt_failure.clear();
 	if (!program.srt_plan_complete) {
 		return false;
@@ -1587,8 +1633,14 @@ bool EvaluateRuntimeSourcesImpl(const ResourcePlan& program, std::span<const uin
 		DescriptorValue value;
 		value.dword_count = source->dword_count;
 		if (!evaluate_flat || active[source_index]) {
+			evaluator.Prepare();
+			const bool compiled = source_index < program.compiled_source_roots.size();
 			for (uint32_t index = 0; index < source->dword_count; index++) {
-				if (!evaluator.Evaluate(source->dwords[index], value.dwords[index])) {
+				const bool ok = compiled && index < 8u
+				                    ? evaluator.EvaluateRoot(program.compiled_source_roots[source_index][index],
+				                                             value.dwords[index])
+				                    : evaluator.Evaluate(source->dwords[index], value.dwords[index]);
+				if (!ok) {
 					return false;
 				}
 			}
@@ -1625,7 +1677,11 @@ bool EvaluateRuntimeSourcesImpl(const ResourcePlan& program, std::span<const uin
 	};
 	if (evaluate_flat) {
 		flattened.resize(program.srt_reads.size());
-		for (const auto& read: program.srt_reads) {
+		evaluator.Prepare();
+		clean_evaluator.Prepare();
+		const bool compiled_roots = program.compiled_srt_roots.size() == program.srt_reads.size();
+		for (size_t read_index = 0; read_index < program.srt_reads.size(); read_index++) {
+			const auto& read = program.srt_reads[read_index];
 			if (read.gpu) {
 				// The shader loads this slot itself.
 				continue;
@@ -1634,7 +1690,9 @@ bool EvaluateRuntimeSourcesImpl(const ResourcePlan& program, std::span<const uin
 			                      clean_flat_slots[read.flat_offset] != 0u;
 			auto&      selected = clean ? clean_evaluator : evaluator;
 			if (read.flat_offset >= flattened.size() ||
-			    !selected.Evaluate(read.value, flattened[read.flat_offset])) {
+			    !(compiled_roots ? selected.EvaluateRoot(program.compiled_srt_roots[read_index],
+			                                             flattened[read.flat_offset])
+			                     : selected.Evaluate(read.value, flattened[read.flat_offset]))) {
 				return false;
 			}
 		}

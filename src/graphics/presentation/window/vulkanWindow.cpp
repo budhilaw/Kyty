@@ -1097,6 +1097,12 @@ void WindowContext::CreateVulkan() {
 			graphic_ctx.checkpoints_enabled = true;
 			Libs::Graphics::SetGpuCheckpointsEnabled(true);
 		}
+		// Guest memory imported as GPU memory: buffers bound straight onto guest pages need no
+		// upload, dirty tracking or readback (KYTY_HOST_BUFFERS).
+		if (HasExtension(available_extensions, VK_EXT_EXTERNAL_MEMORY_HOST_EXTENSION_NAME)) {
+			device_extensions.push_back(VK_EXT_EXTERNAL_MEMORY_HOST_EXTENSION_NAME);
+			graphic_ctx.external_memory_host = true;
+		}
 		if (HasExtension(available_extensions, VK_EXT_DEVICE_FAULT_EXTENSION_NAME)) {
 			device_extensions.push_back(VK_EXT_DEVICE_FAULT_EXTENSION_NAME);
 			graphic_ctx.device_fault_enabled = true;

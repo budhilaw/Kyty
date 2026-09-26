@@ -120,6 +120,15 @@ Buffer::Buffer(GraphicContext& graphics, CommandScheduler& scheduler, MemoryUsag
 	}
 }
 
+Buffer::Buffer(GraphicContext& graphics, CommandScheduler& scheduler, uint64_t cpu_address,
+               uint64_t size, vk::Buffer host_buffer, vk::DeviceAddress device_address)
+    : m_graphics(&graphics), m_scheduler(&scheduler), m_usage(MemoryUsage::DeviceLocal),
+      m_cpu_address(cpu_address), m_device_address(device_address), m_buffer(host_buffer),
+      m_size(size), m_coherent(true), m_host_backed(true) {
+	std::lock_guard lock(g_live_buffers_mutex);
+	g_live_buffers[static_cast<VkBuffer>(host_buffer)] = size;
+}
+
 static void CheckLiveBuffer(const Buffer& buffer, const char* role, uint64_t needed) {
 	std::lock_guard lock(g_live_buffers_mutex);
 	const auto      found = g_live_buffers.find(static_cast<VkBuffer>(buffer.Handle()));
@@ -141,7 +150,9 @@ Buffer::~Buffer() {
 		std::lock_guard lock(g_live_buffers_mutex);
 		g_live_buffers.erase(static_cast<VkBuffer>(m_buffer));
 	}
-	if (m_buffer != nullptr) {
+	if (m_host_backed) {
+		m_graphics->device.destroyBuffer(m_buffer, nullptr);
+	} else if (m_buffer != nullptr) {
 		vmaDestroyBuffer(m_graphics->allocator, m_buffer, m_allocation);
 	}
 }

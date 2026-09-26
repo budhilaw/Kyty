@@ -103,6 +103,12 @@ public:
 	// Uploads the CPU-modified pages of many ranges (sorted, disjoint): one tracker lock and
 	// protection update per region, one staging upload and copy per buffer.
 	void SynchronizeRangesBatch(std::span<const std::pair<uint64_t, uint64_t>> ranges);
+	// Guest memory a host-backed buffer covers is shared with the GPU: a CPU read of what earlier
+	// GPU work in the stream wrote must wait for that work (KYTY_HOST_BUFFERS).
+	void WaitHostWrites(uint64_t vaddr, uint64_t size);
+	// A raw-pointer pass was recorded: it may write any host-backed page.
+	void NoteRawWriteDispatch();
+	[[nodiscard]] bool HostBuffersEnabled() const noexcept { return m_host_buffers; }
 	// Uploads between these share one barrier pair instead of two barriers per buffer.
 	void BeginUploadBatch();
 	void EndUploadBatch();
@@ -137,7 +143,9 @@ private:
 	void TouchBuffer(const Buffer& buffer);
 	[[nodiscard]] OverlapResult ResolveOverlaps(uint64_t vaddr, uint64_t size);
 	void JoinOverlap(BufferId new_id, BufferId overlap_id, bool accumulate_stream_score);
-	[[nodiscard]] BufferId CreateBuffer(uint64_t vaddr, uint64_t size);
+	[[nodiscard]] BufferId CreateBuffer(uint64_t vaddr, uint64_t size, bool host = false);
+	// Rebinds a frequently rewritten buffer onto guest memory; returns the buffer now covering it.
+	BufferId PromoteToHost(BufferId id);
 	void                   Register(BufferId id);
 	void Unregister(BufferId id);
 	template <bool insert>
@@ -218,6 +226,24 @@ private:
 	// CPU read faults per 4 KiB page; pages the game polls (frame markers) get readbacks.
 	std::unordered_map<uint64_t, uint32_t> m_read_fault_counts;
 	std::unordered_set<uint64_t>           m_raw_write_pages; // 4 KiB pages
+	// KYTY_HOST_BUFFERS: guest memory imported in chunks of HostChunkSize, buffers bound onto it.
+	struct HostChunk {
+		vk::DeviceMemory memory = nullptr;
+		uint64_t         size   = 0;
+		uint32_t         type   = 0;
+		bool             failed = false;
+	};
+	static constexpr uint64_t HostChunkSize = 256ull * 1024 * 1024;
+	// Uploads after which a CPU-rewritten buffer is moved onto guest memory, and the largest size.
+	static constexpr uint32_t HostPromoteUploads = 8;
+	static constexpr uint64_t HostPromoteMaxSize = 64ull * 1024 * 1024;
+	[[nodiscard]] vk::Buffer CreateHostBuffer(uint64_t vaddr, uint64_t size, vk::DeviceAddress& address);
+	HostChunk* ImportHostChunk(uint64_t index);
+	// Copies the GPU's current bytes of a range into guest memory now (waits for the GPU).
+	void ForceReadback(uint64_t vaddr, uint64_t size);
+	bool                                   m_host_buffers = false;
+	std::unordered_map<uint64_t, HostChunk> m_host_chunks;
+	uint64_t                               m_raw_write_tick = 0;
 	bool                                   m_upload_batch       = false;
 	bool                                   m_upload_batch_began = false;
 	MemoryTracker                                     m_memory_tracker;

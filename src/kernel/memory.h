@@ -109,6 +109,9 @@ void                   RegisterCallbacks(callback_func_t alloc_func, callback_fu
 void                   SetFlexibleMemorySize(uint64_t size);
 bool                   TryWriteBacking(uint64_t vaddr, const void* data, uint64_t size);
 bool                   TryReadBacking(uint64_t vaddr, void* data, uint64_t size);
+// The direct-memory backing: offset of a guest range one mapping covers, and the alias base.
+bool     FindBackingSpan(uint64_t vaddr, uint64_t size, uint64_t* backing_offset);
+uint8_t* BackingBase(uint64_t* size);
 bool                   ReadGpuBackingOrDownload(uint64_t vaddr, void* data, uint64_t size);
 // Called at each flip; KYTY_TABLE_SYNC refreshes GPU-built tables once per frame.
 void                   NoteGpuFrame();

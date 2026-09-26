@@ -478,6 +478,27 @@ public:
 		return true;
 	}
 
+	// Where one mapping backs a guest range: its offset in the backing (the writable alias is at
+	// BackingBase()). Used to bind GPU buffers straight onto guest memory.
+	bool FindBackingSpan(uint64_t vaddr, uint64_t size, uint64_t* backing_offset) {
+		if (!IsAvailable() || size == 0 || UINT64_MAX - vaddr < size || backing_offset == nullptr) {
+			return false;
+		}
+		std::lock_guard lock(m_mutex);
+		MapEntry        entry {};
+		if (!FindContainingUnlocked(vaddr, size, &entry)) {
+			return false;
+		}
+		const auto offset = entry.backing_offset + vaddr - entry.vaddr;
+		if (!RangeOk(offset, size)) {
+			return false;
+		}
+		*backing_offset = offset;
+		return true;
+	}
+	[[nodiscard]] uint8_t* BackingBase() const { return m_backing_base; }
+	[[nodiscard]] uint64_t BackingSize() const { return m_size; }
+
 private:
 	template <typename Transfer>
 	bool TryTransferBacking(uint64_t vaddr, uint64_t size, Transfer transfer) {
@@ -785,6 +806,12 @@ public:
 	}
 
 	bool BackingContains(uint64_t vaddr, uint64_t size) { return m_backing->Contains(vaddr, size); }
+
+	bool FindBackingSpan(uint64_t vaddr, uint64_t size, uint64_t* backing_offset) {
+		return m_backing->FindBackingSpan(vaddr, size, backing_offset);
+	}
+	[[nodiscard]] uint8_t* BackingBase() const { return m_backing->BackingBase(); }
+	[[nodiscard]] uint64_t BackingSize() const { return m_backing->BackingSize(); }
 
 	bool Protect(uint64_t vaddr, uint64_t size, VirtualMemory::Mode mode) {
 		if (size == 0 || UINT64_MAX - vaddr < size) {

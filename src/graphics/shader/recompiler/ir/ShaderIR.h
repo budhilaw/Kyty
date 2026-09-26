@@ -586,6 +586,10 @@ struct ResourcePlan {
 	mutable size_t evaluation_numbered = SIZE_MAX;
 	// One node per evaluation index, rebuilt whenever the values are numbered.
 	mutable std::vector<CompiledEvalNode> compiled_eval;
+	// Roots evaluated for every draw, compiled with the nodes: each SRT read and each dword of
+	// each descriptor source.
+	mutable std::vector<CompiledEvalOperand>                compiled_srt_roots;
+	mutable std::vector<std::array<CompiledEvalOperand, 8>> compiled_source_roots;
 	std::vector<MemoryInfo>             memory_info;
 	std::vector<DescriptorSource>       descriptor_sources;
 	std::vector<ResourceBlock>          control_flow;

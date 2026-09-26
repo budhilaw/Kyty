@@ -200,6 +200,9 @@ void BufferCache::DeleteBuffer(BufferId id) {
 }
 
 bool BufferCache::DownloadBufferMemory(Buffer& buffer, uint64_t vaddr, uint64_t size) {
+	if (buffer.IsHostBacked()) {
+		return false;
+	}
 	{
 		// A GPU-modified range can span several buffers; only this buffer's part is copied
 		// from it, or the copy would read past its end.
@@ -312,6 +315,12 @@ BufferCache::BufferCache(GraphicContext& graphics, CommandScheduler& scheduler,
 	    m_slot_buffers.insert(m_graphics, m_scheduler, MemoryUsage::DeviceLocal, 0, AllFlags, 16);
 	EXIT_IF(null_id != NULL_BUFFER_ID);
 	SetVulkanObjectNameF(m_graphics.device, GetBuffer(null_id).Handle(), "Kyty.NullBuffer");
+	// Buffers the CPU keeps rewriting are bound onto guest memory itself (imported host memory):
+	// no uploads, dirty-page walks or readbacks for them. KYTY_NO_HOST_BUFFERS=1 disables.
+	m_host_buffers = m_graphics.external_memory_host && std::getenv("KYTY_NO_HOST_BUFFERS") == nullptr;
+	if (m_host_buffers) {
+		LOGF("HOSTBUF: buffers are bound onto guest memory\n");
+	}
 	InitializeReadbackQueue();
 	if (!m_graphics.CanReportMemoryUsage()) {
 		return;
@@ -702,26 +711,34 @@ void BufferCache::ReadMemory(uint64_t vaddr, uint64_t size, bool is_write) {
 		if (is_write && !IsRegionRegistered(vaddr, size)) {
 			return;
 		}
-		// A read of data that a prefetch already has in flight only waits for that download.
-		if (!m_gpu_modified_ranges.Intersects(vaddr, size) && TryWaitPendingDownload(vaddr, size)) {
-			if (is_write) {
-				SnapshotPagesForWrite(vaddr, size);
-				m_memory_tracker.MarkRegionAsCpuModified(vaddr, size);
-			}
-			return;
-		}
-		auto& buffer = m_slot_buffers[FindBuffer(vaddr, size)];
+		// Game threads earn readbacks by polling a page. Writing back for the emulator's own
+		// reads (descriptor tables, DCC codes) brought the corruption back and cost frames.
+		// Counted before the prefetch shortcut below: reads it served were never counted, so a
+		// page whose first reads hit prefetches never became polled, its GPU results never reached
+		// guest memory, and the game culled the Uncharted selector's scene (the blob).
+		bool polled = true;
 		if (!is_write) {
 			std::lock_guard lock(m_snapshot_mutex);
 			if (m_read_fault_counts.size() > 65536) {
 				m_read_fault_counts.clear();
 			}
-			// Game threads earn readbacks by polling a page. Writing back for the emulator's own
-			// reads (descriptor tables, DCC codes) brought the corruption back and cost frames.
 			for (auto page = vaddr & ~uint64_t {4095}; page < vaddr + size; page += 4096) {
+				polled = polled && m_read_fault_counts[page] >= 4u;
 				m_read_fault_counts[page]++;
 			}
 		}
+		// A read of data that a prefetch already has in flight only waits for that download.
+		if (!m_gpu_modified_ranges.Intersects(vaddr, size) && TryWaitPendingDownload(vaddr, size)) {
+			if (is_write) {
+				SnapshotPagesForWrite(vaddr, size);
+				m_memory_tracker.MarkRegionAsCpuModified(vaddr, size);
+			} else if (!polled) {
+				// The prefetch skipped this not-yet-polled page when it landed: fetch it again.
+				ForceReadback(vaddr, size);
+			}
+			return;
+		}
+		auto& buffer = m_slot_buffers[FindBuffer(vaddr, size)];
 		if (!is_write && TryImmediateReadback(buffer, vaddr, size)) {
 			return;
 		}
@@ -835,6 +852,46 @@ void BufferCache::RetirePendingDownloads(bool wait_all) {
 		NoteDownloaded(it->begin, it->size);
 		it = m_pending_downloads.erase(it);
 	}
+}
+
+void BufferCache::ForceReadback(uint64_t vaddr, uint64_t size) {
+	const auto* owner = m_page_table.Find(vaddr >> PageTable::kPageBits);
+	if (owner == nullptr || !*owner) {
+		return;
+	}
+	auto& buffer = m_slot_buffers[*owner];
+	if (buffer.IsHostBacked()) {
+		return;
+	}
+	const auto begin = std::max(vaddr & ~uint64_t {4095}, buffer.CpuAddress());
+	const auto end = std::min((vaddr + size + 4095u) & ~uint64_t {4095}, buffer.CpuAddress() + buffer.Size());
+	if (begin >= end) {
+		return;
+	}
+	const auto bytes             = end - begin;
+	const auto [mapped, offset] = m_download_buffer.Map(bytes, 64);
+	if (mapped == nullptr) {
+		return;
+	}
+	m_download_buffer.Commit();
+	auto& command = m_scheduler.Current();
+	command.EndRendering();
+	const auto        native = command.Handle();
+	vk::MemoryBarrier before {};
+	before.srcAccessMask = vk::AccessFlagBits::eMemoryWrite;
+	before.dstAccessMask = vk::AccessFlagBits::eTransferRead;
+	native.pipelineBarrier(vk::PipelineStageFlagBits::eAllCommands, vk::PipelineStageFlagBits::eTransfer,
+	                       {}, 1, &before, 0, nullptr, 0, nullptr);
+	const vk::BufferCopy copy {buffer.Offset(begin), offset, bytes};
+	native.copyBuffer(buffer.Handle(), m_download_buffer.Handle(), 1, &copy);
+	vk::MemoryBarrier after {};
+	after.srcAccessMask = vk::AccessFlagBits::eTransferWrite;
+	after.dstAccessMask = vk::AccessFlagBits::eHostRead;
+	native.pipelineBarrier(vk::PipelineStageFlagBits::eTransfer, vk::PipelineStageFlagBits::eHost, {}, 1,
+	                       &after, 0, nullptr, 0, nullptr);
+	m_scheduler.Wait(m_scheduler.CurrentTick());
+	m_download_buffer.Invalidate(offset, bytes);
+	WriteBackMerged(begin, mapped, bytes);
 }
 
 bool BufferCache::TryWaitPendingDownload(uint64_t vaddr, uint64_t size) {
@@ -1009,12 +1066,171 @@ void BufferCache::JoinOverlap(BufferId new_id, BufferId overlap_id, bool accumul
 	}
 	if (Libs::Graphics::LabelTraceEnabled()) TraceArgs("join", overlap.CpuAddress(), overlap.Size(),
 	          fmt::format("into buffer=0x{:x}+0x{:x}", new_buffer.CpuAddress(), new_buffer.Size()));
-	new_buffer.CopyFrom(m_scheduler.Current(), overlap, 0,
-	                    overlap.CpuAddress() - new_buffer.CpuAddress(), overlap.Size());
+	if (new_buffer.IsHostBacked()) {
+		// Both views of guest memory: a host-backed old buffer holds the same bytes, and a
+		// device-local one only contributes what the GPU wrote there (its other bytes are stale
+		// next to the guest's).
+		if (!overlap.IsHostBacked()) {
+			const auto begin = overlap.CpuAddress();
+			m_gpu_modified_ranges.ForEachInRange(begin, overlap.Size(), [&](uint64_t start, uint64_t end) {
+				new_buffer.CopyFrom(m_scheduler.Current(), overlap, start - begin,
+				                    start - new_buffer.CpuAddress(), end - start);
+			});
+			m_gpu_modified_ranges.Subtract(begin, overlap.Size());
+			m_memory_tracker.UnmarkRegionAsGpuModified(begin, overlap.Size());
+		}
+	} else {
+		new_buffer.CopyFrom(m_scheduler.Current(), overlap, 0,
+		                    overlap.CpuAddress() - new_buffer.CpuAddress(), overlap.Size());
+	}
 	DeleteBuffer(overlap_id);
 }
 
-BufferId BufferCache::CreateBuffer(uint64_t vaddr, uint64_t size) {
+BufferCache::HostChunk* BufferCache::ImportHostChunk(uint64_t index) {
+	auto& chunk = m_host_chunks[index];
+	if (chunk.memory || chunk.failed) {
+		return chunk.failed ? nullptr : &chunk;
+	}
+	chunk.failed          = true;
+	uint64_t   total      = 0;
+	auto*      base       = Libs::LibKernel::Memory::BackingBase(&total);
+	const auto begin      = index * HostChunkSize;
+	if (base == nullptr || begin >= total) {
+		return nullptr;
+	}
+	const auto size = std::min(HostChunkSize, total - begin) & ~uint64_t {0xffff};
+	if (size == 0) {
+		return nullptr;
+	}
+	void* pointer = base + begin;
+	vk::MemoryHostPointerPropertiesEXT properties {};
+	if (m_graphics.device.getMemoryHostPointerPropertiesEXT(
+	        vk::ExternalMemoryHandleTypeFlagBits::eHostAllocationEXT, pointer, &properties) !=
+	        vk::Result::eSuccess ||
+	    properties.memoryTypeBits == 0) {
+		LOGF("HOSTBUF: guest memory at +0x%" PRIx64 " cannot be imported\n", begin);
+		return nullptr;
+	}
+	const auto memory_properties = m_graphics.physical_device.getMemoryProperties();
+	uint32_t   type              = UINT32_MAX;
+	for (uint32_t i = 0; i < memory_properties.memoryTypeCount; i++) {
+		if ((properties.memoryTypeBits & (1u << i)) == 0) {
+			continue;
+		}
+		const auto flags = memory_properties.memoryTypes[i].propertyFlags;
+		if (type == UINT32_MAX || (flags & vk::MemoryPropertyFlagBits::eHostCoherent)) {
+			type = i;
+		}
+	}
+	vk::ImportMemoryHostPointerInfoEXT import_info {};
+	import_info.handleType   = vk::ExternalMemoryHandleTypeFlagBits::eHostAllocationEXT;
+	import_info.pHostPointer = pointer;
+	vk::MemoryAllocateFlagsInfo flags_info {};
+	flags_info.flags = vk::MemoryAllocateFlagBits::eDeviceAddress;
+	flags_info.pNext = &import_info;
+	vk::MemoryAllocateInfo allocate {};
+	allocate.pNext           = &flags_info;
+	allocate.allocationSize  = size;
+	allocate.memoryTypeIndex = type;
+	vk::DeviceMemory memory {};
+	if (m_graphics.device.allocateMemory(&allocate, nullptr, &memory) != vk::Result::eSuccess) {
+		LOGF("HOSTBUF: importing guest memory +0x%" PRIx64 " size 0x%" PRIx64 " failed\n", begin,
+		     size);
+		return nullptr;
+	}
+	chunk = {memory, size, type, false};
+	LOGF("HOSTBUF: imported guest memory +0x%" PRIx64 " size 0x%" PRIx64 " type %u\n", begin, size,
+	     type);
+	return &chunk;
+}
+
+vk::Buffer BufferCache::CreateHostBuffer(uint64_t vaddr, uint64_t size, vk::DeviceAddress& address) {
+	uint64_t offset = 0;
+	if (!Libs::LibKernel::Memory::FindBackingSpan(vaddr, size, &offset)) {
+		return nullptr;
+	}
+	const auto index = offset / HostChunkSize;
+	if (offset + size > (index + 1) * HostChunkSize) {
+		return nullptr;
+	}
+	auto* chunk = ImportHostChunk(index);
+	if (chunk == nullptr) {
+		return nullptr;
+	}
+	const auto memory_offset = offset - index * HostChunkSize;
+	if (memory_offset + size > chunk->size) {
+		return nullptr;
+	}
+	vk::ExternalMemoryBufferCreateInfo external {};
+	external.handleTypes = vk::ExternalMemoryHandleTypeFlagBits::eHostAllocationEXT;
+	vk::BufferCreateInfo info {};
+	info.pNext = &external;
+	info.size  = size;
+	info.usage = AllFlags | vk::BufferUsageFlagBits::eShaderDeviceAddress;
+	vk::Buffer buffer {};
+	if (m_graphics.device.createBuffer(&info, nullptr, &buffer) != vk::Result::eSuccess) {
+		return nullptr;
+	}
+	const auto requirements = m_graphics.device.getBufferMemoryRequirements(buffer);
+	if ((requirements.memoryTypeBits & (1u << chunk->type)) == 0 ||
+	    memory_offset % std::max<uint64_t>(requirements.alignment, 1) != 0 ||
+	    memory_offset + requirements.size > chunk->size ||
+	    m_graphics.device.bindBufferMemory(buffer, chunk->memory, memory_offset) !=
+	        vk::Result::eSuccess) {
+		m_graphics.device.destroyBuffer(buffer, nullptr);
+		return nullptr;
+	}
+	vk::BufferDeviceAddressInfo address_info {};
+	address_info.buffer = buffer;
+	address             = m_graphics.device.getBufferAddress(address_info);
+	return buffer;
+}
+
+void BufferCache::WaitHostWrites(uint64_t vaddr, uint64_t size) {
+	if (!m_host_buffers || size == 0) {
+		return;
+	}
+	const auto* owner = m_page_table.Find(vaddr >> PageTable::kPageBits);
+	if (owner == nullptr || !*owner || !m_slot_buffers[*owner].IsHostBacked()) {
+		return;
+	}
+	uint64_t tick = std::max(m_raw_write_tick, m_unbounded_write_tick);
+	for (auto block = vaddr >> 16; block <= (vaddr + size - 1) >> 16; block++) {
+		if (const auto it = m_gpu_write_ticks.find(block); it != m_gpu_write_ticks.end()) {
+			tick = std::max(tick, it->second);
+		}
+	}
+	if (tick == 0) {
+		return;
+	}
+	m_scheduler.GetMasterSemaphore().Refresh();
+	if (!m_scheduler.IsFree(tick)) {
+		m_scheduler.Wait(tick);
+	}
+}
+
+void BufferCache::NoteRawWriteDispatch() {
+	m_raw_write_tick = m_scheduler.CurrentTick();
+}
+
+BufferId BufferCache::PromoteToHost(BufferId id) {
+	auto&      buffer = m_slot_buffers[id];
+	const auto vaddr  = buffer.CpuAddress();
+	const auto size   = buffer.Size();
+	const auto next   = CreateBuffer(vaddr, size, true);
+	auto&      result = m_slot_buffers[next];
+	if (!result.IsHostBacked()) {
+		result.host_failed = true;
+	} else {
+		static std::atomic<uint32_t> log_count {0};
+		if (log_count.fetch_add(1) < 64) {
+			LOGF("HOSTBUF: promoted 0x%010" PRIx64 " size 0x%" PRIx64 "\n", result.CpuAddress(), result.Size());
+		}
+	}
+	return next;
+}
+
+BufferId BufferCache::CreateBuffer(uint64_t vaddr, uint64_t size, bool host) {
 	EXIT_IF(m_scheduler.Current().IsInvalid());
 	const auto end = Common::AlignUp(vaddr + size, CACHING_PAGESIZE);
 	vaddr = Common::AlignDown(vaddr, CACHING_PAGESIZE);
@@ -1022,9 +1238,21 @@ BufferId BufferCache::CreateBuffer(uint64_t vaddr, uint64_t size) {
 	const auto overlap = ResolveOverlaps(vaddr, size);
 
 	TraceArgs("create", overlap.begin, overlap.end - overlap.begin, "");
-	const auto id = m_slot_buffers.insert(
-	    m_graphics, m_scheduler, MemoryUsage::DeviceLocal, overlap.begin,
-	    AllFlags | vk::BufferUsageFlagBits::eShaderDeviceAddress, overlap.end - overlap.begin);
+	// A promoted buffer that a new request overlaps stays on guest memory.
+	for (auto it = overlap.first; it != overlap.last && !host; ++it) {
+		host = m_slot_buffers[it->second].IsHostBacked();
+	}
+	vk::DeviceAddress host_address = 0;
+	const vk::Buffer  host_buffer =
+	    m_host_buffers && host ? CreateHostBuffer(overlap.begin, overlap.end - overlap.begin, host_address)
+	                   : vk::Buffer {};
+	const auto id =
+	    host_buffer ? m_slot_buffers.insert(m_graphics, m_scheduler, overlap.begin,
+	                                        overlap.end - overlap.begin, host_buffer, host_address)
+	                : m_slot_buffers.insert(m_graphics, m_scheduler, MemoryUsage::DeviceLocal,
+	                                        overlap.begin,
+	                                        AllFlags | vk::BufferUsageFlagBits::eShaderDeviceAddress,
+	                                        overlap.end - overlap.begin);
 	const auto& buffer = m_slot_buffers[id];
 	SetVulkanObjectNameF(m_graphics.device, buffer.Handle(),
 	                     "Kyty.GameBuffer[guest=0x{:016x} size=0x{:x}]", overlap.begin,
@@ -1345,6 +1573,13 @@ void BufferCache::AppendUploadCopies(Buffer& buffer, uint64_t address, uint64_t 
 
 bool BufferCache::SynchronizeBuffer(Buffer& buffer, uint64_t vaddr, uint64_t size, bool is_written,
                                     bool is_texel_buffer) {
+	if (buffer.IsHostBacked()) {
+		// Guest memory itself: nothing to upload, and GPU writes need no tracking.
+		if (is_texel_buffer && !is_written) {
+			return SynchronizeBufferFromImage(buffer, vaddr, size);
+		}
+		return false;
+	}
 	std::vector<vk::BufferCopy> copies;
 	uint64_t                    total_size = 0;
 	vk::Buffer                  source;
@@ -1356,6 +1591,9 @@ bool BufferCache::SynchronizeBuffer(Buffer& buffer, uint64_t vaddr, uint64_t siz
 		    AppendUploadCopies(buffer, address, bytes, copies, total_size);
 	    },
 	    [&]() noexcept { source = UploadCopies(buffer, copies, total_size); });
+	if (source) {
+		buffer.upload_count++;
+	}
 	if (const auto upload = source ? m_scheduler.UploadCommand() : vk::CommandBuffer {}; upload) {
 		// Recorded ahead of this submission: the current render pass stays open.
 		upload.copyBuffer(source, buffer.Handle(), static_cast<uint32_t>(copies.size()),
@@ -1475,7 +1713,10 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBuffer(uint64_t vaddr, uint64_t 
 	          fmt::format("written={} texel={} cpu_dirty={} gpu_dirty={}", is_written, is_texel_buffer,
 	                      m_memory_tracker.IsRegionCpuModified(vaddr, size),
 	                      m_memory_tracker.IsRegionGpuModified(vaddr, size)));
-	if (!is_written && size <= CACHING_PAGESIZE &&
+	const auto* host_owner = m_host_buffers ? m_page_table.Find(vaddr >> PageTable::kPageBits) : nullptr;
+	const bool  host_page  = host_owner != nullptr && *host_owner && m_slot_buffers[*host_owner].IsHostBacked() &&
+	                        m_slot_buffers[*host_owner].IsInBounds(vaddr, size);
+	if (!host_page && !is_written && size <= CACHING_PAGESIZE &&
 	    !m_memory_tracker.IsRegionGpuModified(vaddr, size) &&
 	    m_memory_tracker.IsRegionCpuModified(vaddr, size)) {
 		const auto alignment = std::max<uint64_t>(
@@ -1491,13 +1732,24 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBuffer(uint64_t vaddr, uint64_t 
 	if (IsBufferInvalid(id) || !m_slot_buffers[id].IsInBounds(vaddr, size)) {
 		id = FindBuffer(vaddr, size);
 	}
+	// A buffer the CPU keeps rewriting moves onto guest memory: no more uploads or dirty-page
+	// walks for it. GPU-written and texel buffers stay in video memory.
+	if (m_host_buffers && !is_written && !is_texel_buffer) {
+		const auto& candidate = m_slot_buffers[id];
+		if (!candidate.IsHostBacked() && !candidate.host_failed && candidate.upload_count >= HostPromoteUploads &&
+		    candidate.Size() <= HostPromoteMaxSize) {
+			id = PromoteToHost(id);
+		}
+	}
 	auto& buffer = m_slot_buffers[id];
 	TouchBuffer(buffer);
 	if (Libs::Graphics::LabelTraceEnabled()) TraceArgs("obtain-buffer", vaddr, size,
 	          fmt::format("buffer=0x{:x}+0x{:x}", buffer.CpuAddress(), buffer.Size()));
 	(void)SynchronizeBuffer(buffer, vaddr, size, is_written, is_texel_buffer);
 	if (is_written) {
-		m_gpu_modified_ranges.Add(vaddr, size);
+		if (!buffer.IsHostBacked()) {
+			m_gpu_modified_ranges.Add(vaddr, size);
+		}
 		const auto tick = m_scheduler.CurrentTick();
 		if (size <= 4 * MiB) {
 			for (auto block = vaddr >> 16; block <= (vaddr + size - 1) >> 16; block++) {
@@ -1818,7 +2070,7 @@ void BufferCache::SynchronizeRangesBatch(std::span<const std::pair<uint64_t, uin
 			const auto& buffer = m_slot_buffers[it->second];
 			const auto  start  = std::max(buffer.CpuAddress(), vaddr);
 			const auto  finish = std::min(buffer.CpuAddress() + buffer.Size(), end);
-			if (start >= finish) {
+			if (start >= finish || buffer.IsHostBacked()) {
 				continue;
 			}
 			if (groups.empty() || groups.back().id != it->second) {
@@ -1850,6 +2102,8 @@ void BufferCache::SynchronizeRangesBatch(std::span<const std::pair<uint64_t, uin
 		    auto& group = groups[piece_group[index]];
 		    AppendUploadCopies(m_slot_buffers[group.id], address, bytes, group.copies, group.total);
 	    });
+	thread_local std::vector<BufferId> promote;
+	promote.clear();
 	bool began = false;
 	for (auto& group: groups) {
 		if (group.copies.empty()) {
@@ -1859,6 +2113,11 @@ void BufferCache::SynchronizeRangesBatch(std::span<const std::pair<uint64_t, uin
 		const auto source = UploadCopies(buffer, group.copies, group.total);
 		if (!source) {
 			continue;
+		}
+		buffer.upload_count++;
+		if (m_host_buffers && !buffer.IsHostBacked() && !buffer.host_failed &&
+		    buffer.upload_count >= HostPromoteUploads && buffer.Size() <= HostPromoteMaxSize) {
+			promote.push_back(group.id);
 		}
 		if (const auto upload = m_scheduler.UploadCommand(); upload) {
 			// Ahead of this submission, outside any render pass.
@@ -1890,6 +2149,12 @@ void BufferCache::SynchronizeRangesBatch(std::span<const std::pair<uint64_t, uin
 		m_scheduler.Current().Handle().pipelineBarrier(
 		    vk::PipelineStageFlagBits::eTransfer, vk::PipelineStageFlagBits::eAllCommands, {}, 1,
 		    &barrier, 0, nullptr, 0, nullptr);
+	}
+	// Buffers the walk keeps re-uploading move onto guest memory.
+	for (const auto id: std::vector<BufferId>(promote)) {
+		if (!IsBufferInvalid(id) && !m_slot_buffers[id].is_deleted) {
+			(void)PromoteToHost(id);
+		}
 	}
 }
 

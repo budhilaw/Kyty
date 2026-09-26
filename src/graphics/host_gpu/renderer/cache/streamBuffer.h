@@ -39,7 +39,12 @@ class Buffer {
 public:
 	Buffer(GraphicContext& graphics, CommandScheduler& scheduler, MemoryUsage usage,
 	       uint64_t cpu_address, vk::BufferUsageFlags flags, uint64_t size);
+	// A buffer bound onto imported guest memory (the memory is owned by the buffer cache).
+	Buffer(GraphicContext& graphics, CommandScheduler& scheduler, uint64_t cpu_address,
+	       uint64_t size, vk::Buffer host_buffer, vk::DeviceAddress device_address);
 	~Buffer();
+	// Bound straight onto guest memory: CPU and GPU share its bytes (no upload or readback).
+	[[nodiscard]] bool IsHostBacked() const noexcept { return m_host_backed; }
 	KYTY_CLASS_NO_COPY(Buffer);
 
 	[[nodiscard]] vk::Buffer         Handle() const noexcept { return m_buffer; }
@@ -73,6 +78,10 @@ public:
 	bool   is_deleted   = false;
 	int    stream_score = 0;
 	size_t lru_id       = 0;
+	// Uploads of CPU-written data (KYTY_HOST_BUFFERS promotes a frequently rewritten buffer onto
+	// guest memory), and whether that was tried and failed.
+	uint32_t upload_count = 0;
+	bool     host_failed  = false;
 
 protected:
 	[[nodiscard]] GraphicContext&   Graphics() const noexcept { return *m_graphics; }
@@ -92,6 +101,7 @@ private:
 	VmaAllocation                 m_allocation = nullptr;
 	uint64_t                      m_size;
 	bool                          m_coherent = false;
+	bool                          m_host_backed = false;
 	std::span<uint8_t>            m_mapped;
 };
 

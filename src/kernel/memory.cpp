@@ -897,6 +897,21 @@ bool TryReadBacking(uint64_t vaddr, void* data, uint64_t size) {
 	       g_guest_address_space->TryReadBacking(vaddr, data, size);
 }
 
+bool FindBackingSpan(uint64_t vaddr, uint64_t size, uint64_t* backing_offset) {
+	return g_guest_address_space != nullptr &&
+	       g_guest_address_space->FindBackingSpan(vaddr, size, backing_offset);
+}
+
+uint8_t* BackingBase(uint64_t* size) {
+	if (g_guest_address_space == nullptr) {
+		return nullptr;
+	}
+	if (size != nullptr) {
+		*size = g_guest_address_space->BackingSize();
+	}
+	return g_guest_address_space->BackingBase();
+}
+
 bool TryReadGpuCleanBacking(uint64_t vaddr, void* data, uint64_t size) {
 	if (g_gpu_resources != nullptr && IsGpuAddressRange(vaddr, size)) {
 		if (!Graphics::GuestGpu::IsGpuThread() ||
@@ -974,12 +989,20 @@ bool IsGpuWrittenRange(uint64_t vaddr, uint64_t size) {
 }
 
 bool PeekGpuCopy(uint64_t vaddr, void* data, uint64_t size) {
+	if (g_gpu_resources != nullptr && Graphics::GuestGpu::IsGpuThread() && IsGpuAddressRange(vaddr, size)) {
+		GetGpuResources().GetBufferCache().WaitHostWrites(vaddr, size);
+	}
 	return g_gpu_resources != nullptr && Graphics::GuestGpu::IsGpuThread() &&
 	       IsGpuAddressRange(vaddr, size) && g_gpu_resources->IsMapped(vaddr, size) &&
 	       GetGpuResources().GetBufferCache().PeekGpuRange(vaddr, size, data, 100'000'000ull);
 }
 
 bool ReadGpuArgs(uint64_t vaddr, void* data, uint64_t size) {
+	// Host-backed buffers share guest memory with the GPU: earlier GPU work writing these
+	// arguments must have run before they are read.
+	if (g_gpu_resources != nullptr && Graphics::GuestGpu::IsGpuThread() && IsGpuAddressRange(vaddr, size)) {
+		GetGpuResources().GetBufferCache().WaitHostWrites(vaddr, size);
+	}
 	// Indirect draw/dispatch arguments are often written by a compute shader just before; the
 	// host must see the GPU's values, so their readback always reaches guest memory.
 	if (TryReadGpuCleanBacking(vaddr, data, size)) {

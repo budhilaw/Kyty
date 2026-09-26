@@ -458,6 +458,7 @@ void RenderContext::UnmapMemory(uint64_t vaddr, uint64_t size) {
 void RenderContext::PrepareBda() {
 	// A pass with raw pointers may write any mapped page.
 	m_buffer_cache.InvalidatePeekCache();
+	m_buffer_cache.NoteRawWriteDispatch();
 	std::shared_lock lock(m_mapped_ranges_mutex);
 	// Every dispatch used to walk every mapped buffer (about 15% of the GPU thread). Nothing
 	// can need an upload unless some page became CPU-modified since the last full walk.
