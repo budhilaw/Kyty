@@ -4,6 +4,10 @@
 #include "common/assert.h"
 #include "graphics/shader/recompiler/ir/ShaderIR.h"
 
+#include <chrono>
+#include <cstdio>
+#include <cstdlib>
+#include <mutex>
 #include <algorithm>
 #include <bit>
 #include <cmath>
@@ -1064,6 +1068,7 @@ bool EvaluateRuntimeSourcesImpl(const ResourcePlan& program, std::span<const uin
                                 std::vector<uint32_t>& flat, bool evaluate_flat,
                                 std::span<const uint8_t> clean_flat_slots,
                                 std::vector<uint8_t>&    active_sources) {
+	const auto t_eval_start = std::chrono::steady_clock::now();
 	t_srt_failure.clear();
 	if (!program.srt_plan_complete) {
 		return false;
@@ -1126,10 +1131,42 @@ bool EvaluateRuntimeSourcesImpl(const ResourcePlan& program, std::span<const uin
 		}
 		evaluated.push_back(value);
 	}
+	// KYTY_SAMPLE_GPU=1: how evaluation time splits between descriptor sources and the flat SRT.
+	static const bool split_stats = std::getenv("KYTY_SAMPLE_GPU") != nullptr;
+	const auto        flat_start  = split_stats ? std::chrono::steady_clock::now()
+	                                            : std::chrono::steady_clock::time_point {};
 	std::vector<uint32_t> flattened;
+	const auto record_split = [&]() {
+		if (!split_stats) {
+			return;
+		}
+		static std::mutex stats_mutex;
+		static uint64_t   calls = 0, sources_n = 0, flat_n = 0, sources_ns = 0, flat_ns = 0;
+		static auto       last  = std::chrono::steady_clock::now();
+		const auto        now   = std::chrono::steady_clock::now();
+		std::lock_guard   lock(stats_mutex);
+		calls++;
+		sources_n += sources.size();
+		flat_n += evaluate_flat ? program.srt_reads.size() : 0u;
+		sources_ns += static_cast<uint64_t>((flat_start - t_eval_start).count());
+		flat_ns += static_cast<uint64_t>((now - flat_start).count());
+		if (now - last > std::chrono::seconds(5)) {
+			std::printf("SRTSPLIT calls=%llu sources=%llu flat_reads=%llu sources_ms=%llu flat_ms=%llu\n",
+			            static_cast<unsigned long long>(calls), static_cast<unsigned long long>(sources_n),
+			            static_cast<unsigned long long>(flat_n),
+			            static_cast<unsigned long long>(sources_ns / 1000000u),
+			            static_cast<unsigned long long>(flat_ns / 1000000u));
+			calls = sources_n = flat_n = sources_ns = flat_ns = 0;
+			last = now;
+		}
+	};
 	if (evaluate_flat) {
 		flattened.resize(program.srt_reads.size());
 		for (const auto& read: program.srt_reads) {
+			if (read.gpu) {
+				// The shader loads this slot itself.
+				continue;
+			}
 			const bool clean    = read.flat_offset < clean_flat_slots.size() &&
 			                      clean_flat_slots[read.flat_offset] != 0u;
 			auto&      selected = clean ? clean_evaluator : evaluator;
@@ -1139,6 +1176,7 @@ bool EvaluateRuntimeSourcesImpl(const ResourcePlan& program, std::span<const uin
 			}
 		}
 	}
+	record_split();
 	results = std::move(evaluated);
 	active_sources = std::move(active);
 	if (evaluate_flat) {

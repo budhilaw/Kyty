@@ -533,7 +533,9 @@ void RenderExecutor::Dispatch(uint64_t submit_id, CommandBuffer& buffer, uint32_
 	}
 	if (program.info.uses_dma) {
 		MapUserDataPointers(bindings);
-		m_context.PrepareBda();
+		if (!program.info.dma_srt_only) {
+			m_context.PrepareBda();
+		}
 	}
 	RebindImages(bindings);
 	g_gpu_driven_dispatch = indirect;
@@ -664,7 +666,10 @@ void RenderExecutor::DispatchIndirect(uint64_t submit_id, CommandBuffer& buffer,
 	FindBuffers(bindings);
 	const auto& program = *input_info.stage.program;
 	if (program.info.uses_dma) {
-		m_context.PrepareBda();
+		MapUserDataPointers(bindings);
+		if (!program.info.dma_srt_only) {
+			m_context.PrepareBda();
+		}
 	}
 	RebindImages(bindings);
 	// Acquiring arguments can merge cache buffers; finalize shader bindings afterward.

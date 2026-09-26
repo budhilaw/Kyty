@@ -633,6 +633,7 @@ TranslateResult TranslateProgram(std::span<const uint32_t> code, const CompileOp
 	IR::BuildSrtPlan(ir);
 	IR::EliminateDeadCode(ir.blocks);
 	IR::TrackResources(ir);
+	IR::OffloadSrtReads(ir);
 	IR::EliminateDeadCode(ir.blocks);
 	TranslateResult result;
 	result.program = std::move(ir);

@@ -39,6 +39,10 @@ struct ResourceSpecialization {
 // its values and is independent of the translated shader CFG.
 ResourcePlan ExtractResourcePlan(const Program& program);
 
+// Moves SRT reads the CPU does not need for binding into the shader (raw-pointer loads).
+// Runs after resource tracking, before dead-code elimination.
+void OffloadSrtReads(Program& program);
+
 // Refreshes cached resources and specialization in place. A failed refresh must not be used.
 bool MaterializeResources(const ResourcePlan& program, const SrtRuntime& runtime,
                           ResourceSnapshot& snapshot, ResourceSpecialization& specialization);

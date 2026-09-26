@@ -434,6 +434,19 @@ struct BindingLayout {
 	bool operator==(const BindingLayout& other) const = default;
 };
 
+// A guest range that GPU-evaluated SRT reads load through raw pointers: the host makes it resident
+// before the draw. Base = user_data[lo] | user_data[hi] << 32 (indices relative to the user-data base).
+struct GpuSrtRange {
+	// from_flat: lo/hi index the flattened SRT (a table pointer read from another table).
+	bool     from_flat    = false;
+	uint32_t user_data_lo = 0;
+	uint32_t user_data_hi = 0;
+	uint32_t begin        = 0;
+	uint32_t end          = 0;
+
+	bool operator==(const GpuSrtRange& other) const = default;
+};
+
 struct ShaderInfo {
 	static constexpr uint32_t MaxBuffers      = 32;
 	static constexpr uint32_t MaxImages       = 64;
@@ -451,6 +464,10 @@ struct ShaderInfo {
 	int32_t                          instance_offset_sgpr = -1;
 	bool                             has_bitwise_xor    = false;
 	bool                             uses_dma           = false;
+	std::vector<GpuSrtRange>         gpu_srt_ranges;
+	// Raw-pointer loads come only from offloaded SRT reads, whose ranges are made resident per draw:
+	// the dirty-page walk before the draw is not needed.
+	bool                             dma_srt_only       = false;
 
 	bool operator==(const ShaderInfo& other) const = default;
 };
@@ -491,6 +508,8 @@ struct DescriptorSource {
 struct SrtRead {
 	Value    value;
 	uint32_t flat_offset = 0;
+	// Evaluated by the shader itself (OffloadSrtReads); the CPU leaves its flat slot zero.
+	bool gpu = false;
 
 	bool operator==(const SrtRead& other) const = default;
 };

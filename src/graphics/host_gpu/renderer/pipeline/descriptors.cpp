@@ -1228,6 +1228,28 @@ void RenderExecutor::RebindImages(PreparedBindings& prepared) {
 }
 
 void RenderExecutor::MapUserDataPointers(const PreparedBindings& bindings) {
+	// SRT reads the shader resolves itself (OffloadSrtReads) load through raw pointers, which only
+	// reach memory the buffer cache holds: their table ranges are made resident first.
+	{
+		const auto& ranges    = bindings.runtime->program->info.gpu_srt_ranges;
+		const auto& user_data = bindings.runtime->resources->user_data;
+		auto&       cache     = m_context.GetBufferCache();
+		for (const auto& range: ranges) {
+			const auto& words = range.from_flat ? bindings.runtime->resources->flattened_srt : user_data;
+			if (range.user_data_lo >= words.size() || range.user_data_hi >= words.size()) {
+				continue;
+			}
+			const auto base = (uint64_t {words[range.user_data_lo]} |
+			                   (uint64_t {words[range.user_data_hi]} << 32u)) &
+			                  0x0000ffffffffffffull;
+			const auto begin = (base & ~uint64_t {3}) + range.begin;
+			const auto size  = uint64_t {range.end - range.begin};
+			if (base < 0x10000u || begin >= (uint64_t {1} << 40u) || !m_context.IsMapped(begin, size)) {
+				continue;
+			}
+			(void)cache.ObtainBuffer(begin, size, false, false);
+		}
+	}
 	// Opt-in (KYTY_MAP_USER_POINTERS=1): buffers over whole pointer windows can shadow game
 	// objects that the CPU keeps writing.
 	static const bool enabled = std::getenv("KYTY_MAP_USER_POINTERS") != nullptr;
@@ -1269,7 +1291,8 @@ void RenderExecutor::PrepareGraphicsBindings(std::span<PreparedBindings* const> 
 		if (stage->runtime->program->info.uses_dma) {
 			MapUserDataPointers(*stage);
 		}
-		uses_dma |= stage->runtime->program->info.uses_dma;
+		// SRT-only raw-pointer shaders had their ranges made resident above: no dirty-page walk.
+		uses_dma |= stage->runtime->program->info.uses_dma && !stage->runtime->program->info.dma_srt_only;
 	}
 	if (uses_dma) {
 		m_context.PrepareBda();

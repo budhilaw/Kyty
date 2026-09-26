@@ -1046,6 +1046,225 @@ static UniformFillPlan AnalyzeUniformFill(const Program& program) {
 	return result;
 }
 
+// GPU-side SRT resolution, step one. Every ReadConst slot is a raw read (user-data pointer +
+// immediate offset) that the CPU evaluated for every draw and uploaded as the flattened SRT
+// (~10% of the GPU thread at the Uncharted selector, 7.9 million reads per 5 s). A slot the CPU
+// does not need for binding (descriptor sources, control flow, uniform fill) is now loaded by the
+// shader itself: its ReadConst uses go back to the original load, which is emitted as a raw-pointer
+// load. The table's range is recorded so the host makes it resident before the draw.
+// Opt-in (KYTY_GPU_SRT=1) until it is faster than the CPU path.
+void OffloadSrtReads(Program& program) {
+	static const bool disabled = std::getenv("KYTY_GPU_SRT") == nullptr;
+	if (disabled || program.srt_reads.empty() || !program.srt_plan_complete) {
+		return;
+	}
+	// Compute shaders that fill a buffer with one value are replaced by a fill; raw-pointer loads
+	// would disable that analysis.
+	if (!program.info.uses_dma && AnalyzeUniformFill(program).fill.words != 0) {
+		return;
+	}
+
+	const auto slot_of = [&](const Inst& inst) -> uint32_t {
+		if (inst.GetOpcode() != ValueOpcode::ReadConst || inst.NumArgs() < 2) {
+			return UINT32_MAX;
+		}
+		const auto slot = inst.Arg(1).Resolve();
+		if (!slot.IsImmediate() || slot.GetType() != Type::U32 ||
+		    slot.U32() >= program.srt_reads.size()) {
+			return UINT32_MAX;
+		}
+		return slot.U32();
+	};
+
+	// Slots the CPU still needs: everything reachable from what it evaluates.
+	std::vector<uint8_t>            needed(program.srt_reads.size(), 0u);
+	std::unordered_set<const Inst*> visited;
+	std::vector<Value>              pending;
+	for (const auto& source: program.descriptor_sources) {
+		for (uint32_t dword = 0; dword < source.dword_count; dword++) {
+			pending.push_back(source.dwords[dword]);
+		}
+	}
+	for (const auto& info: program.block_info) {
+		pending.push_back(info.condition);
+		pending.push_back(info.indirect_target);
+	}
+	for (const auto& read: program.dynamic_reads) {
+		pending.push_back(read);
+	}
+	while (!pending.empty()) {
+		auto value = pending.back().Resolve();
+		pending.pop_back();
+		const auto* inst = value.IsEmpty() ? nullptr : value.TryInstruction();
+		if (inst == nullptr || !visited.insert(inst).second) {
+			continue;
+		}
+		if (const auto slot = slot_of(*inst); slot != UINT32_MAX) {
+			needed[slot] = 1u;
+			pending.push_back(program.srt_reads[slot].value);
+			continue;
+		}
+		for (size_t index = 0; index < inst->NumArgs(); index++) {
+			pending.push_back(inst->Arg(index));
+		}
+	}
+
+	// A slot is redirected only where the load it replaces dominates every use: one ReadConst.
+	std::vector<std::vector<Inst*>> reads(program.srt_reads.size());
+	for (auto* block: program.blocks) {
+		for (auto& inst: *block) {
+			if (const auto slot = slot_of(inst); slot != UINT32_MAX) {
+				reads[slot].push_back(&inst);
+			}
+		}
+	}
+
+	// Why slots stay on the CPU (KYTY_SAMPLE_GPU=1 prints the totals).
+	enum Reject : uint32_t { Needed, Duplicate, NotLoad, Kind, Handle, Base, Offset, Pinned, Count };
+	static std::array<std::atomic<uint64_t>, Reject::Count + 1> rejects {};
+	struct Candidate {
+		uint32_t      slot      = 0;
+		Inst*         root      = nullptr;
+		MemoryInfo*   memory    = nullptr;
+		bool          from_flat = false;
+		uint32_t      lo        = 0; // user-data index, or base slot for from_flat
+		uint32_t      hi        = 0;
+		uint32_t      relative  = 0;
+	};
+	std::vector<Candidate> candidates;
+	std::vector<uint8_t>   pinned(program.srt_reads.size(), 0u);
+	for (uint32_t slot = 0; slot < program.srt_reads.size(); slot++) {
+		const auto reject = [&](Reject why) { rejects[why].fetch_add(1, std::memory_order_relaxed); };
+		if (needed[slot] != 0u) {
+			reject(Needed);
+			continue;
+		}
+		if (reads[slot].size() != 1u) {
+			reject(Duplicate);
+			continue;
+		}
+		auto* root = program.srt_reads[slot].value.Resolve().TryInstruction();
+		if (root == nullptr || root->GetOpcode() != ValueOpcode::LoadAddressU32 ||
+		    root->NumArgs() < 2) {
+			reject(NotLoad);
+			continue;
+		}
+		const auto memory_index = root->Flags<MemoryFlags>().index;
+		if (memory_index >= program.memory_info.size()) {
+			reject(Kind);
+			continue;
+		}
+		auto& memory = program.memory_info[memory_index];
+		if (memory.kind != ResourceKind::ScalarAddress || memory.address_is_full ||
+		    !memory.planning_only) {
+			reject(Kind);
+			continue;
+		}
+		const auto* handle = root->Arg(0).Resolve().TryInstruction();
+		if (handle == nullptr || handle->GetOpcode() != ValueOpcode::GetAddressResource ||
+		    handle->NumArgs() != 2) {
+			reject(Handle);
+			continue;
+		}
+		const auto* low  = handle->Arg(0).Resolve().TryInstruction();
+		const auto* high = handle->Arg(1).Resolve().TryInstruction();
+		Candidate   candidate {slot, root, &memory};
+		if (low != nullptr && high != nullptr && low->GetOpcode() == ValueOpcode::GetUserData &&
+		    high->GetOpcode() == ValueOpcode::GetUserData) {
+			const auto low_reg  = RegIndex(low->Arg(0).ScalarRegister());
+			const auto high_reg = RegIndex(high->Arg(0).ScalarRegister());
+			if (low_reg < program.user_data_base || high_reg < program.user_data_base) {
+				reject(Base);
+				continue;
+			}
+			candidate.lo = low_reg - program.user_data_base;
+			candidate.hi = high_reg - program.user_data_base;
+		} else if (low != nullptr && high != nullptr && slot_of(*low) != UINT32_MAX &&
+		           slot_of(*high) != UINT32_MAX) {
+			// A table pointer read from another table: that slot stays on the CPU and the host
+			// finds the base in the flattened SRT.
+			candidate.from_flat = true;
+			candidate.lo        = slot_of(*low);
+			candidate.hi        = slot_of(*high);
+		} else {
+			reject(Base);
+			continue;
+		}
+		const auto offset = root->Arg(1).Resolve();
+		if (!offset.IsImmediate() || offset.GetType() != Type::U32) {
+			reject(Offset);
+			continue;
+		}
+		const auto relative = static_cast<int64_t>(offset.U32() & ~3u) +
+		                      static_cast<int64_t>(static_cast<int32_t>(memory.offset & ~3u));
+		if (relative < 0 || relative > 0x10000000) {
+			reject(Offset);
+			continue;
+		}
+		candidate.relative = static_cast<uint32_t>(relative);
+		candidates.push_back(candidate);
+	}
+	for (const auto& candidate: candidates) {
+		if (candidate.from_flat) {
+			pinned[candidate.lo] = 1u;
+			pinned[candidate.hi] = 1u;
+		}
+	}
+
+	const bool had_dma   = program.info.uses_dma;
+	uint32_t   offloaded = 0;
+	for (const auto& candidate: candidates) {
+		if (pinned[candidate.slot] != 0u) {
+			rejects[Pinned].fetch_add(1, std::memory_order_relaxed);
+			continue;
+		}
+		auto* read = reads[candidate.slot].front();
+		for (const auto& use: std::vector<Use>(read->Uses())) {
+			use.user->SetArg(use.operand, Value(candidate.root));
+		}
+		candidate.memory->planning_only       = false;
+		program.srt_reads[candidate.slot].gpu = true;
+		GpuSrtRange range {};
+		range.from_flat    = candidate.from_flat;
+		range.user_data_lo = candidate.from_flat ? program.srt_reads[candidate.lo].flat_offset
+		                                         : candidate.lo;
+		range.user_data_hi = candidate.from_flat ? program.srt_reads[candidate.hi].flat_offset
+		                                         : candidate.hi;
+		range.begin        = candidate.relative;
+		range.end          = candidate.relative + 4u;
+		auto existing = std::ranges::find_if(program.info.gpu_srt_ranges, [&](const GpuSrtRange& r) {
+			return r.from_flat == range.from_flat && r.user_data_lo == range.user_data_lo &&
+			       r.user_data_hi == range.user_data_hi;
+		});
+		if (existing == program.info.gpu_srt_ranges.end()) {
+			program.info.gpu_srt_ranges.push_back(range);
+		} else {
+			existing->begin = std::min(existing->begin, range.begin);
+			existing->end   = std::max(existing->end, range.end);
+		}
+		offloaded++;
+	}
+	rejects[Reject::Count].fetch_add(offloaded, std::memory_order_relaxed);
+	if (offloaded != 0) {
+		program.info.uses_dma     = true;
+		program.info.dma_srt_only = !had_dma;
+	}
+	static const bool stats = std::getenv("KYTY_SAMPLE_GPU") != nullptr;
+	static std::atomic<uint32_t> shaders {0};
+	if (stats && (shaders.fetch_add(1) % 64u) == 63u) {
+		std::printf("GPUSRT offloaded=%llu needed=%llu duplicate=%llu notload=%llu kind=%llu "
+		            "handle=%llu base=%llu offset=%llu pinned=%llu\n",
+		            static_cast<unsigned long long>(rejects[Reject::Count].load()),
+		            static_cast<unsigned long long>(rejects[Needed].load()),
+		            static_cast<unsigned long long>(rejects[Duplicate].load()),
+		            static_cast<unsigned long long>(rejects[NotLoad].load()),
+		            static_cast<unsigned long long>(rejects[Kind].load()),
+		            static_cast<unsigned long long>(rejects[Handle].load()),
+		            static_cast<unsigned long long>(rejects[Base].load()),
+		            static_cast<unsigned long long>(rejects[Offset].load()),
+		            static_cast<unsigned long long>(rejects[Pinned].load()));
+	}
+}
 ResourcePlan ExtractResourcePlan(const Program& program) {
 	ResourcePlan plan;
 	plan.stage                      = program.stage;
@@ -1099,7 +1318,7 @@ ResourcePlan ExtractResourcePlan(const Program& program) {
 	}
 	plan.srt_reads.reserve(program.srt_reads.size());
 	for (const auto& read: program.srt_reads) {
-		plan.srt_reads.push_back({Clone(read.value), read.flat_offset});
+		plan.srt_reads.push_back({Clone(read.value), read.flat_offset, read.gpu});
 	}
 	plan.control_flow = ResourceControlFlow(program);
 	for (auto& block: plan.control_flow) {
