@@ -142,6 +142,8 @@ void BufferCache::ChangeRegister(BufferId id) {
 		EXIT_IF(!inserted);
 		m_total_used_memory += buffer.Size();
 		buffer.lru_id = m_lru_cache.Insert(id, m_gc_tick);
+		// Before any GPU work can write the buffer (FindBuffer creates buffers without syncing).
+		m_memory_tracker.EnsureRegions(buffer.CpuAddress(), buffer.Size());
 		std::vector<vk::DeviceAddress> addresses;
 		addresses.reserve(size_pages);
 		for (uint64_t i = 0; i < size_pages; ++i) {
@@ -2211,14 +2213,51 @@ void BufferCache::SynchronizeRangesBatch(std::span<const std::pair<uint64_t, uin
 	// faulting on those regions spun behind it.
 	thread_local std::vector<std::tuple<size_t, uint64_t, uint64_t>> collected;
 	collected.clear();
+	// KYTY_SAMPLE_GPU=1: where the walk's time goes (WALKSPLIT every 5 s).
+	static const bool split_stats = std::getenv("KYTY_SAMPLE_GPU") != nullptr;
+	const auto        now_us      = [] {
+		return static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(
+		                                 std::chrono::steady_clock::now().time_since_epoch())
+		                                 .count());
+	};
+	const auto t0 = split_stats ? now_us() : 0;
 	m_memory_tracker.ForEachUploadRangeBatch(
 	    pieces, [&](size_t index, uint64_t address, uint64_t bytes) noexcept {
 		    collected.emplace_back(index, address, bytes);
 	    });
+	const auto t1 = split_stats ? now_us() : 0;
 	for (const auto& [index, address, bytes]: collected) {
 		auto& group = groups[piece_group[index]];
 		AppendUploadCopies(m_slot_buffers[group.id], address, bytes, group.copies, group.total);
 	}
+	const auto t2 = split_stats ? now_us() : 0;
+	struct SplitReport {
+		uint64_t t0, t1, t2;
+		bool     enabled;
+		~SplitReport() {
+			if (!enabled) {
+				return;
+			}
+			static uint64_t tracker = 0, diff = 0, upload = 0, calls = 0, pages = 0;
+			static auto     last    = std::chrono::steady_clock::now();
+			const auto      t3      = static_cast<uint64_t>(
+                std::chrono::duration_cast<std::chrono::microseconds>(
+                    std::chrono::steady_clock::now().time_since_epoch())
+                    .count());
+			tracker += t1 - t0;
+			diff += t2 - t1;
+			upload += t3 - t2;
+			calls++;
+			if (std::chrono::steady_clock::now() - last > std::chrono::seconds(5)) {
+				std::printf("WALKSPLIT calls=%llu tracker_ms=%llu diff_ms=%llu upload_record_ms=%llu\n",
+				            static_cast<unsigned long long>(calls), static_cast<unsigned long long>(tracker / 1000),
+				            static_cast<unsigned long long>(diff / 1000),
+				            static_cast<unsigned long long>(upload / 1000));
+				tracker = diff = upload = calls = pages = 0;
+				last = std::chrono::steady_clock::now();
+			}
+		}
+	} split_report {t0, t1, t2, split_stats};
 	thread_local std::vector<BufferId> promote;
 	promote.clear();
 	bool began = false;

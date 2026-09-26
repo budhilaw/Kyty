@@ -458,11 +458,11 @@ void RenderContext::UnmapMemory(uint64_t vaddr, uint64_t size) {
 }
 
 void RenderContext::PrepareBda(bool writes) {
-	// A pass that stores through raw pointers may write any mapped page. Read-only passes used to
-	// drop the peek cache too, and each following compute pass drained the GPU again.
-	// KYTY_PEEK_DROP_ALWAYS=1 restores that.
-	static const bool drop_always = std::getenv("KYTY_PEEK_DROP_ALWAYS") != nullptr;
-	if (writes || drop_always) {
+	// A pass with raw pointers may write any mapped page. Keeping the cache across passes the
+	// shader analysis calls read-only (KYTY_PEEK_KEEP_READONLY=1) washed out the Uncharted selector
+	// in every run: that analysis misses some raw-pointer stores.
+	static const bool keep_readonly = std::getenv("KYTY_PEEK_KEEP_READONLY") != nullptr;
+	if (writes || !keep_readonly) {
 		m_buffer_cache.InvalidatePeekCache();
 	}
 	m_buffer_cache.NoteRawWriteDispatch();

@@ -11,7 +11,7 @@ namespace Libs::Graphics {
 constexpr uint64_t TRACKER_PAGE_SIZE    = 4ull * 1024ull;
 // One lock guards each region: every write fault (with its VirtualProtect) and the GPU thread's
 // page walk serialize on it. At 4 MiB the game's per-frame ring buffers shared a few regions and
-// the walk spun behind write faults on unrelated pages (6.5% of the GPU thread).
+// the walk spun behind write faults on unrelated pages (6-7 fps at the selector, 18 at 1 MiB).
 constexpr uint64_t TRACKER_REGION_SIZE  = 1ull * 1024ull * 1024ull;
 constexpr uint64_t TRACKER_ADDRESS_SIZE = 1ull << 40u;
 constexpr size_t   TRACKER_REGION_PAGES = TRACKER_REGION_SIZE / TRACKER_PAGE_SIZE;

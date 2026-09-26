@@ -516,19 +516,26 @@ private:
 		};
 		// Shader resource materialization reads guest memory a dword at a time; the last
 		// mapping this thread used answers most of those without the lock and map lookup.
+		// Descriptor tables, constants and vertex data sit in different mappings, so one remembered
+		// mapping missed most of the time; the last eight are kept.
 		struct LastLookup {
 			const void* owner      = nullptr;
 			uint64_t    generation = 0;
 			MapEntry    entry {};
 		};
-		static thread_local LastLookup last;
-		if (last.owner == this &&
-		    last.generation == m_maps_generation.load(std::memory_order_acquire) &&
-		    vaddr >= last.entry.vaddr && vaddr + size <= last.entry.vaddr + last.entry.size) {
-			const auto offset = last.entry.backing_offset + vaddr - last.entry.vaddr;
-			if (RangeOk(offset, size)) {
-				transfer(m_backing_base + offset, 0, static_cast<size_t>(size));
-				return true;
+		static thread_local std::array<LastLookup, 8> recent {};
+		static thread_local size_t                    recent_next = 0;
+		{
+			const auto generation = m_maps_generation.load(std::memory_order_acquire);
+			for (const auto& last: recent) {
+				if (last.owner == this && last.generation == generation && vaddr >= last.entry.vaddr &&
+				    vaddr + size <= last.entry.vaddr + last.entry.size) {
+					const auto offset = last.entry.backing_offset + vaddr - last.entry.vaddr;
+					if (RangeOk(offset, size)) {
+						transfer(m_backing_base + offset, 0, static_cast<size_t>(size));
+						return true;
+					}
+				}
 			}
 		}
 		std::array<Segment, 8> inline_segments {};
@@ -549,7 +556,8 @@ private:
 					return false;
 				}
 				if (current == vaddr && bytes == size) {
-					last = {this, m_maps_generation.load(std::memory_order_acquire), entry};
+					recent[recent_next] = {this, m_maps_generation.load(std::memory_order_acquire), entry};
+					recent_next         = (recent_next + 1u) % recent.size();
 				}
 				const Segment segment {offset, current - vaddr, bytes};
 				if (count < inline_segments.size()) {

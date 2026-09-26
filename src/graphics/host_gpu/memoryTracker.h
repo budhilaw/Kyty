@@ -31,6 +31,13 @@ public:
 	void               MarkRegionAsGpuModified(uint64_t vaddr, uint64_t size);
 	void               UnmarkRegionAsGpuModified(uint64_t vaddr, uint64_t size);
 	void               UntrackMemory(uint64_t vaddr, uint64_t size);
+	// Creates the tracking regions of a range now. A new region marks all its pages CPU-modified,
+	// which is only true while no GPU work has written them: a region first created later (by a
+	// query) under a buffer that a raw-pointer pass had written put the stale CPU copy back over
+	// the GPU's data (Uncharted's washed-out selector, far more often with smaller regions).
+	void EnsureRegions(uint64_t vaddr, uint64_t size) {
+		Iterate<true>(vaddr, size, [](RegionManager*, uint64_t, uint64_t) {});
+	}
 	// Moves whenever any page becomes CPU-modified; lets callers skip re-syncing when it has not.
 	[[nodiscard]] uint64_t CpuGeneration() const {
 		return m_cpu_generation.load(std::memory_order_acquire);
