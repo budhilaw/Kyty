@@ -1786,6 +1786,96 @@ void BufferCache::EndUploadBatch() {
 	m_upload_batch_began = false;
 }
 
+void BufferCache::SynchronizeRangesBatch(std::span<const std::pair<uint64_t, uint64_t>> ranges) {
+	// Split into per-buffer pieces in address order; pieces of one buffer are consecutive.
+	struct Group {
+		BufferId                    id;
+		std::vector<vk::BufferCopy> copies;
+		uint64_t                    total = 0;
+	};
+	thread_local std::vector<std::pair<uint64_t, uint64_t>> pieces;
+	thread_local std::vector<uint32_t>                      piece_group;
+	thread_local std::vector<Group>                         groups;
+	pieces.clear();
+	piece_group.clear();
+	groups.clear();
+	for (const auto& [vaddr, size]: ranges) {
+		const auto end = vaddr + size;
+		auto       it  = m_buffers.upper_bound(vaddr);
+		if (it != m_buffers.begin()) {
+			--it;
+		}
+		for (; it != m_buffers.end() && it->first < end; ++it) {
+			const auto& buffer = m_slot_buffers[it->second];
+			const auto  start  = std::max(buffer.CpuAddress(), vaddr);
+			const auto  finish = std::min(buffer.CpuAddress() + buffer.Size(), end);
+			if (start >= finish) {
+				continue;
+			}
+			if (groups.empty() || groups.back().id != it->second) {
+				groups.push_back({it->second, {}, 0});
+			}
+			pieces.emplace_back(start, finish - start);
+			piece_group.push_back(static_cast<uint32_t>(groups.size() - 1u));
+		}
+	}
+	if (pieces.empty()) {
+		return;
+	}
+	// Buffers may overlap in guest memory; the tracker needs sorted, disjoint ranges.
+	bool ordered = true;
+	for (size_t i = 1; i < pieces.size(); i++) {
+		if (pieces[i].first < pieces[i - 1].first + pieces[i - 1].second) {
+			ordered = false;
+			break;
+		}
+	}
+	if (!ordered) {
+		for (const auto& [start, size]: pieces) {
+			SynchronizeBuffersInRange(start, size);
+		}
+		return;
+	}
+	m_memory_tracker.ForEachUploadRangeBatch(
+	    pieces, [&](size_t index, uint64_t address, uint64_t bytes) noexcept {
+		    auto& group = groups[piece_group[index]];
+		    AppendUploadCopies(m_slot_buffers[group.id], address, bytes, group.copies, group.total);
+	    });
+	bool began = false;
+	for (auto& group: groups) {
+		if (group.copies.empty()) {
+			continue;
+		}
+		auto&      buffer = m_slot_buffers[group.id];
+		const auto source = UploadCopies(buffer, group.copies, group.total);
+		if (!source) {
+			continue;
+		}
+		auto& command = m_scheduler.Current();
+		command.EndRendering();
+		const auto native = command.Handle();
+		if (!began) {
+			vk::MemoryBarrier barrier {};
+			barrier.srcAccessMask = vk::AccessFlagBits::eMemoryRead | vk::AccessFlagBits::eMemoryWrite;
+			barrier.dstAccessMask = vk::AccessFlagBits::eTransferWrite;
+			native.pipelineBarrier(vk::PipelineStageFlagBits::eAllCommands,
+			                       vk::PipelineStageFlagBits::eTransfer, {}, 1, &barrier, 0, nullptr,
+			                       0, nullptr);
+			began = true;
+		}
+		native.copyBuffer(source, buffer.Handle(), static_cast<uint32_t>(group.copies.size()),
+		                  group.copies.data());
+	}
+	if (began) {
+		vk::MemoryBarrier barrier {};
+		barrier.srcAccessMask = vk::AccessFlagBits::eTransferWrite;
+		barrier.dstAccessMask = vk::AccessFlagBits::eMemoryRead | vk::AccessFlagBits::eMemoryWrite;
+		m_scheduler.Current().Handle().pipelineBarrier(
+		    vk::PipelineStageFlagBits::eTransfer, vk::PipelineStageFlagBits::eAllCommands, {}, 1,
+		    &barrier, 0, nullptr, 0, nullptr);
+	}
+}
+
 void BufferCache::SynchronizeBuffersInRange(uint64_t vaddr, uint64_t size) {
 	const auto end = vaddr + size;
 	auto       it  = m_buffers.upper_bound(vaddr);

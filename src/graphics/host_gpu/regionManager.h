@@ -140,6 +140,20 @@ public:
 		}
 	}
 
+	// Batched upload collection: clears CPU-dirty bits of one range and reports them, leaving the
+	// protection update to FlushCpuProtection once every range of this region is done (region
+	// lock held throughout).
+	template <typename Func>
+	void CollectCpuUpload(uint64_t vaddr, uint64_t size, Func&& func) {
+		const auto [start, end] = GetPageRange(vaddr, size);
+		RegionBits mask(m_cpu_dirty, start, end);
+		m_cpu_dirty.UnsetRange(start, end);
+		for (const auto [first, last]: mask) {
+			func(m_cpu_addr + first * TRACKER_PAGE_SIZE, (last - first) * TRACKER_PAGE_SIZE);
+		}
+	}
+	void FlushCpuProtection() { UpdateProtection<true, false>(); }
+
 	TrackingSpinLock lock;
 
 private:

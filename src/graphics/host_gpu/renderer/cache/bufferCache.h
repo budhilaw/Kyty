@@ -100,6 +100,9 @@ public:
 	[[nodiscard]] bool IsRegionGpuModified(uint64_t vaddr, uint64_t size);
 	void               ProcessFaultBuffer();
 	void               SynchronizeBuffersInRange(uint64_t vaddr, uint64_t size);
+	// Uploads the CPU-modified pages of many ranges (sorted, disjoint): one tracker lock and
+	// protection update per region, one staging upload and copy per buffer.
+	void SynchronizeRangesBatch(std::span<const std::pair<uint64_t, uint64_t>> ranges);
 	// Uploads between these share one barrier pair instead of two barriers per buffer.
 	void BeginUploadBatch();
 	void EndUploadBatch();

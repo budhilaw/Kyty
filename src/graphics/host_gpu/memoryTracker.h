@@ -7,6 +7,7 @@
 #include "graphics/host_gpu/rangeSet.h"
 #include "graphics/host_gpu/regionManager.h"
 
+#include <span>
 #include <algorithm>
 #include <atomic>
 #include <memory>
@@ -125,6 +126,41 @@ public:
 				                   manager->GetCpuAddr() + offset, bytes);
 				               manager->lock.unlock();
 			               });
+		}
+		s_upload_owner = previous_upload_owner;
+	}
+
+	// Upload collection for many read-only ranges (sorted by address, non-overlapping): each
+	// tracking region is locked and re-protected once, not once per range. The raw-pointer walk
+	// visits ~130 scattered pages per call; per-range locking and protection was most of its cost.
+	// func(index, address, bytes) runs with the region lock held.
+	template <typename Func>
+	void ForEachUploadRangeBatch(std::span<const std::pair<uint64_t, uint64_t>> ranges, Func&& func) {
+		CheckNotInUploadCallback();
+		for (const auto& [address, size]: ranges) {
+			Iterate<true>(address, size, [](RegionManager*, uint64_t, uint64_t) {});
+		}
+		const auto*    previous_upload_owner = std::exchange(s_upload_owner, this);
+		RegionManager* current               = nullptr;
+		for (size_t index = 0; index < ranges.size(); index++) {
+			Iterate<false>(ranges[index].first, ranges[index].second,
+			               [&](RegionManager* manager, uint64_t offset, uint64_t bytes) {
+				               if (manager != current) {
+					               if (current != nullptr) {
+						               current->FlushCpuProtection();
+						               current->lock.unlock();
+					               }
+					               current = manager;
+					               current->lock.lock();
+				               }
+				               manager->CollectCpuUpload(
+				                   manager->GetCpuAddr() + offset, bytes,
+				                   [&](uint64_t address, uint64_t length) { func(index, address, length); });
+			               });
+		}
+		if (current != nullptr) {
+			current->FlushCpuProtection();
+			current->lock.unlock();
 		}
 		s_upload_owner = previous_upload_owner;
 	}

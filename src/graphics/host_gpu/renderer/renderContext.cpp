@@ -484,11 +484,19 @@ void RenderContext::PrepareBda() {
 		const auto        walk_start = std::chrono::steady_clock::now();
 		stat_calls++;
 		stat_full += full ? 1u : 0u;
+		// KYTY_NO_SYNC_BATCH=1: the old walk, one tracker lock and upload per range.
+		static const bool no_sync_batch = std::getenv("KYTY_NO_SYNC_BATCH") != nullptr;
+		thread_local std::vector<std::pair<uint64_t, uint64_t>> walk;
+		walk.clear();
 		if (full) {
 			m_mapped_ranges.ForEach([this](uint64_t start, uint64_t end) {
 				stat_ranges++;
 				stat_bytes += end - start;
-				m_buffer_cache.SynchronizeBuffersInRange(start, end - start);
+				if (no_sync_batch) {
+					m_buffer_cache.SynchronizeBuffersInRange(start, end - start);
+				} else {
+					walk.emplace_back(start, end - start);
+				}
 			});
 		} else {
 			// Pages the game writes are logged one at a time; adjacent ones are walked together.
@@ -508,8 +516,22 @@ void RenderContext::PrepareBda() {
 				m_mapped_ranges.ForEachInRange(address, size, [this](uint64_t start, uint64_t end) {
 					stat_ranges++;
 					stat_bytes += end - start;
-					m_buffer_cache.SynchronizeBuffersInRange(start, end - start);
+					if (no_sync_batch) {
+						m_buffer_cache.SynchronizeBuffersInRange(start, end - start);
+					} else {
+						walk.emplace_back(start, end - start);
+					}
 				});
+			}
+		}
+		if (!walk.empty()) {
+			// The batch records its own barrier pair.
+			if (!no_batch) {
+				m_buffer_cache.EndUploadBatch();
+			}
+			m_buffer_cache.SynchronizeRangesBatch(walk);
+			if (!no_batch) {
+				m_buffer_cache.BeginUploadBatch();
 			}
 		}
 		if (!no_batch) {
