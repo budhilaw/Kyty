@@ -108,6 +108,31 @@ static void FillRandomBuffer(void* buf, size_t nbytes) {
 	}
 }
 
+// ReadFile into guest memory failed with 0 bytes when the GPU thread re-protected a page of the
+// destination after InvalidateMemory (Uncharted then decoded a garbage texture header). The file
+// is read into host memory and copied in, so any protected page faults and is handled.
+template <typename F>
+static void ReadIntoGuest(F& f, void* buf, uint32_t nbytes, uint32_t* bytes_read) {
+	*bytes_read = 0;
+	f.Read(buf, nbytes, bytes_read);
+	if (*bytes_read != 0 || nbytes == 0) {
+		return;
+	}
+	// Nothing was read: either end of file or an inaccessible destination. Retry through a host
+	// buffer from the same position.
+	const auto           pos = f.Tell();
+	std::vector<uint8_t> host(nbytes);
+	f.Read(host.data(), nbytes, bytes_read);
+	if (*bytes_read != 0) {
+		static std::atomic<uint32_t> logs {0};
+		if (logs.fetch_add(1) < 16) {
+			printf("FILE READ RETRY: direct read returned 0, host read %u bytes at pos %" PRIu64 "\n",
+			       *bytes_read, static_cast<uint64_t>(pos));
+		}
+		std::memcpy(buf, host.data(), *bytes_read);
+	}
+}
+
 static void SecToTimespec(KernelTimespec* ts, double sec) {
 	ts->tv_sec  = static_cast<int64_t>(sec);
 	ts->tv_nsec = static_cast<int64_t>((sec - static_cast<double>(ts->tv_sec)) * 1000000000.0);
@@ -622,7 +647,7 @@ int64_t KYTY_SYSV_ABI KernelRead(int d, void* buf, size_t nbytes) {
 	Memory::InvalidateMemory(reinterpret_cast<uint64_t>(buf),
 	                         std::min<uint64_t>(nbytes, remaining));
 	uint32_t bytes_read = 0;
-	file->f.Read(buf, static_cast<uint32_t>(nbytes), &bytes_read);
+	ReadIntoGuest(file->f, buf, static_cast<uint32_t>(nbytes), &bytes_read);
 
 	file->mutex.Unlock();
 
@@ -748,7 +773,7 @@ int64_t KYTY_SYSV_ABI KernelPread(int d, void* buf, size_t nbytes, int64_t offse
 	                         std::min<uint64_t>(nbytes, remaining));
 	uint32_t bytes_read = 0;
 	file->f.Seek(offset);
-	file->f.Read(buf, static_cast<uint32_t>(nbytes), &bytes_read);
+	ReadIntoGuest(file->f, buf, static_cast<uint32_t>(nbytes), &bytes_read);
 	file->f.Seek(pos);
 
 	file->mutex.Unlock();

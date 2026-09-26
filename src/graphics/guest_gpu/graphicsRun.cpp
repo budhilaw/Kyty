@@ -2369,6 +2369,7 @@ void CommandProcessor::WriteAtEndOfPipe(uint32_t cache_policy, uint32_t event_wr
 	const auto store_fence  = [&](const void* data, size_t bytes) {
 		if (dst_gpu_addr != nullptr) {
 			Libs::LibKernel::Memory::NoteLabelStore(dst_address, bytes);
+			Libs::LibKernel::Memory::ReadLogGpuToCpu("eop", dst_address, data, bytes, 0);
 		}
 		if (dst_gpu_addr == nullptr ||
 		    Libs::LibKernel::Memory::TryWriteBacking(dst_address, data, bytes)) {

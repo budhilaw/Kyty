@@ -3962,6 +3962,56 @@ bool ProtectGuestMemory(uint64_t vaddr, uint64_t size, VirtualMemory::Mode mode,
 static std::mutex                                   g_guest_stack_mutex;
 static std::vector<std::pair<uint64_t, uint64_t>>   g_guest_stacks;
 
+static std::pair<uint64_t, uint64_t> ReadLogWindow() {
+	static const auto window = [] {
+		const char* value = std::getenv("KYTY_READLOG");
+		if (value == nullptr) {
+			return std::pair<uint64_t, uint64_t> {UINT64_MAX, 0};
+		}
+		char*      end  = nullptr;
+		const auto from = std::strtoull(value, &end, 10);
+		const auto to   = (end != nullptr && *end == ',') ? std::strtoull(end + 1, nullptr, 10) : from;
+		return std::pair<uint64_t, uint64_t> {from, to};
+	}();
+	return window;
+}
+
+bool ReadLogActive() {
+	const auto [from, to] = ReadLogWindow();
+	const auto frame      = g_gpu_frame_epoch.load(std::memory_order_relaxed);
+	return frame >= from && frame <= to;
+}
+
+void ReadLogGpuToCpu(const char* path, uint64_t vaddr, const void* data, uint64_t size,
+                     uint64_t writer) {
+	if (!ReadLogActive()) {
+		return;
+	}
+	// FNV-1a over the delivered bytes, plus the first two dwords as values.
+	uint64_t    hash  = 1469598103934665603ull;
+	const auto* bytes = static_cast<const uint8_t*>(data);
+	for (uint64_t i = 0; i < size; i++) {
+		hash = (hash ^ bytes[i]) * 1099511628211ull;
+	}
+	uint32_t w0 = 0;
+	uint32_t w1 = 0;
+	std::memcpy(&w0, bytes, std::min<uint64_t>(size, 4));
+	if (size >= 8) {
+		std::memcpy(&w1, bytes + 4, 4);
+	}
+	LOGF("RL GPU2CPU f=%" PRIu64 " %s addr=0x%010" PRIx64 " size=0x%" PRIx64 " writer=%016" PRIx64
+	     " hash=%016" PRIx64 " w=%08x %08x\n",
+	     g_gpu_frame_epoch.load(), path, vaddr, size, writer, hash, w0, w1);
+}
+
+void ReadLogCpuRead(uint64_t vaddr, uint64_t size, uint64_t writer) {
+	if (!ReadLogActive()) {
+		return;
+	}
+	LOGF("RL CPUREAD f=%" PRIu64 " addr=0x%010" PRIx64 " size=0x%" PRIx64 " writer=%016" PRIx64 "\n",
+	     g_gpu_frame_epoch.load(), vaddr, size, writer);
+}
+
 static std::mutex                   g_label_mutex;
 static std::unordered_set<uint64_t> g_label_dwords; // dword-aligned addresses
 

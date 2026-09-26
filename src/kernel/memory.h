@@ -205,6 +205,12 @@ bool ProtectGuestHostMemory(uint64_t vaddr, uint64_t size, Common::VirtualMemory
 void NoteGuestStackRange(uint64_t vaddr, uint64_t size);
 // Diagnostic before a GPU readback overwrites guest memory: logs guest pointers it would zero.
 void CheckReadbackClobber(uint64_t vaddr, const void* data, uint64_t size, const char* who);
+// KYTY_READLOG=from,to: logs GPU data reaching guest memory (GPU2CPU) and game reads of
+// GPU-owned memory (CPUREAD) during flips [from, to] as "RL ..." lines.
+[[nodiscard]] bool ReadLogActive();
+void               ReadLogGpuToCpu(const char* path, uint64_t vaddr, const void* data, uint64_t size,
+                                   uint64_t writer);
+void               ReadLogCpuRead(uint64_t vaddr, uint64_t size, uint64_t writer);
 // Fence/label dwords the command processor stored straight into guest memory: a buffer
 // readback never overwrites them (the buffer's copy of such a page is older).
 void NoteLabelStore(uint64_t vaddr, uint64_t size);

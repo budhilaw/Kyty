@@ -38,6 +38,7 @@ static void WriteBackingIfMapped(uint64_t vaddr, const void* data, uint64_t size
 		LOGF("DOWNLOAD image range=0x%010" PRIx64 "+0x%" PRIx64 "\n", vaddr, size);
 	}
 	Libs::LibKernel::Memory::CheckReadbackClobber(vaddr, data, size, "image");
+	Libs::LibKernel::Memory::ReadLogGpuToCpu("image", vaddr, data, size, 0);
 	if (!Libs::LibKernel::Memory::TryWriteBacking(vaddr, data, size)) {
 		LOGF("Memory: skipped readback into unmapped range addr=0x%016" PRIx64 " size=0x%016" PRIx64 "\n", vaddr, size);
 	}

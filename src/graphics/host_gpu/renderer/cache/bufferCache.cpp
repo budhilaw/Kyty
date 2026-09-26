@@ -44,6 +44,7 @@ static void WriteBackingIfMapped(uint64_t vaddr, const void* data, uint64_t size
 		LOGF("DOWNLOAD buffer range=0x%010" PRIx64 "+0x%" PRIx64 "\n", vaddr, size);
 	}
 	Libs::LibKernel::Memory::CheckReadbackClobber(vaddr, data, size, "buffer");
+	Libs::LibKernel::Memory::ReadLogGpuToCpu("buffer", vaddr, data, size, FindGpuWriter(vaddr));
 	if (!Libs::LibKernel::Memory::TryWriteBacking(vaddr, data, size)) {
 		LOGF("Memory: skipped readback into unmapped range addr=0x%016" PRIx64 " size=0x%016" PRIx64 "\n", vaddr, size);
 	}
@@ -217,12 +218,26 @@ bool BufferCache::DownloadBufferMemory(Buffer& buffer, uint64_t vaddr, uint64_t 
 	    vaddr, size, [&](uint64_t address, uint64_t bytes) noexcept {
 		    m_memory_tracker.ValidateGpuDirtyPages(m_gpu_modified_ranges, address, bytes,
 		                                           "buffer download");
+		    bool any = false;
 		    m_gpu_modified_ranges.ForEachInRange(address, bytes, [&](uint64_t start, uint64_t end) {
 			    TraceArgs("download", start, end - start, "");
 			    copies.emplace_back(start - buffer_address, total_size, end - start);
 			    // Keep packed ranges on separate cache lines, as in shadPS4.
 			    total_size += Common::AlignUp(end - start, 64);
+			    any = true;
 		    });
+		    if (!any) {
+			    // The tracker still holds the page as GPU-owned but no dirty bytes are listed for
+			    // it: copying nothing handed the game stale guest bytes (Uncharted's selector then
+			    // culled the whole scene). The GPU copy of the page is the current one.
+			    static std::atomic<uint32_t> orphan_logs {0};
+			    if (orphan_logs.fetch_add(1) < 32) {
+				    LOGF("DOWNLOAD ORPHAN addr=0x%016" PRIx64 " size=0x%" PRIx64 "\n", address,
+				           bytes);
+			    }
+			    copies.emplace_back(address - buffer_address, total_size, bytes);
+			    total_size += Common::AlignUp(bytes, 64);
+		    }
 		    m_gpu_modified_ranges.Subtract(address, bytes);
 	    });
 	if (copies.empty()) {
@@ -672,6 +687,9 @@ void BufferCache::ReadMemory(uint64_t vaddr, uint64_t size, bool is_write) {
 	Common::WaitTrace::Scope readback_scope(Common::WaitTrace::Kind::GpuReadback);
 	if (GuestGpu::IsGpuThread()) {
 		SetGpuPhase("readback", vaddr);
+	}
+	if (!GuestGpu::IsGpuThread() && !is_write) {
+		Libs::LibKernel::Memory::ReadLogCpuRead(vaddr, size, FindGpuWriter(vaddr));
 	}
 	if (!GuestGpu::IsGpuThread() && CommandScheduler::InDeferredOperation()) {
 		Common::WaitTrace::PrintHostStack("deferred readback");
