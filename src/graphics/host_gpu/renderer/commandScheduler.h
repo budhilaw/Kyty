@@ -58,6 +58,11 @@ public:
 	[[nodiscard]] uint32_t WorkSinceSubmit() const noexcept { return m_work_since_submit; }
 	[[nodiscard]] bool             IsFree(uint64_t tick);
 	[[nodiscard]] MasterSemaphore& GetMasterSemaphore() noexcept { return m_master; }
+	// Command buffer for buffer uploads, submitted just before the current one. Copies cannot
+	// be recorded inside a render pass, so recording them inline ended the pass for every draw
+	// that uploaded data (dozens of passes per frame, each storing and reloading its targets).
+	// Null when disabled (KYTY_NO_UPLOAD_PROLOGUE=1).
+	[[nodiscard]] vk::CommandBuffer UploadCommand();
 	[[nodiscard]] RenderContext&   Context() const noexcept { return m_context; }
 	[[nodiscard]] GraphicContext&  Graphics() const noexcept { return m_graphics; }
 
@@ -101,6 +106,7 @@ private:
 	GraphicContext&              m_graphics;
 	CommandPool                  m_command_pool;
 	CommandBuffer                m_command;
+	vk::CommandBuffer            m_upload = nullptr;
 	std::queue<PendingOperation> m_pending_operations;
 	std::queue<PendingOperation> m_priority_operations;
 	std::mutex                   m_operation_mutex;

@@ -1356,7 +1356,11 @@ bool BufferCache::SynchronizeBuffer(Buffer& buffer, uint64_t vaddr, uint64_t siz
 		    AppendUploadCopies(buffer, address, bytes, copies, total_size);
 	    },
 	    [&]() noexcept { source = UploadCopies(buffer, copies, total_size); });
-	if (source && m_upload_batch) {
+	if (const auto upload = source ? m_scheduler.UploadCommand() : vk::CommandBuffer {}; upload) {
+		// Recorded ahead of this submission: the current render pass stays open.
+		upload.copyBuffer(source, buffer.Handle(), static_cast<uint32_t>(copies.size()),
+		                  copies.data());
+	} else if (source && m_upload_batch) {
 		auto& command = m_scheduler.Current();
 		command.EndRendering();
 		const auto native = command.Handle();
@@ -1854,6 +1858,12 @@ void BufferCache::SynchronizeRangesBatch(std::span<const std::pair<uint64_t, uin
 		auto&      buffer = m_slot_buffers[group.id];
 		const auto source = UploadCopies(buffer, group.copies, group.total);
 		if (!source) {
+			continue;
+		}
+		if (const auto upload = m_scheduler.UploadCommand(); upload) {
+			// Ahead of this submission, outside any render pass.
+			upload.copyBuffer(source, buffer.Handle(), static_cast<uint32_t>(group.copies.size()),
+			                  group.copies.data());
 			continue;
 		}
 		auto& command = m_scheduler.Current();

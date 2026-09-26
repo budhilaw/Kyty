@@ -24,6 +24,8 @@ namespace FrameCapture {
 void OnFlip(uint64_t presented_address);
 // Counts one recorded draw (per-frame totals are logged at flips).
 void NoteDraw();
+// Counts one ended render pass.
+void NotePassEnd();
 
 // Records produced while a frame is captured; they attach to the next draw or dispatch.
 void NoteTarget(const char* kind, uint32_t slot, uint32_t image_index, uint64_t address,

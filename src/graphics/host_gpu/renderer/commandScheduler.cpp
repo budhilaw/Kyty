@@ -194,7 +194,7 @@ void CommandScheduler::Flush(SubmitInfo& submit) {
 	// flush. Those record no commands, so submitting an empty buffer only costs a queue round
 	// trip: the work they are meant to follow has already been submitted.
 	if (SkipEmptySubmits() && !m_command.IsInvalid() && !m_command.HasRecordedWork() &&
-	    submit.num_wait_semaphores == 0 && submit.num_signal_semaphores == 0) {
+	    m_upload == nullptr && submit.num_wait_semaphores == 0 && submit.num_signal_semaphores == 0) {
 		return;
 	}
 	Submit(submit);
@@ -420,6 +420,27 @@ CommandBuffer& CommandScheduler::Current() {
 	return m_command;
 }
 
+vk::CommandBuffer CommandScheduler::UploadCommand() {
+	static const bool disabled = std::getenv("KYTY_NO_UPLOAD_PROLOGUE") != nullptr;
+	if (disabled) {
+		return nullptr;
+	}
+	if (!m_upload) {
+		m_upload = m_command_pool.Commit();
+		vk::CommandBufferBeginInfo begin {};
+		begin.flags = vk::CommandBufferUsageFlagBits::eOneTimeSubmit;
+		EXIT_NOT_IMPLEMENTED(m_upload.begin(&begin) != vk::Result::eSuccess);
+		// Earlier submissions may still read or write what these copies overwrite.
+		vk::MemoryBarrier barrier {};
+		barrier.srcAccessMask = vk::AccessFlagBits::eMemoryRead | vk::AccessFlagBits::eMemoryWrite;
+		barrier.dstAccessMask = vk::AccessFlagBits::eTransferWrite | vk::AccessFlagBits::eTransferRead;
+		m_upload.pipelineBarrier(vk::PipelineStageFlagBits::eAllCommands,
+		                         vk::PipelineStageFlagBits::eTransfer, {}, 1, &barrier, 0, nullptr, 0,
+		                         nullptr);
+	}
+	return m_upload;
+}
+
 CommandBuffer& CommandScheduler::BeginCommand() {
 	EXIT_IF(!m_command.IsInvalid());
 	m_command.m_buffer = m_command_pool.Commit();
@@ -438,6 +459,21 @@ uint64_t CommandScheduler::Submit(SubmitInfo submit) {
 	const auto buffer   = m_command.m_buffer;
 	auto&      graphics = m_graphics;
 	EXIT_IF(graphics.queue == nullptr);
+	std::array<vk::CommandBuffer, 2> buffers {buffer, nullptr};
+	uint32_t                         buffer_count = 1;
+	if (m_upload) {
+		// Uploads finish before anything of this submission reads them.
+		vk::MemoryBarrier barrier {};
+		barrier.srcAccessMask = vk::AccessFlagBits::eTransferWrite;
+		barrier.dstAccessMask = vk::AccessFlagBits::eMemoryRead | vk::AccessFlagBits::eMemoryWrite;
+		m_upload.pipelineBarrier(vk::PipelineStageFlagBits::eTransfer,
+		                         vk::PipelineStageFlagBits::eAllCommands, {}, 1, &barrier, 0, nullptr,
+		                         0, nullptr);
+		EXIT_NOT_IMPLEMENTED(m_upload.end() != vk::Result::eSuccess);
+		buffers      = {m_upload, buffer};
+		buffer_count = 2;
+		m_upload     = nullptr;
+	}
 
 	vk::Result result;
 	uint64_t   tick;
@@ -457,8 +493,8 @@ uint64_t CommandScheduler::Submit(SubmitInfo submit) {
 		submit_info.waitSemaphoreCount   = submit.num_wait_semaphores;
 		submit_info.pWaitSemaphores      = submit.wait_semaphores.data();
 		submit_info.pWaitDstStageMask    = submit.wait_stages.data();
-		submit_info.commandBufferCount   = 1;
-		submit_info.pCommandBuffers      = &buffer;
+		submit_info.commandBufferCount   = buffer_count;
+		submit_info.pCommandBuffers      = buffers.data();
 		submit_info.signalSemaphoreCount = submit.num_signal_semaphores;
 		submit_info.pSignalSemaphores    = submit.signal_semaphores.data();
 

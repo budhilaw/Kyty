@@ -9,6 +9,7 @@
 #include "graphics/host_gpu/renderer/image/imageView.h"
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
+#include "graphics/host_gpu/renderer/frameCapture.h"
 #include "graphics/host_gpu/vulkanCommon.h"
 
 #include <algorithm>
@@ -141,6 +142,7 @@ void CommandBuffer::EndRendering() const {
 	}
 	// Not Handle(): a pending barrier belongs after the pass, before the next command.
 	m_buffer.endRendering();
+	FrameCapture::NotePassEnd();
 	m_recorded     = true;
 	m_rendering    = false;
 	m_render_state = {};

@@ -546,6 +546,11 @@ uint64_t FlipSerial() {
 }
 
 std::atomic<uint32_t> g_frame_draws {0};
+std::atomic<uint32_t> g_frame_passes {0};
+
+void NotePassEnd() {
+	g_frame_passes.fetch_add(1, std::memory_order_relaxed);
+}
 
 void NoteDraw() {
 	g_frame_draws.fetch_add(1, std::memory_order_relaxed);
@@ -559,11 +564,14 @@ void OnFlip(uint64_t presented_address) {
 		static uint32_t min_draws = UINT32_MAX;
 		static uint32_t max_draws = 0;
 		const auto      draws     = g_frame_draws.exchange(0, std::memory_order_relaxed);
+		static uint32_t max_passes = 0;
+		max_passes = std::max(max_passes, g_frame_passes.exchange(0, std::memory_order_relaxed));
 		min_draws                 = std::min(min_draws, draws);
 		max_draws                 = std::max(max_draws, draws);
 		if (flip % 30u == 0u) {
-			std::printf("FRAMEDRAWS flip=%llu min=%u max=%u\n", static_cast<unsigned long long>(flip),
-			            min_draws, max_draws);
+			std::printf("FRAMEDRAWS flip=%llu min=%u max=%u passes=%u\n", static_cast<unsigned long long>(flip),
+			            min_draws, max_draws, max_passes);
+			max_passes = 0;
 			min_draws = UINT32_MAX;
 			max_draws = 0;
 		}
