@@ -722,7 +722,11 @@ void BufferCache::ReadMemory(uint64_t vaddr, uint64_t size, bool is_write) {
 		if (!is_write) {
 			std::lock_guard lock(m_snapshot_mutex);
 			if (m_read_fault_counts.size() > 65536) {
-				m_read_fault_counts.clear();
+				// Polled pages keep their status (clearing everything dropped it at random).
+				std::erase_if(m_read_fault_counts, [](const auto& entry) { return entry.second < 4u; });
+				if (m_read_fault_counts.size() > 65536) {
+					m_read_fault_counts.clear();
+				}
 			}
 			for (auto page = vaddr & ~uint64_t {4095}; page < vaddr + size; page += 4096) {
 				polled = polled && m_read_fault_counts[page] >= 4u;
@@ -935,6 +939,20 @@ void BufferCache::PrefetchReadbacks() {
 		// Adjacent buffers can merge into one range; only the owner's part is downloaded here.
 		const auto& buffer = m_slot_buffers[*owner];
 		range_size = std::min(range_size, buffer.CpuAddress() + buffer.Size() - start);
+		// Only ranges the game polls: a prefetch of an unpolled page skips its writeback, and
+		// retiring it made the page readable without a fault, so its read count never grew and
+		// the game kept reading stale GPU results (the Uncharted selector culled its scene).
+		bool polled = false;
+		{
+			std::lock_guard lock(m_snapshot_mutex);
+			for (auto page = start & ~uint64_t {4095}; page < start + range_size && !polled; page += 4096) {
+				const auto found = m_read_fault_counts.find(page);
+				polled           = found != m_read_fault_counts.end() && found->second >= 4u;
+			}
+		}
+		if (!polled) {
+			return;
+		}
 		ranges.push_back({*owner, start, range_size});
 		budget -= range_size;
 	});
@@ -1286,11 +1304,19 @@ void BufferCache::RecordGpuBaseline(uint64_t address, const uint8_t* data, uint6
 	constexpr uint64_t Page = 4096;
 	std::lock_guard    lock(m_snapshot_mutex);
 	if (m_gpu_baselines.size() > 98304) {
-		// Over ~400 MiB of baselines: drop an arbitrary eighth rather than all of them (a page
-		// without one skips its next readback).
-		auto it = m_gpu_baselines.begin();
-		for (size_t n = 0; n < 12288 && it != m_gpu_baselines.end(); n++) {
+		// Over ~400 MiB of baselines: drop an eighth, but never a page the game polls. A polled
+		// page that lost its baseline got a new one from the GPU's bytes without writing them, so
+		// unchanged GPU results were never written back again: the Uncharted selector read stale
+		// culling data and culled its scene, at random, whenever eviction hit that page.
+		size_t dropped = 0;
+		for (auto it = m_gpu_baselines.begin(); it != m_gpu_baselines.end() && dropped < 12288;) {
+			const auto polled = m_read_fault_counts.find(it->first);
+			if (polled != m_read_fault_counts.end() && polled->second >= 4u) {
+				++it;
+				continue;
+			}
 			it = m_gpu_baselines.erase(it);
+			dropped++;
 		}
 	}
 	for (uint64_t done = 0; done < size;) {
@@ -1385,6 +1411,34 @@ void BufferCache::WriteBackMerged(uint64_t vaddr, const uint8_t* data, uint64_t 
 		// Bytes with a GPU baseline: the GPU changed a byte only if it differs from what was
 		// uploaded, so every other byte keeps the guest's current value.
 		for (auto page = first_page; page < vaddr + size; page += BasePage) {
+			// KYTY_WB_TRACE=<hex page>: why a readback of that page did or did not write guest memory.
+			static const uint64_t trace_page = [] {
+				const char* text = std::getenv("KYTY_WB_TRACE");
+				return text != nullptr ? std::strtoull(text, nullptr, 16) & ~uint64_t {4095} : 0;
+			}();
+			if (page == trace_page) {
+				const auto polled   = m_read_fault_counts.find(page);
+				const auto baseline = m_gpu_baselines.find(page);
+				bool       all_valid = baseline != m_gpu_baselines.end();
+				if (all_valid) {
+					for (const auto word: baseline->second->valid) {
+						all_valid = all_valid && word == ~uint64_t {0};
+					}
+				}
+				const auto begin  = std::max(page, vaddr);
+				const auto length = std::min(page + BasePage, vaddr + size) - begin;
+				uint32_t   gpu[2] {}, guest[2] {}, base[2] {};
+				std::memcpy(gpu, data + (begin - vaddr), std::min<uint64_t>(8, length));
+				(void)Libs::LibKernel::Memory::TryReadBacking(begin, guest, std::min<uint64_t>(8, length));
+				if (baseline != m_gpu_baselines.end()) {
+					std::memcpy(base, baseline->second->bytes.data() + (begin - page), std::min<uint64_t>(8, length));
+				}
+				LOGF("WBTRACE page=0x%010" PRIx64 " polled=%u baseline=%d all_valid=%d gpu=%08x %08x "
+				     "guest=%08x %08x base=%08x %08x\n",
+				     page, polled != m_read_fault_counts.end() ? polled->second : 0u,
+				     baseline != m_gpu_baselines.end() ? 1 : 0, all_valid ? 1 : 0, gpu[0], gpu[1],
+				     guest[0], guest[1], base[0], base[1]);
+			}
 			if (!all_readback) {
 				const auto polled = m_read_fault_counts.find(page);
 				if (polled == m_read_fault_counts.end() || polled->second < 4u) {

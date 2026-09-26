@@ -2394,6 +2394,13 @@ void CommandProcessor::WriteAtEndOfPipe(uint32_t cache_policy, uint32_t event_wr
 			Libs::LibKernel::Memory::NoteLabelStore(dst_address, bytes);
 			Libs::LibKernel::Memory::ReadLogGpuToCpu("eop", dst_address, data, bytes, 0);
 		}
+		// KYTY_NO_PARSE_FENCE=1: the label appears only when the GPU finished the work (the
+		// end-of-pipe write below); a parse-time store let the game read results the GPU had not
+		// produced yet.
+		static const bool no_parse_fence = std::getenv("KYTY_NO_PARSE_FENCE") != nullptr;
+		if (no_parse_fence) {
+			return;
+		}
 		if (dst_gpu_addr == nullptr ||
 		    Libs::LibKernel::Memory::TryWriteBacking(dst_address, data, bytes)) {
 			return;
