@@ -1006,7 +1006,7 @@ void BufferCache::JoinOverlap(BufferId new_id, BufferId overlap_id, bool accumul
 	if (accumulate_stream_score) {
 		new_buffer.IncreaseStreamScore(overlap.StreamScore() + 1);
 	}
-	TraceArgs("join", overlap.CpuAddress(), overlap.Size(),
+	if (Libs::Graphics::LabelTraceEnabled()) TraceArgs("join", overlap.CpuAddress(), overlap.Size(),
 	          fmt::format("into buffer=0x{:x}+0x{:x}", new_buffer.CpuAddress(), new_buffer.Size()));
 	new_buffer.CopyFrom(m_scheduler.Current(), overlap, 0,
 	                    overlap.CpuAddress() - new_buffer.CpuAddress(), overlap.Size());
@@ -1350,12 +1350,28 @@ bool BufferCache::SynchronizeBuffer(Buffer& buffer, uint64_t vaddr, uint64_t siz
 	m_memory_tracker.ForEachUploadRange(
 	    vaddr, size, is_written,
 	    [&](uint64_t address, uint64_t bytes) noexcept {
-		    TraceArgs("upload", address, bytes,
+		    if (Libs::Graphics::LabelTraceEnabled()) TraceArgs("upload", address, bytes,
 		              fmt::format("into buffer=0x{:x}+0x{:x}", buffer.CpuAddress(), buffer.Size()));
 		    AppendUploadCopies(buffer, address, bytes, copies, total_size);
 	    },
 	    [&]() noexcept { source = UploadCopies(buffer, copies, total_size); });
-	if (source) {
+	if (source && m_upload_batch) {
+		auto& command = m_scheduler.Current();
+		command.EndRendering();
+		const auto native = command.Handle();
+		if (!m_upload_batch_began) {
+			// One global barrier before the batch's first copy covers every buffer in it.
+			vk::MemoryBarrier barrier {};
+			barrier.srcAccessMask = vk::AccessFlagBits::eMemoryRead | vk::AccessFlagBits::eMemoryWrite;
+			barrier.dstAccessMask = vk::AccessFlagBits::eTransferWrite;
+			native.pipelineBarrier(vk::PipelineStageFlagBits::eAllCommands,
+			                       vk::PipelineStageFlagBits::eTransfer, {}, 1, &barrier, 0, nullptr,
+			                       0, nullptr);
+			m_upload_batch_began = true;
+		}
+		native.copyBuffer(source, buffer.Handle(), static_cast<uint32_t>(copies.size()),
+		                  copies.data());
+	} else if (source) {
 		auto& command = m_scheduler.Current();
 		command.EndRendering();
 		const auto native = command.Handle();
@@ -1440,7 +1456,7 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBuffer(uint64_t vaddr, uint64_t 
 		NoteGpuWriter(vaddr, size, CurrentWriterShader() != 0 ? CurrentWriterShader() : 6u);
 	}
 
-	TraceArgs("obtain", vaddr, size,
+	if (Libs::Graphics::LabelTraceEnabled()) TraceArgs("obtain", vaddr, size,
 	          fmt::format("written={} texel={} cpu_dirty={} gpu_dirty={}", is_written, is_texel_buffer,
 	                      m_memory_tracker.IsRegionCpuModified(vaddr, size),
 	                      m_memory_tracker.IsRegionGpuModified(vaddr, size)));
@@ -1462,7 +1478,7 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBuffer(uint64_t vaddr, uint64_t 
 	}
 	auto& buffer = m_slot_buffers[id];
 	TouchBuffer(buffer);
-	TraceArgs("obtain-buffer", vaddr, size,
+	if (Libs::Graphics::LabelTraceEnabled()) TraceArgs("obtain-buffer", vaddr, size,
 	          fmt::format("buffer=0x{:x}+0x{:x}", buffer.CpuAddress(), buffer.Size()));
 	(void)SynchronizeBuffer(buffer, vaddr, size, is_written, is_texel_buffer);
 	if (is_written) {
@@ -1740,6 +1756,25 @@ void BufferCache::RunGarbageCollector() {
 
 void BufferCache::ProcessFaultBuffer() {
 	m_fault_manager.ProcessFaultBuffer();
+}
+
+void BufferCache::BeginUploadBatch() {
+	m_upload_batch       = true;
+	m_upload_batch_began = false;
+}
+
+void BufferCache::EndUploadBatch() {
+	if (m_upload_batch_began) {
+		auto&             command = m_scheduler.Current();
+		vk::MemoryBarrier barrier {};
+		barrier.srcAccessMask = vk::AccessFlagBits::eTransferWrite;
+		barrier.dstAccessMask = vk::AccessFlagBits::eMemoryRead | vk::AccessFlagBits::eMemoryWrite;
+		command.Handle().pipelineBarrier(vk::PipelineStageFlagBits::eTransfer,
+		                                 vk::PipelineStageFlagBits::eAllCommands, {}, 1, &barrier, 0,
+		                                 nullptr, 0, nullptr);
+	}
+	m_upload_batch       = false;
+	m_upload_batch_began = false;
 }
 
 void BufferCache::SynchronizeBuffersInRange(uint64_t vaddr, uint64_t size) {

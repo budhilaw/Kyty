@@ -38,6 +38,10 @@ public:
 				EXIT("recursive region tracking lock while contended\n");
 			}
 			std::atomic_signal_fence(std::memory_order_seq_cst);
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+			// A bare spin starved the owner's hyperthread sibling (7% of the GPU thread spun here).
+			YieldProcessor();
+#endif
 		}
 		m_owner.store(thread, std::memory_order_relaxed);
 	}

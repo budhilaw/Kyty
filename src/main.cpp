@@ -389,6 +389,10 @@ static void StartGpuSampler() {
 		const auto module = reinterpret_cast<uint64_t>(GetModuleHandleA(nullptr));
 		std::unordered_map<uint64_t, uint32_t> self;
 		std::unordered_map<uint64_t, uint32_t> inclusive;
+		// Samples outside the emulator image: by module and by the emulator function that called out.
+		std::unordered_map<uint64_t, uint32_t> ext_module;
+		std::unordered_map<uint64_t, uint32_t> ext_caller;
+		std::unordered_map<uint64_t, uint32_t> ext_caller2;
 		uint32_t samples = 0;
 		auto     last    = std::chrono::steady_clock::now();
 		for (;;) {
@@ -439,6 +443,25 @@ static void StartGpuSampler() {
 						}
 					} else if (frame == 0) {
 						self[0]++;
+						HMODULE owner = nullptr;
+						GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+						                       GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+						                   reinterpret_cast<LPCSTR>(rip), &owner);
+						ext_module[reinterpret_cast<uint64_t>(owner)]++;
+					}
+				}
+				if (frame_count > 0 && !(frames[0] >= module && frames[0] < module + 0x4000000u)) {
+					for (int frame = 1; frame < frame_count; frame++) {
+						if (frames[frame] >= module && frames[frame] < module + 0x4000000u) {
+							ext_caller[frames[frame] - module]++;
+							for (int next = frame + 1; next < frame_count; next++) {
+								if (frames[next] >= module && frames[next] < module + 0x4000000u) {
+									ext_caller2[frames[next] - module]++;
+									break;
+								}
+							}
+							break;
+						}
 					}
 				}
 			}
@@ -459,6 +482,23 @@ static void StartGpuSampler() {
 				};
 				top(self, "self");
 				top(inclusive, "incl");
+				top(ext_caller, "extcaller");
+				top(ext_caller2, "extcaller2");
+				{
+					std::string line = fmt::format("GPUSAMPLE extmod n={}:", samples);
+					for (const auto& [base, count]: ext_module) {
+						char name[MAX_PATH] {};
+						if (base == 0 || GetModuleFileNameA(reinterpret_cast<HMODULE>(base), name, MAX_PATH) == 0) {
+							std::snprintf(name, sizeof(name), "nounwind");
+						}
+						const char* slash = std::strrchr(name, '\\');
+						line += fmt::format(" {}={:.1f}%", slash != nullptr ? slash + 1 : name, 100.0 * count / samples);
+					}
+					std::printf("%s\n", line.c_str());
+				}
+				ext_module.clear();
+				ext_caller.clear();
+				ext_caller2.clear();
 				std::fflush(stdout);
 				self.clear();
 				inclusive.clear();

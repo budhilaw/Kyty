@@ -100,6 +100,9 @@ public:
 	[[nodiscard]] bool IsRegionGpuModified(uint64_t vaddr, uint64_t size);
 	void               ProcessFaultBuffer();
 	void               SynchronizeBuffersInRange(uint64_t vaddr, uint64_t size);
+	// Uploads between these share one barrier pair instead of two barriers per buffer.
+	void BeginUploadBatch();
+	void EndUploadBatch();
 	[[nodiscard]] uint64_t CpuGeneration() const { return m_memory_tracker.CpuGeneration(); }
 	void TakeCpuDirtyLog(std::vector<std::pair<uint64_t, uint64_t>>& out, bool& full) {
 		m_memory_tracker.TakeCpuDirtyLog(out, full);
@@ -212,6 +215,8 @@ private:
 	// CPU read faults per 4 KiB page; pages the game polls (frame markers) get readbacks.
 	std::unordered_map<uint64_t, uint32_t> m_read_fault_counts;
 	std::unordered_set<uint64_t>           m_raw_write_pages; // 4 KiB pages
+	bool                                   m_upload_batch       = false;
+	bool                                   m_upload_batch_began = false;
 	MemoryTracker                                     m_memory_tracker;
 	StreamBuffer                                      m_staging_buffer;
 	StreamBuffer                                      m_stream_buffer;

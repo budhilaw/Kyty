@@ -556,7 +556,8 @@ private:
 				result = slots.values[slot];
 				return true;
 			}
-		} else if (const auto found = m_cache.find(inst); found != m_cache.end()) {
+		} else if (const auto found = std::ranges::find(m_cache, inst, &std::pair<const Inst*, uint64_t>::first);
+		           found != m_cache.end()) {
 			result = found->second;
 			return true;
 		}
@@ -578,7 +579,7 @@ private:
 			slots.values[slot] = out;
 			slots.stamps[slot] = m_epoch;
 		} else {
-			m_cache.emplace(inst, out);
+			m_cache.emplace_back(inst, out);
 		}
 		result = out;
 		return true;
@@ -1044,7 +1045,9 @@ private:
 	Evaluator*                                m_clean_evaluator = nullptr;
 	Value                                     m_active_mask;
 	uint32_t                                  m_epoch = 0;
-	std::unordered_map<const Inst*, uint64_t> m_cache;
+	// Values without an evaluation slot (rare). A vector: MSVC's unordered_map allocates when it is
+	// constructed, and several evaluators are built per draw.
+	std::vector<std::pair<const Inst*, uint64_t>> m_cache;
 	std::vector<const Inst*>                  m_visiting;
 	bool                                      m_reserved = false;
 };

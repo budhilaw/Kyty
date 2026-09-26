@@ -966,7 +966,9 @@ TextureBinding RenderExecutor::ResolveTexture(const ShaderRecompiler::IR::ImageR
 	                  image->info.extent.width, image->info.extent.height);
 	const bool stencil_view = image->info.IsDepth() && image->info.HasStencil() &&
 	                          address == image->info.stencil.address;
-	char capture_note[160];
+	char capture_note[160] {};
+	// Formatting this note for every bound image cost ~2% of the GPU thread with capture off.
+	if (FrameCapture::Active())
 	std::snprintf(capture_note, sizeof(capture_note),
 	              "%s T#=%08x,%08x,%08x,%08x,%08x,%08x,%08x,%08x",
 	              stencil_view ? "[stencil of depth image]" : "", descriptor.fields[0],

@@ -472,8 +472,22 @@ void RenderContext::PrepareBda() {
 		bool                                                    log_full = false;
 		m_buffer_cache.TakeCpuDirtyLog(dirty, log_full);
 		full = full || log_full;
+		// Two barriers per uploaded buffer were a large part of this walk's driver time.
+		static const bool no_batch = std::getenv("KYTY_NO_UPLOAD_BATCH") != nullptr;
+		if (!no_batch) {
+			m_buffer_cache.BeginUploadBatch();
+		}
+		// KYTY_SAMPLE_GPU=1 also reports how this walk spends its time.
+		static const bool walk_stats = std::getenv("KYTY_SAMPLE_GPU") != nullptr;
+		static uint64_t   stat_calls = 0, stat_full = 0, stat_ranges = 0, stat_bytes = 0, stat_us = 0;
+		static auto       stat_last  = std::chrono::steady_clock::now();
+		const auto        walk_start = std::chrono::steady_clock::now();
+		stat_calls++;
+		stat_full += full ? 1u : 0u;
 		if (full) {
 			m_mapped_ranges.ForEach([this](uint64_t start, uint64_t end) {
+				stat_ranges++;
+				stat_bytes += end - start;
 				m_buffer_cache.SynchronizeBuffersInRange(start, end - start);
 			});
 		} else {
@@ -492,8 +506,26 @@ void RenderContext::PrepareBda() {
 			dirty.resize(merged);
 			for (const auto& [address, size]: dirty) {
 				m_mapped_ranges.ForEachInRange(address, size, [this](uint64_t start, uint64_t end) {
+					stat_ranges++;
+					stat_bytes += end - start;
 					m_buffer_cache.SynchronizeBuffersInRange(start, end - start);
 				});
+			}
+		}
+		if (!no_batch) {
+			m_buffer_cache.EndUploadBatch();
+		}
+		if (walk_stats) {
+			const auto now = std::chrono::steady_clock::now();
+			stat_us += static_cast<uint64_t>(
+			    std::chrono::duration_cast<std::chrono::microseconds>(now - walk_start).count());
+			if (now - stat_last > std::chrono::seconds(5)) {
+				std::printf("BDAWALK calls=%llu full=%llu ranges=%llu bytes=%llu ms=%llu\n",
+				            static_cast<unsigned long long>(stat_calls), static_cast<unsigned long long>(stat_full),
+				            static_cast<unsigned long long>(stat_ranges), static_cast<unsigned long long>(stat_bytes),
+				            static_cast<unsigned long long>(stat_us / 1000u));
+				stat_calls = stat_full = stat_ranges = stat_bytes = stat_us = 0;
+				stat_last = now;
 			}
 		}
 		m_bda_synced_generation = generation;
